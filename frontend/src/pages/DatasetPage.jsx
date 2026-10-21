@@ -4,6 +4,7 @@ import { api, downloadBlob } from '../lib/api.js';
 import useResource from '../hooks/useResource.js';
 import { useInspector } from '../lib/inspector.jsx';
 import FieldsView from '../components/FieldsView.jsx';
+import BucketsView from '../components/BucketsView.jsx';
 import GapQueue from '../components/GapQueue.jsx';
 import SectorPanel from '../components/SectorPanel.jsx';
 import ReviewQueue from '../components/ReviewQueue.jsx';
@@ -1583,6 +1584,7 @@ export default function DatasetPage() {
             />
           ) : null}
 
+          {tab === 'buckets' ? <BucketsView datasetId={id} /> : null}
           {tab === 'fields' ? (
             <div className="space-y-6">
               {/* The domain reading and its receipt, above the full field list.

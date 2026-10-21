@@ -319,6 +319,7 @@ export const api = {
   records: (id, params, o) => request(`/datasets/${encodeURIComponent(id)}/records${qs(params)}`, o),
   sources: (id, o) => request(`/datasets/${encodeURIComponent(id)}/sources`, o),
   coverage: (id, o) => request(`/datasets/${encodeURIComponent(id)}/coverage`, o),
+  buckets: (id, o) => request(`/datasets/${encodeURIComponent(id)}/buckets`, o),
   conflicts: (id, o) => request(`/datasets/${encodeURIComponent(id)}/conflicts`, o),
   resolveConflict: (id, body, o) =>
     request(`/datasets/${encodeURIComponent(id)}/conflicts/resolve`, { ...o, method: 'POST', body }),

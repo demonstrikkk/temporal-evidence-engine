@@ -808,7 +808,7 @@ async def get_dataset(did: str, include_records: bool = False,
     return {"data": view, "error": None, "meta": {"correlation_id": cid}}
 
 
-async def _plan_for_run(run_id: str) -> dict:
+def _plan_for_run_sync(r: object, run_id: str) -> dict:
     """The plan a run was built from, wherever that plan was stored.
 
     A plan can live in three places, and the buckets view must not care which:
@@ -820,35 +820,41 @@ async def _plan_for_run(run_id: str) -> dict:
 
     Looking only under the run id meant a compiled run's dataset reported
     "no buckets" for a plan that declared them.
+
+    The run is read first, and the plan looked up under its id, because the
+    run's `workflow_id` is where the plan is *usually* stored. Probing the run
+    id first meant a statement that always missed against Postgres, at ~170ms
+    a statement against a remote pooler.
     """
     if not run_id:
         return {}
-    r = repo()
     getter = getattr(r, "get_plan", None)
     if not callable(getter):
         return {}
     try:
-        plan = await asyncio.to_thread(getter, run_id)
+        run = r.get_run(run_id) or {}
     except Exception as e:  # noqa: BLE001
-        log.warning("plan lookup failed",
+        log.warning("run lookup failed",
                     extra={"data": {"run_id": run_id[:36], "error": str(e)[:150]}})
         return {}
-    if plan:
-        return plan
-    run = await asyncio.to_thread(r.get_run, run_id) or {}
     # `LocalRepo` keeps the plan on the run row itself.
     own = run.get("plan") or {}
     if own:
         return own
     plan_id = str(run.get("workflow_id") or "")
-    if not plan_id or plan_id == run_id:
-        return {}
-    try:
-        return await asyncio.to_thread(getter, plan_id) or {}
-    except Exception as e:  # noqa: BLE001
-        log.warning("plan lookup failed",
-                    extra={"data": {"plan_id": plan_id[:36], "error": str(e)[:150]}})
-        return {}
+    for candidate in (plan_id, run_id):
+        if not candidate:
+            continue
+        try:
+            plan = getter(candidate) or {}
+        except Exception as e:  # noqa: BLE001
+            log.warning("plan lookup failed",
+                        extra={"data": {"plan_id": candidate[:36],
+                                        "error": str(e)[:150]}})
+            continue
+        if plan:
+            return plan
+    return {}
 
 
 @app.get("/api/datasets/{did}/buckets", dependencies=[Depends(require_api_key)])
@@ -860,34 +866,50 @@ async def get_dataset_buckets(did: str,
     returns the record ids that match each rule. The rules come from the plan
     the edition stamped at compile time, so a dataset imported from a corpus
     keeps the same views a compiled run would have.
+
+    Cached, like the other derived reads, because the measurement is brutal:
+    every statement against a remote pooler costs ~170ms, so reading a
+    dataset's rows in pages plus resolving its plan is several round trips
+    before a single number comes back. The answer only changes when a cell is
+    written, and every write path drops the cache.
     """
-    ds = await asyncio.to_thread(repo().get_dataset_row, did)
-    if not ds:
-        raise not_found("dataset", did)
-    plan = await _plan_for_run(ds.get("run_id", ""))
-    rules = plan.get("buckets") or []
-    if not rules:
-        return {"data": {"dataset_id": did, "records": ds.get("record_count", 0),
-                         "buckets": [], "unassigned_count": 0,
-                         "unassigned_record_ids": [],
-                         "edition": plan.get("edition", ""),
-                         "reason": "this dataset's plan declares no buckets"},
-                "error": None, "meta": {"correlation_id": cid}}
-    # `get_records` caps a page (LocalRepo at 500), so asking for 5000 returned
-    # 500 and the counts looked complete. Page until the dataset is exhausted.
-    records: list[dict] = []
-    offset = 0
-    while True:
-        got = await asyncio.to_thread(repo().get_records, did, "", 500, offset)
-        batch = (got or {}).get("records") or []
-        records.extend(batch)
-        if len(batch) < 500:
-            break
-        offset += len(batch)
-    out = buckets_svc.derive(rules, records)
-    out["dataset_id"] = did
-    out["edition"] = plan.get("edition", "")
-    return {"data": out, "error": None, "meta": {"correlation_id": cid}}
+    def _compute() -> dict:
+        r = repo()
+        ds = r.get_dataset_row(did)
+        if not ds:
+            raise not_found("dataset", did)
+        plan = _plan_for_run_sync(r, ds.get("run_id", ""))
+        rules = plan.get("buckets") or []
+        if not rules:
+            return {"dataset_id": did, "records": ds.get("record_count", 0),
+                    "buckets": [], "unassigned_count": 0,
+                    "unassigned_record_ids": [],
+                    "edition": plan.get("edition", ""),
+                    "reason": "this dataset's plan declares no buckets"}
+        # `get_records` caps a page (LocalRepo at 500), so asking for 5000
+        # returned 500 and the counts looked complete. Page until the dataset
+        # is exhausted.
+        records: list[dict] = []
+        offset = 0
+        while True:
+            got = r.get_records(did, "", 500, offset)
+            batch = (got or {}).get("records") or []
+            records.extend(batch)
+            if len(batch) < 500:
+                break
+            offset += len(batch)
+        out = buckets_svc.derive(rules, records)
+        out["dataset_id"] = did
+        out["edition"] = plan.get("edition", "")
+        return out
+
+    data, hit, shared = await asyncio.to_thread(
+        readcache.cached, f"buckets:{did}", _compute)
+    if shared:
+        log.info("bucket read waited on an identical compute in flight",
+                 extra={"data": {"dataset_id": did}})
+    return {"data": data, "error": None,
+            "meta": {"correlation_id": cid, "cached": hit}}
 
 
 @app.delete("/api/datasets/{did}", dependencies=[Depends(require_api_key)])

@@ -7,6 +7,8 @@ term is present.
 """
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from app.core.errors import AppError
@@ -167,7 +169,7 @@ def test_duplicate_document_ids_are_refused(tmp_path) -> None:
 def test_imported_plan_keeps_the_edition_bucket_rules(tmp_path) -> None:
     repo = LocalRepo(str(tmp_path / "store"))
     out = import_corpus(repo, _corpus())
-    plan = repo.get_plan(out["run_id"])
+    plan = _plan_of(repo, out["run_id"])
     records = repo.get_records(out["dataset_id"], "", 100, 0)["records"]
 
     views = {b["name"]: b for b in derive(plan["buckets"], records)["buckets"]}
@@ -175,3 +177,58 @@ def test_imported_plan_keeps_the_edition_bucket_rules(tmp_path) -> None:
     assert views["regional"]["count"] == 1
     assert views["regional"]["record_ids"] == ["local:1"]
     assert plan["edition"] == "test_domain"
+
+
+def _plan_of(repo, run_id: str) -> dict:
+    """The plan a run was built from, however that store keeps it.
+
+    A compiled run's plan lives under the plan id and the run points at it;
+    the import stores it the same way.
+    """
+    plan = repo.get_plan(run_id)
+    if plan:
+        return plan
+    run = repo.get_run(run_id) or {}
+    return repo.get_plan(str(run.get("workflow_id") or "")) or {}
+
+
+def test_the_workflow_id_is_a_uuid_because_the_database_column_is_one(
+        tmp_path) -> None:
+    """`workflows.id` is a uuid column, so a label is not a legal value for it.
+
+    The import passed "legal_corpus" straight through. `LocalRepo` stores a
+    string and accepted it, so the import worked locally and failed against
+    Postgres with "invalid input syntax for type uuid" -- a bug that only
+    existed in the store that matters.
+    """
+    repo = LocalRepo(str(tmp_path / "store"))
+    out = import_corpus(repo, _corpus(), workflow_id="legal_corpus")
+
+    run = repo.get_run(out["run_id"]) or {}
+    workflow_id = str(run.get("workflow_id") or "")
+
+    assert workflow_id, "the run must name the workflow it came from"
+    uuid.UUID(workflow_id)  # raises if it is not a uuid
+
+    # And the plan is reachable under that id, which is where the buckets
+    # route looks for it.
+    assert repo.get_plan(workflow_id)["edition"] == "test_domain"
+
+
+def test_the_same_label_maps_to_the_same_workflow(tmp_path) -> None:
+    """Re-importing a corpus must not leave a new workflow behind each time.
+
+    The id is derived from the label, so the second import updates the same
+    workflow row instead of adding another one.
+    """
+    repo = LocalRepo(str(tmp_path / "store"))
+    first = import_corpus(repo, _corpus(), workflow_id="legal_corpus")
+    second = import_corpus(repo, _corpus(), workflow_id="legal_corpus")
+
+    one = (repo.get_run(first["run_id"]) or {}).get("workflow_id")
+    two = (repo.get_run(second["run_id"]) or {}).get("workflow_id")
+
+    assert one == two
+    # Two runs, two datasets: each import is its own run.
+    assert first["run_id"] != second["run_id"]
+    assert first["dataset_id"] != second["dataset_id"]

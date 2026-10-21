@@ -157,12 +157,32 @@ def _plan(payload: dict) -> dict:
     }
 
 
+def _workflow_uuid(label: str) -> str:
+    """A stable UUID for a workflow label.
+
+    `workflows.id` is a uuid column, so a label like "legal_corpus" is not a
+    legal value for it. `LocalRepo` stores a string and accepted one, which
+    is why the import worked in local mode and failed against Postgres with
+    "invalid input syntax for type uuid" -- the same bug, two stores, one
+    visible only where it mattered.
+
+    The id is derived from the label rather than randomised, so importing the
+    same corpus twice updates one workflow row instead of leaving a new one
+    behind each time. The plan is stored under it, and the run points at it,
+    exactly as a compiled run does.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"datagoblin-corpus:{label}"))
+
+
 def import_corpus(repo: object, payload: dict, *,
                   workflow_id: str = "corpus_import") -> dict:
     """Store `payload` as one run, its pages, and one dataset. Returns ids.
 
     The repository surface is the one both adapters share: `create_run`,
     `save_plan`, `upsert_page`, `append_event`, `finalize_dataset`.
+
+    `workflow_id` is a *label*, not an id: it names the workflow in the run
+    history, and the id it maps to is derived from it.
     """
     if int(payload.get("corpus_version") or 0) != CORPUS_VERSION:
         raise validation(f"corpus_version must be {CORPUS_VERSION}")
@@ -179,8 +199,9 @@ def import_corpus(repo: object, payload: dict, *,
 
     plan = _plan(payload)
     run_id = str(uuid.uuid4())
-    repo.create_run(run_id, workflow_id, plan)
-    repo.save_plan(run_id, plan)
+    plan_id = _workflow_uuid(workflow_id)
+    repo.create_run(run_id, plan_id, plan)
+    repo.save_plan(plan_id, plan)
     repo.append_event(run_id, {
         "type": "stage.started", "stage": "FETCHING",
         "message": f"importing {len(documents)} curated documents",

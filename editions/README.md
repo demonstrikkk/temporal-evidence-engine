@@ -10,6 +10,8 @@ editions/
     edition.json      the profile (the only file the core reads)
     selectors/        optional per-host CSS schemas
     tests/            optional, run with the edition installed
+    corpus/           optional: a pre-built, quote-backed corpus (see below)
+    ingest/           optional: the code that builds that corpus
 ```
 
 `edition.json` is validated by `app.domain.profile.DomainProfile`. Unknown keys
@@ -50,9 +52,49 @@ is refused with a named reason and does not load; the core keeps working.
 | `defaults` | applied only where the plan has no value |
 | `examples` | metadata for `/api/editions`-style listings and conformance |
 | `entity` | used only when the plan has no entity of its own |
+| `buckets` | derived views over declared fields; the core groups stored cells by these rules and writes nothing |
+| `tiering` | how the edition places a document in a tier, as data; the core carries it without interpreting it |
 
 Nothing here overwrites a value the user or the planner chose, and applying the
 same profile twice produces the same plan.
+
+## A corpus instead of a crawl
+
+Some verticals know in advance which documents they want. Crawling for them at
+request time costs a model call per page and gets less than a curated build
+does, so an edition may ship a **corpus**: documents whose every value already
+carries a quote that resolves against the stored text.
+
+```
+editions/<name>/
+  sources.json        the curated document list, with the metadata per document
+  ingest/             the code that fetches, parses and quotes them
+  corpus/
+    documents.json    the built corpus: stored text + quote-backed fields
+    index.json        one summary row per document
+    report.md         what the build produced
+    .cache/           source bytes, gitignored; not evidence
+```
+
+Build it (offline after the first fetch), then import it:
+
+```powershell
+backend\.venv\Scripts\python.exe editions\datagoblin_legal\ingest\build.py --write
+
+backend\.venv\Scripts\python.exe backend\scripts\import_corpus.py `
+  --corpus editions\datagoblin_legal\corpus\documents.json
+```
+
+The importer writes a normal run, pages, records and a dataset through the same
+repository methods a live run uses, so the corpus shows up in the Studio like
+any other dataset — no separate store, no separate view. It validates every
+quote and value first: a value whose quote does not resolve against the stored
+text is refused before anything is written, and a value the quote does not
+support is stored `unverified` with the reason.
+
+`workflow_id` is a *label*, not an id. The `workflows.id` column is a uuid, so
+the importer derives a stable uuid from the label; a label that reached that
+column directly worked in local mode and failed against Postgres.
 
 ## Writing one
 

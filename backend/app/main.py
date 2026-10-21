@@ -813,12 +813,10 @@ async def _plan_for_run(run_id: str) -> dict:
 
     A plan can live in three places, and the buckets view must not care which:
 
-    * the run row itself (a corpus import stores its plan there, and
-      `LocalRepo.create_run` keeps it on the run);
-    * under the run id (a corpus import also saves it by run id);
-    * under the plan id, which is what a *compiled* run has: the run was
-      started from a compiled plan, and the plan's id is the run's
-      `workflow_id`, not the run id.
+    * the run row itself (`LocalRepo.create_run` keeps it on the run);
+    * under the run id (a compiled plan saved before the run started);
+    * under the plan id, which is what both a compiled run and a corpus
+      import have: the plan's id is the run's `workflow_id`, not the run id.
 
     Looking only under the run id meant a compiled run's dataset reported
     "no buckets" for a plan that declared them.

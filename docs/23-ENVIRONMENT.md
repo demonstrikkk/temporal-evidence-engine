@@ -117,6 +117,29 @@ Agreement is also compared semantically, not textually: `{"a": 1}` and `{"a":1}`
 are one answer. Three models that all said `{"capital": "Paris"}` were once
 reported as a 2-1 "majority" purely because one omitted a space after the colon.
 
+## A legal corpus, imported rather than crawled
+
+The legal edition ships a curated corpus instead of crawling for it at request
+time. Importing it needs **no model and no provider** — every value is already
+in the source's own words with a quote that resolves against the stored text —
+so it works with the reader offline:
+
+```powershell
+# build (offline after the first fetch)
+backend\.venv\Scripts\python.exe editions\datagoblin_legal\ingest\build.py --write
+
+# import into whichever store PERSISTENCE names
+backend\.venv\Scripts\python.exe backend\scripts\import_corpus.py `
+  --corpus editions\datagoblin_legal\corpus\documents.json
+```
+
+The importer writes through the same repository methods a live run uses, so the
+corpus appears in the Studio as an ordinary dataset. With `PERSISTENCE=postgres`
+it lands in the same database as everything else; with `PERSISTENCE=local` it
+lands in the JSONL store, which is a *different* store from the one a server
+started from the repo root reads. A corpus imported into one store is invisible
+to a server reading the other, and the dataset list is where that shows.
+
 
 Critical: start the API from the REPO ROOT (`set PYTHONPATH=backend &&
 python -m uvicorn app.main:app`), because settings load `.env` from the CWD.

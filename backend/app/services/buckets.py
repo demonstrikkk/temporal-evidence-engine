@@ -9,11 +9,12 @@ Two matcher shapes, ORed:
 
 * `values` — exact, case-insensitive equality (a jurisdiction list).
 * `contains` — substring, for fields whose value carries more than the bucket
-  word ("High Court of Delhi" in `court`).
+  word ("Regional Office" in `office`).
 
-A record may belong to more than one bucket. That is intentional: a case can be
-both regional and about legal aid, and forcing one label would hide the other.
-Records matching no rule are reported as `unassigned`, not silently dropped.
+A record may belong to more than one bucket. That is intentional: a document
+can be both regional and about a national topic, and forcing one label would
+hide the other. Records matching no rule are reported as `unassigned`, not
+silently dropped.
 """
 from __future__ import annotations
 

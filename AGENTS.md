@@ -174,6 +174,19 @@ The importer validates every quote and value first, stores each document with
 `upsert_page`, settles every cell through `validator.settle`, and finalizes the
 run and dataset together.
 
+Two rules keep the core free of this edition's vocabulary, and both are
+enforced by tests:
+
+- The words that support a boolean value are declared by the edition and travel
+  with the corpus file (`support_terms` on the field). The core only checks
+  that a declared term is in the quote. A boolean with no declared terms is
+  not supported.
+- The tier a document sits in is derived from the manifest's own metadata by
+  the edition's `tiering` policy, and stored in the document's header so the
+  value is a slice of the text. A bucket rule then reads `tier`, not a place
+  name. `test_edition_isolation.py` fails if a string literal in `app/` carries
+  one vertical's words.
+
 ## Before you claim something works
 
 Say what you ran and what it printed. "The tests pass" is a claim about a

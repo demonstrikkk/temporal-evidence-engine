@@ -91,6 +91,12 @@ def apply_profile(plan: dict, profile: DomainProfile) -> dict:
     if profile.buckets and not out.get("buckets"):
         out["buckets"] = [rule.model_dump() for rule in profile.buckets]
 
+    # The tiering policy travels with the plan for the same reason the buckets
+    # do: it is how a run decides which tier a document is in, and a plan that
+    # lost it would file everything in one tier.
+    if profile.tiering and not out.get("tiering"):
+        out["tiering"] = copy.deepcopy(profile.tiering)
+
     out["edition"] = profile.name
     out["edition_version"] = profile.version
     return out

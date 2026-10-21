@@ -32,6 +32,11 @@
       "description": "The state or union jurisdiction the document belongs to (India for central law and the Supreme Court)."
     },
     {
+      "name": "tier",
+      "type": "string",
+      "description": "Which tier of law the document sits in: local (this edition's own state), regional (another state), or national (union law)."
+    },
+    {
       "name": "year",
       "type": "number",
       "description": "The year of enactment, publication or judgment."
@@ -106,7 +111,7 @@
     "A judgment's court and jurisdiction come from the document, not from its filename.",
     "dlsa_eligible is written true only where a quote states eligibility; there is no false value."
   ],
-  "planner_guidance": "A row is one legal document: a section of an Act, a constitutional article, or a reported judgment. Prefer official court and India Code sources. Record the document's own title and citation; do not invent a reporter citation.",
+  "planner_guidance": "A row is one legal document: a section of an Act, a constitutional article, or a reported judgment. Prefer official court and India Code sources. Record the document's own title and citation; do not invent a reporter citation. Documents fall into three tiers: local law of a single state (Delhi statutes and the state legal aid authority), regional decisions of a state High Court, and national law (central statutes, the Constitution, the Supreme Court). A document can sit in more than one tier.",
   "extractor_guidance": "Quote the exact words of the document. A summary is a verbatim excerpt, never a paraphrase. Leave a field absent rather than guessing it.",
   "defaults": {
     "source_types": [
@@ -118,37 +123,35 @@
     "Which Supreme Court judgments require a magistrate to consider legal aid before remand?",
     "Show Delhi High Court judgments about legal aid in criminal cases."
   ],
+  "tiering": {
+    "home_jurisdiction": "Delhi",
+    "national_states": [
+      "CENTRAL"
+    ]
+  },
   "buckets": [
     {
       "name": "local",
       "label": "Local",
-      "field": "court",
-      "contains": [
-        "district court",
-        "sessions court",
-        "magistrate",
-        "trial court",
-        "family court",
-        "civil judge"
+      "field": "tier",
+      "values": [
+        "local"
       ]
     },
     {
       "name": "regional",
       "label": "Regional",
-      "field": "jurisdiction",
+      "field": "tier",
       "values": [
-        "Delhi",
-        "Uttar Pradesh",
-        "Bihar",
-        "Rajasthan"
+        "regional"
       ]
     },
     {
       "name": "national",
       "label": "National",
-      "field": "jurisdiction",
+      "field": "tier",
       "values": [
-        "India"
+        "national"
       ]
     }
   ]

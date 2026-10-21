@@ -15,6 +15,20 @@ import re
 
 _WS = re.compile(r"\s+")
 
+#: How a boolean field is supported by the quote it cites.
+#:
+#: A boolean is a classification, not a word the source prints: no document
+#: says "dlsa_eligible: true". It says the applicant is entitled to free legal
+#: aid. Which words count as that statement is knowledge about this vertical,
+#: so it lives here, in the edition, and travels with the corpus file as data.
+#: The core importer only checks that one of the declared terms is in the quote;
+#: it does not know what any of them mean.
+BOOLEAN_SUPPORT: dict[str, dict[str, list[str]]] = {
+    "dlsa_eligible": {
+        "true_terms": ["eligible", "entitled", "free legal aid"],
+    },
+}
+
 
 def clean(value: object) -> str:
     return _WS.sub(" ", str(value or "")).strip()
@@ -63,6 +77,38 @@ def quote_for(text: str, needle: str) -> str:
     return text[span[0]:span[1]] if span else ""
 
 
+def tier_for(document: dict, policy: dict) -> str:
+    """Which tier of law a document belongs to: local, regional or national.
+
+    The answer comes from the manifest's own metadata -- the state the source
+    is filed under and the jurisdiction it speaks for -- and from the policy
+    the manifest declares. No place name is written here, and none is guessed:
+    a document the manifest has not classified is a build failure, not a
+    silent third.
+
+    The policy is data for the same reason the sources are:
+
+    * `national_states` are the states whose law is union law (the manifest
+      spells them `CENTRAL`);
+    * `home_jurisdiction` is the state this edition serves, which is the local
+      tier for its readers;
+    * everything else is a state of its own: regional.
+    """
+    state = clean(document.get("state"))
+    jurisdiction = clean(document.get("jurisdiction"))
+    national = {clean(s).lower()
+                for s in (policy.get("national_states") or [])}
+    home = clean(policy.get("home_jurisdiction")).lower()
+    if not state and not jurisdiction:
+        raise ValueError("a document with no state and no jurisdiction cannot "
+                         "be placed in a tier")
+    if state.lower() in national:
+        return "national"
+    if home and jurisdiction.lower() == home:
+        return "local"
+    return "regional"
+
+
 def header_lines(document: dict) -> dict[str, str]:
     """The metadata lines the stored text begins with, keyed by field name."""
     title = clean(document.get("title"))
@@ -73,6 +119,7 @@ def header_lines(document: dict) -> dict[str, str]:
     year = clean(document.get("year"))
     act = clean(document.get("act"))
     section = clean(document.get("section"))
+    tier = clean(document.get("tier"))
     values = {
         "document_title": title,
         "document_type": doc_type,
@@ -82,6 +129,7 @@ def header_lines(document: dict) -> dict[str, str]:
         "year": year,
         "act": act,
         "section": section,
+        "tier": tier,
     }
     labels = {
         "document_title": "Title",
@@ -92,6 +140,7 @@ def header_lines(document: dict) -> dict[str, str]:
         "year": "Year",
         "act": "Act",
         "section": "Section",
+        "tier": "Tier",
     }
     return {name: f"{labels[name]}: {value}"
             for name, value in values.items() if value}
@@ -143,7 +192,7 @@ def _looks_like_front_matter(line: str) -> bool:
         "the judgment of", "for the appellant", "for the respondent",
         "for the state", "for the petitioners", "special leave petition",
         "appellate jurisdiction", "supreme court reports")) or bool(
-            re.search(r"\wv\.", line))
+            re.search(r"(?:\bv\.|[A-Za-z]v\.)", line))
 
 
 def summary_quote(body: str, *, min_chars: int = 120, max_chars: int = 900) -> str:
@@ -159,7 +208,8 @@ def summary_quote(body: str, *, min_chars: int = 120, max_chars: int = 900) -> s
     if not body:
         return ""
     for marker in ("J U D G M E N T", "JUDGMENT", "Headnotes",
-                   "Issue for Consideration", "ORDER"):
+                   "Issue for Consideration", "Pronounced On", "Reserved On",
+                   "ORDER"):
         # "DATE OF JUDGMENT" appears in the metadata block before the real
         # heading. Taking the last occurrence skips it; ORDER is the one marker
         # whose operative text is at the end, so it keeps the first hit.
@@ -234,8 +284,13 @@ def fields_for(document: dict, text: str, lines: dict[str, str],
 
     eligible = dlsa_quote(body)
     if eligible:
-        fields["dlsa_eligible"] = {"value": True, "quote": eligible,
-                                   "read_method": "regex"}
+        fields["dlsa_eligible"] = {
+            "value": True, "quote": eligible, "read_method": "regex",
+            # The words that make this a `true`. The core importer checks
+            # them; it does not know what they mean.
+            "support_terms": list(BOOLEAN_SUPPORT.get("dlsa_eligible", {})
+                                  .get("true_terms", [])),
+        }
     return fields
 
 
@@ -244,11 +299,16 @@ def dlsa_quote(body: str) -> str:
 
     The field is positive-only by design. A judgment about legal aid does not
     make its parties eligible, so this looks for the two ideas in one sentence
-    rather than for the topic alone.
+    rather than for the topic alone. The words come from `BOOLEAN_SUPPORT`, so
+    the rule that decides what counts and the rule that checks the corpus
+    cannot drift apart.
     """
+    terms = BOOLEAN_SUPPORT.get("dlsa_eligible", {}).get("true_terms", [])
+    if not terms:
+        return ""
     for sentence in re.split(r"(?<=[.!?])\s+", body or ""):
         low = sentence.lower()
-        if ("eligible" in low or "entitled" in low) and (
+        if any(term in low for term in terms) and (
                 "free legal aid" in low or "legal services" in low
                 or "legal aid" in low):
             return sentence.strip()

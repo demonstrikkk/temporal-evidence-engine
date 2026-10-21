@@ -1,8 +1,8 @@
 # Legal corpus build
 
 - documents: 68
-- cells: 546
-- generated_at: 2026-10-21T09:11:12+00:00
+- cells: 617
+- generated_at: 2026-10-21T10:36:13+00:00
 
 | document_type | documents |
 |---|---|

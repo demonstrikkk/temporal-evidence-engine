@@ -808,6 +808,51 @@ async def get_dataset(did: str, include_records: bool = False,
     return {"data": view, "error": None, "meta": {"correlation_id": cid}}
 
 
+async def _plan_for_run(run_id: str) -> dict:
+    """The plan a run was built from, wherever that plan was stored.
+
+    A plan can live in three places, and the buckets view must not care which:
+
+    * the run row itself (a corpus import stores its plan there, and
+      `LocalRepo.create_run` keeps it on the run);
+    * under the run id (a corpus import also saves it by run id);
+    * under the plan id, which is what a *compiled* run has: the run was
+      started from a compiled plan, and the plan's id is the run's
+      `workflow_id`, not the run id.
+
+    Looking only under the run id meant a compiled run's dataset reported
+    "no buckets" for a plan that declared them.
+    """
+    if not run_id:
+        return {}
+    r = repo()
+    getter = getattr(r, "get_plan", None)
+    if not callable(getter):
+        return {}
+    try:
+        plan = await asyncio.to_thread(getter, run_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("plan lookup failed",
+                    extra={"data": {"run_id": run_id[:36], "error": str(e)[:150]}})
+        return {}
+    if plan:
+        return plan
+    run = await asyncio.to_thread(r.get_run, run_id) or {}
+    # `LocalRepo` keeps the plan on the run row itself.
+    own = run.get("plan") or {}
+    if own:
+        return own
+    plan_id = str(run.get("workflow_id") or "")
+    if not plan_id or plan_id == run_id:
+        return {}
+    try:
+        return await asyncio.to_thread(getter, plan_id) or {}
+    except Exception as e:  # noqa: BLE001
+        log.warning("plan lookup failed",
+                    extra={"data": {"plan_id": plan_id[:36], "error": str(e)[:150]}})
+        return {}
+
+
 @app.get("/api/datasets/{did}/buckets", dependencies=[Depends(require_api_key)])
 async def get_dataset_buckets(did: str,
                               cid: str = Depends(correlation_id)) -> dict:
@@ -821,7 +866,7 @@ async def get_dataset_buckets(did: str,
     ds = await asyncio.to_thread(repo().get_dataset_row, did)
     if not ds:
         raise not_found("dataset", did)
-    plan = await asyncio.to_thread(repo().get_plan, ds.get("run_id", "")) or {}
+    plan = await _plan_for_run(ds.get("run_id", ""))
     rules = plan.get("buckets") or []
     if not rules:
         return {"data": {"dataset_id": did, "records": ds.get("record_count", 0),

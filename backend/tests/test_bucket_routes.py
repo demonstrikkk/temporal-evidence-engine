@@ -73,6 +73,34 @@ def test_buckets_page_past_the_repository_page_cap(client):
     assert data["unassigned_count"] == 0
 
 
+def test_a_compiled_run_finds_its_plan_under_the_plan_id(client):
+    """A run started from a compiled plan stores the plan under the plan id.
+
+    Looking only under the run id made every compiled run's dataset report
+    "no buckets" for a plan that declared them.
+    """
+    plan_id = "plan-buckets-compiled"
+    plan = {
+        "goal": "legal documents", "entity": "legal_document",
+        "fields": [{"name": "jurisdiction", "type": "string"}],
+        "search_queries": ["legal"],
+        "buckets": [{"name": "national", "label": "National",
+                     "field": "jurisdiction", "values": ["India"]}],
+    }
+    rows = [{"fields": {"jurisdiction": {"value": "India",
+                                         "verification_status": "verified",
+                                         "source": {}}}}]
+    run_id = "run-compiled-buckets"
+    main_mod.REPO.save_plan(plan_id, plan)
+    main_mod.REPO.create_run(run_id, plan_id, plan)
+    did = main_mod.REPO.finalize_dataset(run_id, plan, rows, {"records": 1})
+
+    data = client.get(f"/api/datasets/{did}/buckets").json()["data"]
+
+    views = {b["name"]: b for b in data["buckets"]}
+    assert views["national"]["count"] == 1
+
+
 def test_a_dataset_without_rules_says_so_instead_of_inventing_buckets(client):
     did = _dataset(buckets=[])
     data = client.get(f"/api/datasets/{did}/buckets").json()["data"]

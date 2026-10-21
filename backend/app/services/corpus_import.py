@@ -67,7 +67,7 @@ def load_corpus(path: str | Path) -> dict:
     return payload
 
 
-def _supported(value: Any, quote: str) -> bool:
+def _supported(value: Any, quote: str, support_terms: Any = ()) -> bool:
     """Is `value` stated by `quote`?
 
     This is the corpus-side support verdict. It is intentionally literal: a
@@ -76,20 +76,23 @@ def _supported(value: Any, quote: str) -> bool:
     present. It does not prove the value means what the schema says -- only a
     reader or a judge can -- but it refuses a value attributed to a sentence
     that does not contain it.
+
+    A boolean is a classification, not a word the source prints, so the words
+    that support `true` are declared by the edition, per field, in the corpus
+    file. The core does not know what any of them mean: it checks that one of
+    them is in the quote. A boolean field that declares no terms can only be
+    supported by the literal word, and otherwise fails closed.
     """
     if value is None:
         return False
     quote_norm = normalize_for_match(quote)
     if not quote_norm:
         return False
+    terms = [str(t) for t in (support_terms or []) if str(t).strip()]
     items = value if isinstance(value, (list, tuple)) else [value]
     for item in items:
         if isinstance(item, bool):
-            # A boolean is a classification, not a word the source prints.
-            # `true` must therefore be supported by the source's own
-            # eligibility words; there is no stored `false` by design.
-            if item and any(word in quote_norm for word in
-                            ("eligible", "entitled", "free legal aid")):
+            if item and any(normalize_for_match(t) in quote_norm for t in terms):
                 continue
             needle = "true" if item else "false"
         else:
@@ -150,6 +153,7 @@ def _plan(payload: dict) -> dict:
         "edition": str(payload.get("edition") or ""),
         "edition_version": str(payload.get("edition_version") or ""),
         "buckets": list(payload.get("buckets") or []),
+        "tiering": dict(payload.get("tiering") or {}),
     }
 
 
@@ -210,7 +214,7 @@ def import_corpus(repo: object, payload: dict, *,
         for name, field in (document.get("fields") or {}).items():
             quote = str(field.get("quote") or "")
             value = field.get("value")
-            supported = _supported(value, quote)
+            supported = _supported(value, quote, field.get("support_terms"))
             status = "verified" if supported else "unverified"
             reason = "" if supported else (
                 "the quote does not contain the value it is cited for")

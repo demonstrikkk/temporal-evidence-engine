@@ -18,7 +18,7 @@ from app.core.errors import AppError
 from app.domain import api, registry
 from app.domain.apply import apply_profile
 from app.domain.profile import DomainProfile
-from app.schemas.plan import FieldSpec
+from app.schemas.plan import FieldSpec, WorkflowPlan
 from app.services import planner, relevance, selectors
 
 
@@ -143,6 +143,32 @@ def test_the_merge_is_idempotent() -> None:
     once = apply_profile(_plan(), _legal())
     twice = apply_profile(once, _legal())
     assert once == twice
+
+
+def test_the_tiering_policy_reaches_the_plan_and_survives_the_round_trip() -> None:
+    """The policy that files a document in a tier must not be lost.
+
+    It is declared on the profile and carried by the plan, and the plan model
+    declares it: pydantic drops a key it does not know, so a plan that lost
+    the policy would file every document in one tier.
+    """
+    profile = _legal(tiering={"home_jurisdiction": "Example",
+                              "national_states": ["CENTRAL"]})
+    out = apply_profile(_plan(), profile)
+
+    assert out["tiering"] == {"home_jurisdiction": "Example",
+                              "national_states": ["CENTRAL"]}
+
+    kept = WorkflowPlan(**out).model_dump()
+    assert kept["tiering"] == out["tiering"]
+    assert WorkflowPlan(**kept).model_dump()["tiering"] == out["tiering"]
+
+
+def test_a_plan_that_already_has_a_tiering_policy_keeps_it() -> None:
+    plan = _plan(tiering={"home_jurisdiction": "Chosen"})
+    out = apply_profile(plan, _legal(tiering={"home_jurisdiction": "Edition"}))
+
+    assert out["tiering"] == {"home_jurisdiction": "Chosen"}
 
 
 def test_an_empty_allowlist_takes_the_editions() -> None:

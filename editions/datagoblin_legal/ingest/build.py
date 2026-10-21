@@ -20,12 +20,12 @@ from pathlib import Path
 if __package__ in (None, ""):  # direct script execution
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from ingest.fetch import fetch
-    from ingest.normalize import compose, fields_for
+    from ingest.normalize import compose, fields_for, tier_for
     from ingest.parse import body_text, constitution_article
     from ingest.validate import report, require_valid, validate
 else:
     from .fetch import fetch
-    from .normalize import compose, fields_for
+    from .normalize import compose, fields_for, tier_for
     from .parse import body_text, constitution_article
     from .validate import report, require_valid, validate
 
@@ -42,6 +42,17 @@ def _edition() -> dict:
     return json.loads((EDITION_DIR / "edition.json").read_text(encoding="utf-8"))
 
 
+def _tiering_policy() -> dict:
+    """How a document is placed in a tier, read from the manifest.
+
+    The policy is data because it is legal knowledge: which states are union
+    law, and which state this edition serves. It is declared next to the
+    sources it describes, so adding a state is an edit to a list rather than
+    an edit to the code that reads it.
+    """
+    return _edition().get("tiering") or {}
+
+
 def _summary(document: dict) -> dict:
     return {
         "doc_id": document["doc_id"],
@@ -50,6 +61,7 @@ def _summary(document: dict) -> dict:
         "citation": document.get("citation", ""),
         "court": document.get("court", ""),
         "jurisdiction": document.get("jurisdiction", ""),
+        "tier": document.get("tier", ""),
         "year": document.get("year"),
         "source_url": document.get("source_url", ""),
         "fetch_url": document.get("fetch_url", ""),
@@ -63,6 +75,7 @@ def build(documents: list[dict], *, cache_dir: Path, refresh: bool = False,
           timeout: float = 90.0) -> tuple[dict, list[str]]:
     warnings: list[str] = []
     built: list[dict] = []
+    policy = _tiering_policy()
     for index, source in enumerate(documents, 1):
         doc_id = str(source.get("doc_id") or "")
         try:
@@ -74,6 +87,10 @@ def build(documents: list[dict], *, cache_dir: Path, refresh: bool = False,
                 body = constitution_article(
                     body, str(source.get("section") or ""),
                     str(source.get("title") or ""))
+            # The tier is derived here and stored in the header, so the
+            # bucket rule that reads it is a value in the text rather than a
+            # place name written into code.
+            source = {**source, "tier": tier_for(source, policy)}
             text, lines = compose(source, body)
             fields = fields_for(source, text, lines, body)
             if "document_title" not in fields:
@@ -81,7 +98,7 @@ def build(documents: list[dict], *, cache_dir: Path, refresh: bool = False,
             document = {
                 **{k: source.get(k) for k in (
                     "doc_id", "doc_type", "title", "citation", "act", "short_act",
-                    "section", "court", "jurisdiction", "state", "year",
+                    "section", "court", "jurisdiction", "state", "tier", "year",
                     "source_url", "fetch_url", "content_type", "text_field")},
                 "retrieved_at": fetched.get("fetched_at", ""),
                 "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -109,6 +126,7 @@ def build(documents: list[dict], *, cache_dir: Path, refresh: bool = False,
         "generated_at": _now(),
         "schema": edition.get("fields", []),
         "buckets": edition.get("buckets", []),
+        "tiering": edition.get("tiering", {}),
         "dedupe_keys": edition.get("dedupe_keys", []),
         "allowed_sources": edition.get("allowed_sources", []),
         "seed_domains": edition.get("seed_domains", []),

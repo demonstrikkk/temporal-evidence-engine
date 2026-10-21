@@ -84,6 +84,10 @@ class WorkflowPlan(BaseModel):
     #: same reason as the edition stamp: a key pydantic does not know is gone on
     #: the next round trip, and the bucket view would forget how to group.
     buckets: list[dict] = Field(default_factory=list)
+    #: How the edition places a document in a tier, as data. Declared here for
+    #: the same reason as the buckets: pydantic drops a key it does not know,
+    #: and a run that lost the policy would file every document in one tier.
+    tiering: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourceRef(BaseModel):

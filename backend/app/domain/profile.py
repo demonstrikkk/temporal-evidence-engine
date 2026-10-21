@@ -41,8 +41,8 @@ class BucketRule(BaseModel):
     provenance changes, and a record may fall into more than one bucket.
 
     `values` are exact, case-insensitive matches; `contains` are substrings for
-    fields whose value carries more than the bucket word ("High Court of Delhi"
-    in `court`). Matching both lists is an OR. A rule with no matcher is a
+    fields whose value carries more than the bucket word ("Regional Office" in
+    `office`). Matching both lists is an OR. A rule with no matcher is a
     configuration error rather than a bucket that silently catches everything.
     """
 
@@ -123,6 +123,17 @@ class DomainProfile(BaseModel):
     #: Derived views over declared fields (for example, court level). The core
     #: only groups stored cells; an edition never gets to write a second copy.
     buckets: list[BucketRule] = Field(default_factory=list)
+
+    #: How the edition places a document in a tier, as data.
+    #:
+    #: The core does not know what a "tier" is, or which states exist -- an
+    #: edition that wants a local/regional/national view says so here, and the
+    #: core carries the declaration without interpreting it. `national_states`
+    #: are the states whose law is union law; `home_jurisdiction` is the state
+    #: the edition serves, which is its local tier. The keys are free-form on
+    #: purpose: this is the edition's vocabulary, and the core is not the place
+    #: to define it.
+    tiering: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("name")
     @classmethod

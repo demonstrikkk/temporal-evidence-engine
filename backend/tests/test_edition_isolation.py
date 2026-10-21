@@ -88,6 +88,65 @@ def test_editions_only_import_the_published_surface() -> None:
                      f"{CORE_ALLOWED}:\n" + "\n".join(bad))
 
 
+def _string_literals(path: Path) -> list[tuple[int, str]]:
+    """Every string literal in a file that is not a docstring.
+
+    Docstrings are excluded on purpose: a comment explaining *why* the core
+    stays domain-agnostic is allowed to name the words it refuses to bake in.
+    What is not allowed is the words themselves, in code, deciding something.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+    return [(node.lineno, node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and id(node) not in docstrings]
+
+
+def test_the_core_carries_no_editions_vocabulary() -> None:
+    """The core must not know what a legal word means.
+
+    A shared service that hardcodes one vertical's words is that vertical
+    wearing the engine's clothes. `corpus_import` once decided that a boolean
+    was supported when the quote contained "eligible", "entitled" or "free
+    legal aid" -- legal vocabulary, in the core, deciding what every other
+    edition's booleans mean. The words now travel with the corpus file, so
+    the core only checks that a declared term is present.
+
+    Only string literals are checked. A docstring may name the word it
+    refuses to bake in; a literal may not.
+    """
+    vocabulary = (
+        "free legal aid",
+        "legal aid",
+        "eligible",
+        "entitled",
+        "high court",
+        "supreme court",
+        "indiacode",
+        "delhi",
+        "district court",
+    )
+    bad: list[str] = []
+    for path in sorted(APP.rglob("*.py")):
+        for line, literal in _string_literals(path):
+            low = literal.lower()
+            for word in vocabulary:
+                if word in low:
+                    bad.append(f"{path.relative_to(ROOT)}:{line} has {word!r} "
+                               f"in a string literal")
+    assert not bad, ("the core carries an edition's vocabulary; it should "
+                     "come from the edition as data:\n" + "\n".join(bad))
+
+
 def test_the_scanner_notices_a_core_import() -> None:
     assert _violations("import editions.legal", direction="core")
     assert _violations("from datagoblin_legal import profile", direction="core")

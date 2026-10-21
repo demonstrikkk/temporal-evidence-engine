@@ -20,15 +20,16 @@ from collections import Counter
 from .normalize import find_span
 
 
-def _supported(value: object, quote: str) -> bool:
+def _supported(value: object, quote: str, support_terms: object = ()) -> bool:
     quote_low = " ".join((quote or "").split()).lower()
     if not quote_low:
         return False
+    terms = [str(t) for t in (support_terms or []) if str(t).strip()]
     items = value if isinstance(value, (list, tuple)) else [value]
     for item in items:
         if isinstance(item, bool):
-            if item and any(word in quote_low for word in
-                            ("eligible", "entitled", "free legal aid")):
+            if item and any(" ".join(t.split()).lower() in quote_low
+                            for t in terms):
                 continue
             needle = "true" if item else "false"
         else:
@@ -88,7 +89,8 @@ def validate(payload: dict, *, expected_count: int | None = None) -> list[str]:
                 continue
             if find_span(text, quote) is None:
                 problems.append(f"{doc_id}: field {name!r} quote does not resolve")
-            if not _supported(field.get("value"), quote):
+            if not _supported(field.get("value"), quote,
+                              field.get("support_terms")):
                 problems.append(f"{doc_id}: field {name!r} value is not in its quote")
     return problems
 

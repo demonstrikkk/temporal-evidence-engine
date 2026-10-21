@@ -36,7 +36,7 @@ const GLYPH = {
   overview: '◉',
   records: '▦',
   fields: '⌗',
-  buckets: 'buckets',
+  buckets: '⊞',
   sources: '◌',
   review: '✓',
   coverage: '△',

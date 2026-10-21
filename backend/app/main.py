@@ -31,6 +31,7 @@ from app.repositories import factory as factory_repo
 from app.repositories.factory import build_repo
 from app.schemas.run import Counters, DatasetView, Envelope, RunView
 from app.services import backfill as backfill_svc
+from app.services import buckets as buckets_svc
 from app.services import dataset_agent as agent_svc
 from app.services import dashboard as dashboard_svc
 from app.services import profile as profile_svc
@@ -805,6 +806,45 @@ async def get_dataset(did: str, include_records: bool = False,
         full = await asyncio.to_thread(repo().get_dataset, did)
         view["records"] = (full or {}).get("records", [])
     return {"data": view, "error": None, "meta": {"correlation_id": cid}}
+
+
+@app.get("/api/datasets/{did}/buckets", dependencies=[Depends(require_api_key)])
+async def get_dataset_buckets(did: str,
+                              cid: str = Depends(correlation_id)) -> dict:
+    """Derived Local/Regional/National-style views over stored cells.
+
+    A bucket is a grouping, not a copy: this reads the dataset's cells and
+    returns the record ids that match each rule. The rules come from the plan
+    the edition stamped at compile time, so a dataset imported from a corpus
+    keeps the same views a compiled run would have.
+    """
+    ds = await asyncio.to_thread(repo().get_dataset_row, did)
+    if not ds:
+        raise not_found("dataset", did)
+    plan = await asyncio.to_thread(repo().get_plan, ds.get("run_id", "")) or {}
+    rules = plan.get("buckets") or []
+    if not rules:
+        return {"data": {"dataset_id": did, "records": ds.get("record_count", 0),
+                         "buckets": [], "unassigned_count": 0,
+                         "unassigned_record_ids": [],
+                         "edition": plan.get("edition", ""),
+                         "reason": "this dataset's plan declares no buckets"},
+                "error": None, "meta": {"correlation_id": cid}}
+    # `get_records` caps a page (LocalRepo at 500), so asking for 5000 returned
+    # 500 and the counts looked complete. Page until the dataset is exhausted.
+    records: list[dict] = []
+    offset = 0
+    while True:
+        got = await asyncio.to_thread(repo().get_records, did, "", 500, offset)
+        batch = (got or {}).get("records") or []
+        records.extend(batch)
+        if len(batch) < 500:
+            break
+        offset += len(batch)
+    out = buckets_svc.derive(rules, records)
+    out["dataset_id"] = did
+    out["edition"] = plan.get("edition", "")
+    return {"data": out, "error": None, "meta": {"correlation_id": cid}}
 
 
 @app.delete("/api/datasets/{did}", dependencies=[Depends(require_api_key)])

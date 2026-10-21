@@ -32,6 +32,31 @@ MAX_GUIDANCE_CHARS = 2000
 _SLUG = re.compile(r"^[a-z][a-z0-9_-]{1,40}$")
 
 
+class BucketRule(BaseModel):
+    """One derived view over a record field.
+
+    Buckets are a *view*, not another copy of the data: a rule names a field the
+    edition already declares and the values that belong in the bucket. The
+    service reads the stored cells and groups them; nothing about the record's
+    provenance changes, and a record may fall into more than one bucket.
+
+    `values` are exact, case-insensitive matches; `contains` are substrings for
+    fields whose value carries more than the bucket word ("High Court of Delhi"
+    in `court`). Matching both lists is an OR. A rule with no matcher is a
+    configuration error rather than a bucket that silently catches everything.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    label: str = ""
+    field: str
+    values: list[str] = Field(default_factory=list)
+    contains: list[str] = Field(default_factory=list)
+    #: Where records that match no rule go. At most one rule may claim it.
+    fallback: bool = False
+
+
 class DomainProfile(BaseModel):
     """One vertical's knowledge, in a form the core can consume.
 
@@ -94,6 +119,10 @@ class DomainProfile(BaseModel):
 
     #: Prompts this edition is meant to answer, for the UI and for conformance.
     examples: list[str] = Field(default_factory=list)
+
+    #: Derived views over declared fields (for example, court level). The core
+    #: only groups stored cells; an edition never gets to write a second copy.
+    buckets: list[BucketRule] = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod

@@ -85,6 +85,12 @@ def apply_profile(plan: dict, profile: DomainProfile) -> dict:
         if key not in out or out[key] in (None, "", [], {}):
             out[key] = copy.deepcopy(value)
 
+    # Buckets are additive like every other edition contribution. A plan that
+    # already carries rules keeps them; applying the same profile twice must
+    # not duplicate the list.
+    if profile.buckets and not out.get("buckets"):
+        out["buckets"] = [rule.model_dump() for rule in profile.buckets]
+
     out["edition"] = profile.name
     out["edition_version"] = profile.version
     return out

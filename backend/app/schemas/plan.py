@@ -80,6 +80,10 @@ class WorkflowPlan(BaseModel):
     #: run would lose the record of what shaped it.
     edition: str = ""
     edition_version: str = ""
+    #: Derived bucket rules contributed by the edition. Declared here for the
+    #: same reason as the edition stamp: a key pydantic does not know is gone on
+    #: the next round trip, and the bucket view would forget how to group.
+    buckets: list[dict] = Field(default_factory=list)
 
 
 class SourceRef(BaseModel):

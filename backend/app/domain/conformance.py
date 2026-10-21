@@ -72,6 +72,25 @@ def check(profile: DomainProfile) -> list[str]:
         if not _FIELD.match(name):
             problems.append(f"field_phrases key is not a field identifier: {name!r}")
 
+    bucket_names: list[str] = []
+    fallbacks = 0
+    for rule in profile.buckets:
+        bucket_names.append(rule.name)
+        if not _FIELD.match(rule.name):
+            problems.append(f"bucket name must be snake_case: {rule.name!r}")
+        if rule.field not in declared:
+            problems.append(f"bucket {rule.name!r} names a field the profile "
+                            f"does not declare: {rule.field!r}")
+        if not (rule.values or rule.contains or rule.fallback):
+            problems.append(f"bucket {rule.name!r} has no values, contains or "
+                            "fallback, so it can never match")
+        fallbacks += int(bool(rule.fallback))
+    duplicates = sorted({n for n in bucket_names if bucket_names.count(n) > 1})
+    if duplicates:
+        problems.append(f"duplicate bucket names: {', '.join(duplicates)}")
+    if fallbacks > 1:
+        problems.append("more than one bucket claims the fallback")
+
     for prompt in profile.examples:
         if not str(prompt).strip():
             problems.append("examples contains a blank prompt")

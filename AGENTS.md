@@ -147,6 +147,33 @@ Gate: the core suite must pass with no edition installed. Then, per edition:
 $env:EDITIONS_PATH="editions"; backend\.venv\Scripts\python.exe -m pytest editions\<name>\tests -q
 ```
 
+### The legal corpus
+
+The legal edition ships a curated corpus rather than crawling at request time.
+The build is offline after the first fetch and writes `corpus/documents.json`,
+`corpus/index.json` and `corpus/report.md`:
+
+```powershell
+backend\.venv\Scripts\python.exe editions\datagoblin_legal\ingest\build.py --write
+```
+
+Every field quote is a slice of the stored text: a metadata header from
+`sources.json` followed by the source body. `corpus/.cache/` is ignored; it holds
+source bytes, not evidence. Rebuild with `--refresh` only when you mean to accept
+changed source text.
+
+Import the corpus through the generic importer, never through `/api/runs` (a run
+is capped at twelve seeds):
+
+```powershell
+backend\.venv\Scripts\python.exe backend\scripts\import_corpus.py `
+  --corpus editions\datagoblin_legal\corpus\documents.json
+```
+
+The importer validates every quote and value first, stores each document with
+`upsert_page`, settles every cell through `validator.settle`, and finalizes the
+run and dataset together.
+
 ## Before you claim something works
 
 Say what you ran and what it printed. "The tests pass" is a claim about a

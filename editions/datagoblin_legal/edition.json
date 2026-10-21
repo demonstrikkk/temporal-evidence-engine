@@ -1,0 +1,155 @@
+{
+  "name": "datagoblin_legal",
+  "version": "0.1.0",
+  "api_version": 1,
+  "description": "Indian legal documents: central statutes, the Constitution, and reported judgments, with every value tied to a locatable quote.",
+  "entity": "legal_document",
+  "fields": [
+    {
+      "name": "document_title",
+      "type": "string",
+      "description": "The document's own title, e.g. 'Arnesh Kumar v. State of Bihar' or 'BNS s. 3 - General explanations'.",
+      "required": true
+    },
+    {
+      "name": "document_type",
+      "type": "string",
+      "description": "One of statute, judgment, constitution or fee_schedule."
+    },
+    {
+      "name": "citation",
+      "type": "string",
+      "description": "The reporter or act citation printed for the document."
+    },
+    {
+      "name": "court",
+      "type": "string",
+      "description": "The court that decided the judgment, empty for legislation."
+    },
+    {
+      "name": "jurisdiction",
+      "type": "string",
+      "description": "The state or union jurisdiction the document belongs to (India for central law and the Supreme Court)."
+    },
+    {
+      "name": "year",
+      "type": "number",
+      "description": "The year of enactment, publication or judgment."
+    },
+    {
+      "name": "act",
+      "type": "string",
+      "description": "The Act, Code or Constitution the document belongs to."
+    },
+    {
+      "name": "section",
+      "type": "string",
+      "description": "The section, article or order rule the document covers, when it covers one."
+    },
+    {
+      "name": "summary",
+      "type": "string",
+      "description": "A verbatim excerpt from the document body, not a paraphrase."
+    },
+    {
+      "name": "dlsa_eligible",
+      "type": "boolean",
+      "description": "True only where the document states eligibility for free legal aid; never written false."
+    }
+  ],
+  "field_phrases": {
+    "document_title": "case title",
+    "citation": "case citation",
+    "court": "court name",
+    "jurisdiction": "jurisdiction",
+    "act": "act name",
+    "section": "section number",
+    "summary": "judgment summary"
+  },
+  "required_fields": [
+    "document_title"
+  ],
+  "dedupe_keys": [
+    "document_title"
+  ],
+  "allowed_sources": [
+    "indiacode.gov.in",
+    "api.sci.gov.in",
+    "delhihighcourt.nic.in",
+    "patnahighcourt.gov.in",
+    "allahabadhighcourt.in",
+    "hcraj.nic.in",
+    "legislative.gov.in",
+    "dslsa.org",
+    "cdnbbsr.s3waas.gov.in"
+  ],
+  "seed_domains": [
+    "indiacode.gov.in",
+    "api.sci.gov.in",
+    "delhihighcourt.nic.in",
+    "patnahighcourt.gov.in",
+    "allahabadhighcourt.in",
+    "hcraj.nic.in",
+    "legislative.gov.in"
+  ],
+  "relevance_terms": [
+    "statute",
+    "judgment",
+    "legal aid",
+    "high court",
+    "supreme court",
+    "section",
+    "article"
+  ],
+  "validation_rules": [
+    "Every stored value carries a quote that resolves against the stored document text.",
+    "A judgment's court and jurisdiction come from the document, not from its filename.",
+    "dlsa_eligible is written true only where a quote states eligibility; there is no false value."
+  ],
+  "planner_guidance": "A row is one legal document: a section of an Act, a constitutional article, or a reported judgment. Prefer official court and India Code sources. Record the document's own title and citation; do not invent a reporter citation.",
+  "extractor_guidance": "Quote the exact words of the document. A summary is a verbatim excerpt, never a paraphrase. Leave a field absent rather than guessing it.",
+  "defaults": {
+    "source_types": [
+      "official"
+    ]
+  },
+  "examples": [
+    "What does BNS section 3 say about general explanations?",
+    "Which Supreme Court judgments require a magistrate to consider legal aid before remand?",
+    "Show Delhi High Court judgments about legal aid in criminal cases."
+  ],
+  "buckets": [
+    {
+      "name": "local",
+      "label": "Local",
+      "field": "court",
+      "contains": [
+        "district court",
+        "sessions court",
+        "magistrate",
+        "trial court",
+        "family court",
+        "civil judge"
+      ]
+    },
+    {
+      "name": "regional",
+      "label": "Regional",
+      "field": "jurisdiction",
+      "values": [
+        "Delhi",
+        "Uttar Pradesh",
+        "Bihar",
+        "Rajasthan"
+      ]
+    },
+    {
+      "name": "national",
+      "label": "National",
+      "field": "jurisdiction",
+      "values": [
+        "India"
+      ]
+    }
+  ]
+}

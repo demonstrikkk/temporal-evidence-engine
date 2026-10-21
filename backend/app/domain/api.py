@@ -13,11 +13,13 @@ from __future__ import annotations
 from app.core.errors import validation
 from app.domain.apply import apply_profile
 from app.domain.conformance import check as check_profile
-from app.domain.profile import EDITION_API_VERSION, DomainProfile, generic_profile
+from app.domain.profile import (EDITION_API_VERSION, BucketRule, DomainProfile,
+                                generic_profile)
 from app.domain.registry import (Edition, get, list_editions, register, reset)
 
 __all__ = [
-    "EDITION_API_VERSION", "DomainProfile", "Edition", "apply_profile", "check_profile",
+    "EDITION_API_VERSION", "BucketRule", "DomainProfile", "Edition",
+    "apply_profile", "check_profile",
     "generic_profile", "get", "list_editions", "register", "require", "reset",
 ]
 

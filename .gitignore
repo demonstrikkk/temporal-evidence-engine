@@ -31,3 +31,7 @@ frontend/screenshots/
 /video/
 video/datagoblin-demo/
 /video/datagoblin-demo/assets/
+
+# Edition fetch caches (rebuildable; source bytes, not evidence)
+editions/*/corpus/.cache/
+

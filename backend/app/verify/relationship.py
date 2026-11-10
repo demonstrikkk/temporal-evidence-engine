@@ -38,7 +38,7 @@ If the document states a different value, put that value in "candidate_value"
 exactly as written. If the document states the same value, "candidate_value"
 must be empty. If the document does not state a value, leave it empty.
 
-Return JSON only:
+The response must be a json object. Return JSON only:
 {"relationship": "...", "quote": "...", "candidate_value": "...",
  "reasoning": "one sentence"}
 

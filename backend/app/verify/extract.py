@@ -43,7 +43,7 @@ Rules you must follow:
   Prices, availability, staffing and rankings are high or ephemeral.
 - "extraction_confidence" is 0..1.
 
-Return JSON only: {"claims": [{...}]}
+The response must be a json object. Return JSON only: {"claims": [{...}]}
 Never return prose, never return a verdict, never judge the claim.
 """
 

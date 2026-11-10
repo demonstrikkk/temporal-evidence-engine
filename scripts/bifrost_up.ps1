@@ -15,6 +15,11 @@
 #   scripts\bifrost_up.ps1 -Reset          # wipe the config store and re-import
 #   scripts\bifrost_up.ps1 -Stop           # stop the process this script started
 #
+# Exit 0 only when the gateway answers, the virtual key is accepted AND every
+# model named in a routing rule's `fallbacks` is actually served. That last check
+# exists because a fallback host that is down when the gateway boots disappears
+# from the served model list without any error; start the fallback host first.
+#
 # Provider keys are read by Bifrost from the environment named in
 # bifrost\config.json (`env.GROQ_API_KEY`), never from this file.
 
@@ -156,6 +161,86 @@ function Test-VirtualKey {
     return @{ ok = $false; detail = "gateway did not answer the key probe: $($probe.body)" }
 }
 
+function Import-DotEnvKey([string]$Name) {
+    # Bifrost reads provider keys from its own environment (`env.GROQ_API_KEY` in
+    # bifrost\config.json). Nothing loads `.env` into a PowerShell session, so a
+    # plain `scripts\bifrost_up.ps1` starts a gateway whose primary provider has
+    # no key: it answers `/health`, accepts the virtual key, and fails every real
+    # call. Read the one key from the same file the backend uses rather than
+    # making "it works if you exported the variable first" part of the product.
+    if (Test-Path "env:$Name") { return $false }
+    $file = Join-Path $repo '.env'
+    if (-not (Test-Path $file)) { return $false }
+    $match = Select-String -Path $file -Pattern "^$Name=(.*)$" |
+        Select-Object -First 1
+    if (-not $match) { return $false }
+    $value = $match.Matches[0].Groups[1].Value.Trim().Trim('"').Trim("'")
+    if (-not $value) { return $false }
+    Set-Item -Path "env:$Name" -Value $value
+    return $true
+}
+
+function Test-ConfigDrift {
+    # The gateway imports `bifrost\config.json` once, into its own store. Editing
+    # the committed file afterwards changes nothing, and nothing says so: a
+    # fallback can be "configured" in the file and absent from the running
+    # gateway. Report the drift, and the one command that fixes it, every time
+    # the script runs - including when the gateway is already up.
+    $stored = Join-Path $appDir 'config.json'
+    if (-not (Test-Path $stored)) { return $null }
+    $a = Get-FileHash $configSource -Algorithm SHA256
+    $b = Get-FileHash $stored -Algorithm SHA256
+    if ($a.Hash -eq $b.Hash) { return $null }
+    return ("bifrost\config.json differs from the copy the gateway imported. " +
+            "The running gateway still uses the imported one. Run this script " +
+            "with -Reset to import the current file (it stops the gateway).")
+}
+
+function Test-FallbackRoute {
+    # A virtual key's wildcard is expanded against the provider catalogue when the
+    # gateway boots. Start the gateway while the fallback host is down and the
+    # fallback model is simply absent from `/v1/models`; the config still looks
+    # right, and every primary rate limit then fails the call instead of
+    # degrading. Measured here: 11 models served with Ollama down, 13 with it up,
+    # same config. So ask the gateway what it will actually serve, rather than
+    # reading the config and believing it.
+    #
+    # NOTE: this is an *optional, warn-only* check. Ollama is a documented
+    # fallback for operators whose hardware can run it; this laptop cannot, so a
+    # missing fallback model must not stop the script. A Groq rate limit with no
+    # fallback produces a `partial` run — honest, not silent.
+    $wanted = @()
+    try {
+        $config = Get-Content $configSource -Raw | ConvertFrom-Json
+        foreach ($rule in @($config.governance.routing_rules)) {
+            foreach ($entry in @($rule.fallbacks)) { if ($entry) { $wanted += $entry } }
+        }
+    }
+    catch {
+        return @{ ok = $false; detail = "could not read $configSource : $_" }
+    }
+    if (-not $wanted.Count) {
+        return @{ ok = $true; detail = 'no fallback configured (a primary failure fails the run)' }
+    }
+    $probe = Invoke-Probe "$baseUrl/v1/models" 15
+    if ($probe.code -ne 200) {
+        return @{ ok = $false; wanted = $wanted
+                  detail = "cannot list models ($($probe.code)): $($probe.body)" }
+    }
+    $served = @((($probe.body | ConvertFrom-Json).data) | ForEach-Object { $_.id })
+    $missing = @($wanted | Where-Object { $served -notcontains $_ })
+    if ($missing.Count) {
+        return @{ ok = $false; wanted = $wanted; missing = $missing
+                  detail = ("$($missing -join ', ') is configured as a fallback but " +
+                            "the gateway will not serve it ($($served.Count) models " +
+                            "listed). The fallback host (Ollama) was probably down " +
+                            "when the gateway started. Optional fallback — " +
+                            "continuing without it.") }
+    }
+    return @{ ok = $true; wanted = $wanted
+              detail = "fallback served: $($wanted -join ', ')" }
+}
+
 if ($Stop) { Stop-Gateway; return }
 
 New-Item -ItemType Directory -Force $appDir | Out-Null
@@ -173,6 +258,9 @@ if (-not (Test-Path (Join-Path $appDir 'config.json'))) {
     Write-Host "Imported bifrost\config.json into $appDir" -ForegroundColor Cyan
 }
 
+$drift = Test-ConfigDrift
+if ($drift) { Write-Host $drift -ForegroundColor Yellow }
+
 if (Test-Gateway 2) {
     Write-Host "Bifrost already answers at $baseUrl." -ForegroundColor Green
     $existing = Test-VirtualKey
@@ -183,7 +271,24 @@ if (Test-Gateway 2) {
         Write-Host "Virtual key $virtualKey : $($existing.detail)" -ForegroundColor Red
         exit 1
     }
+    $route = Test-FallbackRoute
+    if ($route.ok) {
+        Write-Host "$($route.detail)." -ForegroundColor Green
+    }
+    else {
+        Write-Host "Fallback: $($route.detail)" -ForegroundColor Yellow
+    }
     return
+}
+
+if (-not $env:GROQ_API_KEY) {
+    $imported = Import-DotEnvKey 'GROQ_API_KEY'
+    if ($imported) {
+        Write-Host 'Loaded GROQ_API_KEY from .env into the shell environment.' -ForegroundColor Cyan
+    }
+    else {
+        Write-Host 'Warning: GROQ_API_KEY is not set. Bifrost will start, but the hosted provider cannot answer.' -ForegroundColor Yellow
+    }
 }
 
 $binary = Resolve-Binary
@@ -231,5 +336,15 @@ if ($key.ok) {
 }
 else {
     Write-Host "Virtual key $virtualKey : $($key.detail)" -ForegroundColor Red
+}
+# The gateway answering is not the same as the gateway serving what the config
+# promises. Ask it; report, but do not fail — the Ollama fallback is optional
+# on machines that cannot run it (this one cannot).
+$route = Test-FallbackRoute
+if ($route.ok) {
+    Write-Host "$($route.detail)." -ForegroundColor Green
+}
+else {
+    Write-Host "Fallback: $($route.detail)" -ForegroundColor Yellow
 }
 Write-Host "Logs: $logFile"

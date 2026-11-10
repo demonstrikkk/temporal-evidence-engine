@@ -50,7 +50,8 @@ def test_a_locatable_support_is_supported(store, make_gateway, make_tavily,
     row = evidence[0]
     content = row["revision"]["content"]
     assert content[row["start_char"]:row["end_char"]] == row["quote_text"]
-    assert row["link"]["settlement_status"] == "settled"
+    assert row["link"]["settlement_status"] == "accepted"
+    assert row["link"]["relationship_settled"] == "supports"
     assert row["start_char"] > 0  # absolute offset into the stored text
     assert store.get_run(run.run_id)["status"] == "completed"
 
@@ -237,7 +238,16 @@ def test_a_passage_about_another_plan_does_not_refute_this_one(
     rows = store.list_evidence(claim["id"])
     settled = {row["link"]["relationship_proposed"]: row["link"]["settlement_status"]
                for row in rows}
-    assert settled == {"supports": "settled", "contradicts": "not_settled"}
+    assert settled == {"supports": "accepted", "contradicts": "rejected"}
+    # A rejected proposal has no settled relationship. Writing a settlement word
+    # into `relationship_settled` made the column unable to answer "which
+    # relationship survived?", which is the only question its name asks.
+    rejected = [row for row in rows if row["link"]["settlement_status"] == "rejected"]
+    assert rejected and all(row["link"]["relationship_settled"] is None
+                            for row in rejected)
+    accepted = [row for row in rows if row["link"]["settlement_status"] == "accepted"]
+    assert accepted and all(row["link"]["relationship_settled"] == "supports"
+                            for row in accepted)
     skipped = _events(store, run.run_id, "evidence.settled")
     refusal = [e for e in skipped if not e["payload"]["settled"]][0]
     assert "subject" in refusal["payload"]["reason"], refusal["payload"]["reason"]

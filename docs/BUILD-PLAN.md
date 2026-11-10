@@ -244,6 +244,14 @@ Rules:
 Follow DataGoblin's migration contract: `backend/migrations/NNN_*.sql`, applied
 in filename order, idempotent, additive, every new column with a default.
 
+**As built**, every table below lives in schema `tev`, and the file split is
+`000_roles.sql` (the Supabase role names the inherited policies reference),
+`014` answers + runs, `015` claims, `016` sources, `017` evidence, `018`
+model_calls, `019` events, `020` resolved_model, `021` rule-version default
+removed. The SQL in this section is the design record; the migrations are the
+contract. `000` exists because migration 001 grants to `anon`, which only
+Supabase provides - on a plain PostgreSQL the chain aborted there (D-016).
+
 > **Important reuse decision.** Do **not** create a parallel source table that
 > `settle` cannot read. Store source text in `source_revisions` and pass
 > `source_revisions.content` straight to `settle(source_text=...)`. `pages` stays
@@ -351,7 +359,7 @@ CREATE TABLE IF NOT EXISTS claim_evidence (
   evidence_id uuid NOT NULL REFERENCES evidence_spans(id),
   relationship_proposed text NOT NULL DEFAULT 'mentions_only',
   relationship_settled text NULL,        -- supports|contradicts|mentions_only|silent
-  settlement_status text NULL,           -- verified|unverified
+  settlement_status text NULL,           -- accepted|rejected (D-017)
   settlement_reason text NULL,
   settlement_start int NULL,
   settlement_end int NULL,
@@ -449,11 +457,13 @@ Notes:
 
 ### 8.1 Decision precedence
 
-Inputs: only evidence rows where `relationship_settled != 'silent'` and, for
-`supports`/`contradicts`, `settlement_status = 'verified'`. A settled row also
-has to be a statement (three words minimum) and, for a contradiction, has to name
-the claim's own qualifier; both are enforced in `app/verify/settlement.py`
-(D-013).
+Inputs: only evidence rows where `settlement_status = 'accepted'`, and then only
+those whose `relationship_settled` is `supports` or `contradicts`. `accepted` is
+the settlement gate's verdict on the proposal; `relationship_settled` is which
+relationship survived it (D-017 - the columns used to hold `'settled'` in both,
+which answered neither question). A settled row also has to be a statement (three
+words minimum) and, for a contradiction, has to name the claim's own qualifier;
+both are enforced in `app/verify/settlement.py` (D-013).
 
 | # | Condition | Status | Reason |
 |---|---|---|---|
@@ -979,8 +989,8 @@ Verified by command, not by memory:
 
 | command | last output |
 |---|---|
-| `pytest backend\tests -q` | 2313 passed, 8 skipped |
-| `pytest backend\tests\verify -q` | 136 passed |
+| `pytest backend\tests -q` | 2320 passed, 8 skipped |
+| `pytest backend\tests\verify -q` | 140 passed |
 | `npm test` | 33 tests in 3 suites, 0 failures |
 | `npm run build` | exit 0; 58 modules; `dist` JS 248.18 kB (78.21 kB gzip) |
 | `eval\run_eval.py` (hermetic) | 18 cases / 19 claims; status 100%; false supported 0; false changed 0; 26 quotes valid; event dates 8/8; `$0.0000`; **Gate: PASS** |

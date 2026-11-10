@@ -25,9 +25,10 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, time as dtime, timezone
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Protocol
 
 from app.core.config import REPO_ROOT, settings
 from app.core.logging import log
@@ -394,8 +395,34 @@ class LocalStore:
 # ---------------------------------------------------------------------------
 
 def _jsonb(value: Any) -> Any:
+    """A jsonb parameter that can hold what the product actually produces.
+
+    psycopg's default JSON dumper refuses a `datetime`, `date`, `Decimal` or
+    `UUID`. The payloads here are event payloads and receipts, which contain
+    exactly those types, so a model receipt carrying `created_at` was dropped
+    with `could not append run event` on Postgres while the local store kept it.
+    A store that silently loses an event is worse than one that fails loudly,
+    but the right answer is neither: encode the type that is already a legal part
+    of the domain.
+    """
     from psycopg.types.json import Jsonb
-    return Jsonb(value) if value is not None else None
+
+    if value is None:
+        return None
+
+    def encode(obj: Any) -> Any:
+        if isinstance(obj, (datetime, date, dtime)):
+            return obj.isoformat()
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, (uuid.UUID, Path)):
+            return str(obj)
+        if isinstance(obj, (set, frozenset)):
+            return sorted(obj, key=str)
+        raise TypeError(f"{type(obj).__name__} is not JSON serialisable")
+
+    return Jsonb(value, dumps=lambda obj: json.dumps(obj, default=encode,
+                                                     ensure_ascii=False))
 
 
 class PgStore:
@@ -412,19 +439,19 @@ class PgStore:
         return psycopg.connect(self._dsn, row_factory=dict_row,
                                options="-c search_path=tev,public")
 
-    def _one(self, sql: str, params: Iterable[Any] = ()) -> dict | None:
+    def _one(self, sql: str, params: Any = ()) -> dict | None:
         with self._conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
+            cur.execute(sql, params)
             return cur.fetchone()
 
-    def _all(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
+    def _all(self, sql: str, params: Any = ()) -> list[dict]:
         with self._conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
+            cur.execute(sql, params)
             return list(cur.fetchall())
 
-    def _write(self, sql: str, params: Iterable[Any] = ()) -> dict | None:
+    def _write(self, sql: str, params: Any = ()) -> dict | None:
         with self._conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
+            cur.execute(sql, params)
             row = cur.fetchone() if cur.description else None
             conn.commit()
             return row

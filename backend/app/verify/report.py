@@ -177,9 +177,10 @@ def render_markdown(run: dict[str, Any], answer: dict[str, Any],
             lines.append("")
             continue
         for item in evidence:
-            settled = item.get("settlement_status") or "not_settled"
+            fate = item.get("settlement_status") or "rejected"
+            relationship = item.get("relationship_settled") or "none"
             lines.append(f"**{item.get('source_title') or item.get('source_url')}** "
-                         f"— {item.get('publisher')} — {settled}")
+                         f"— {item.get('publisher')} — {fate} (`{relationship}`)")
             lines.append("")
             lines.append(f"- Proposal: `{item.get('relationship_proposed')}`")
             if item.get("settlement_reason"):

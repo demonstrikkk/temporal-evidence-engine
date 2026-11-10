@@ -485,8 +485,20 @@ class Verifier:
                 "id": new_id(), "claim_id": claim_id,
                 "evidence_id": evidence["id"],
                 "relationship_proposed": proposal.relationship.value,
-                "relationship_settled": ("settled" if settled else "unsettled"),
-                "settlement_status": "settled" if settled else "not_settled",
+                # The two columns answer two questions, and neither of them is
+                # "was this any good": `relationship_settled` is *which*
+                # relationship survived the gate (NULL when none did), and
+                # `settlement_status` is whether the gate accepted the proposal.
+                # They used to hold "settled"/"unsettled" and "settled"/
+                # "not_settled", which put a settlement word in a relationship
+                # column and a bare "settled" in both - so a reader querying
+                # `relationship_settled = 'contradicts'` (the schema's own
+                # vocabulary) matched nothing. The word `verified` is
+                # deliberately not used here: it names the promotion chokepoint
+                # on a cell, not the fate of a proposal.
+                "relationship_settled": (proposal.relationship.value
+                                         if settled else None),
+                "settlement_status": "accepted" if settled else "rejected",
                 "settlement_reason": ("" if settled else
                                      (settlement.reason if settlement else
                                       proposal.error or "the quote does not "

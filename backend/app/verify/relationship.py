@@ -18,6 +18,7 @@ from app.core.logging import log
 from app.research.sources import render_windows
 from app.schemas.evidence import locate_quote
 from app.verify.schemas import ClaimDraft, Relationship
+from app.verify.store import iso
 
 _SYSTEM = """You compare one claim with one source document.
 
@@ -113,7 +114,7 @@ def propose(client: BifrostClient, *, claim: ClaimDraft, content: str,
 
     receipt = {"provider": result.provider, "model": result.model,
                "request_id": result.request_id, "status": result.status,
-               "created_at": result.created_at,
+               "created_at": iso(result.created_at),
                "input_tokens": result.input_tokens,
                "output_tokens": result.output_tokens,
                "cost_usd": result.cost_usd, "latency_ms": result.latency_ms,

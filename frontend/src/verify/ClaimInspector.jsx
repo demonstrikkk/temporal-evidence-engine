@@ -26,7 +26,10 @@ function eventStatusLabel(status) {
 }
 
 function SettlementBadge({ status, reason }) {
-  const settled = status === 'settled';
+  // `accepted`/`rejected` is the stored vocabulary: did the settlement gate
+  // accept this proposal? The badge says it in words a reader recognises, but
+  // the state comes from the record rather than from a second guess.
+  const settled = status === 'accepted';
   return (
     <span
       className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${

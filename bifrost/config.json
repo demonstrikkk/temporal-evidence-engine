@@ -43,7 +43,7 @@
           { "provider": "groq", "weight": 1.0,
             "allowed_models": ["*"], "key_ids": ["*"] },
           { "provider": "ollama", "weight": 1.0,
-            "allowed_models": ["*"], "key_ids": ["*"] }
+            "allowed_models": ["llama3.2:1b"], "key_ids": ["*"] }
         ]
       }
     ],

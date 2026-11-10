@@ -23,6 +23,12 @@ CREATE = re.compile(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w.]+)\s*\(", 
 ALTER = re.compile(
     r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?([\w.]+)\s+"
     r"ALTER\s+COLUMN\s+([\w\"]+)", re.I)
+CREATE_ROLE = re.compile(r"CREATE\s+ROLE\s+([\w\"\$]+)", re.I)
+TO_ROLE = re.compile(r"\bTO\s+([\w\"\$]+(?:\s*,\s*[\w\"\$]+)*)", re.I)
+
+#: Roles PostgreSQL always provides. `PUBLIC` is a pseudo-role, not a grantee
+#: anyone can drop.
+BUILTIN_ROLES = {"public", "current_user", "session_user", "current_role"}
 
 #: Not column names: table constraints that can appear inside a CREATE TABLE.
 CONSTRAINTS = {"PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "CONSTRAINT", "EXCLUDE"}
@@ -130,3 +136,44 @@ def test_the_rule_version_default_is_dropped_on_the_tables_that_have_it():
     dropped = {(match.group(1).lower(), match.group(2).strip('"').lower())
                for match in ALTER.finditer(sql)}
     assert dropped == {(table, "rule_version") for table in carriers}, dropped
+
+
+def _strip_comments(sql: str) -> str:
+    return "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+
+
+def _grantees(sql: str) -> set[str]:
+    """Role names named by `GRANT ... TO` or `CREATE POLICY ... TO`."""
+    names: set[str] = set()
+    for statement in _strip_comments(sql).split(";"):
+        if not re.search(r"\b(CREATE\s+POLICY|GRANT)\b", statement, re.I):
+            continue
+        match = TO_ROLE.search(statement)
+        if not match:
+            continue
+        for name in match.group(1).split(","):
+            name = name.strip().strip('"').lower()
+            if name and name not in BUILTIN_ROLES and not name.startswith("%"):
+                names.add(name)
+    return names
+
+
+def test_every_role_a_policy_grants_to_is_created_before_it_is_used():
+    """Migration 001 grants to `anon`, which only Supabase provides.
+
+    On a plain PostgreSQL the whole migration chain aborted at 001 with
+    `role "anon" does not exist`, so `PERSISTENCE=postgres` could not be
+    provisioned outside Supabase - something no hermetic test could see, because
+    the local store has no roles. `000_roles.sql` creates them first.
+    """
+    created: dict[str, str] = {}
+    offenders: list[str] = []
+    for path in sorted(MIGRATIONS.glob("*.sql")):
+        sql = path.read_text(encoding="utf-8")
+        for match in CREATE_ROLE.finditer(_strip_comments(sql)):
+            created.setdefault(match.group(1).strip('"').lower(), path.name)
+        for name in _grantees(sql):
+            if name not in created:
+                offenders.append(f"{path.name} grants to {name!r}, which no earlier "
+                                 f"migration creates")
+    assert offenders == [], offenders

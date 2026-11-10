@@ -268,6 +268,50 @@ the first time it ran.
 
 It needs no imports to execute, so an `ImportError` elsewhere cannot hide it.
 
+### Running the Postgres path without Docker
+
+`PERSISTENCE=postgres` is a different store with different SQL, and a green
+hermetic suite says nothing about it: the local store has no placeholders to get
+wrong (D-016). Three of the four defects found on the first real run were
+invisible locally. Before claiming the Postgres path works, run it.
+
+Any PostgreSQL with contrib (`pg_trgm`) will do. There is no Docker dependency;
+a portable Windows distribution works, and so does a throwaway cluster:
+
+```powershell
+# 1. a scratch cluster, not the shared project
+& "$env:TEMP\pgfull\pgsql\bin\initdb.exe" -D "$env:TEMP\tev_pgdata" -U postgres -A trust
+& "$env:TEMP\pgfull\pgsql\bin\postgres.exe" -D "$env:TEMP\tev_pgdata" -p 5545 `
+    -c listen_addresses=127.0.0.1 -c fsync=off      # leave this running
+& "$env:TEMP\pgfull\pgsql\bin\createdb.exe" -h 127.0.0.1 -p 5545 -U postgres tev
+
+# 2. the whole chain, from nothing. 000 must come first: it creates the
+#    Supabase role names that migration 001 grants to.
+$env:DATABASE_URL = 'postgresql://postgres@127.0.0.1:5545/tev'
+backend\.venv\Scripts\python.exe backend\scripts\db_migrate.py
+#   expect: applied 000 ... 021, migrate complete (13 public tables, 12 tev tables)
+#   run it twice; the second pass must print the same counts and no error.
+
+# 3. the columns that must not have a default
+psql -h 127.0.0.1 -p 5545 -U postgres -d tev -tAc `
+  "select table_name, coalesce(column_default,'<none>') from information_schema.columns
+    where table_schema='tev' and column_name='rule_version'"
+#   expect: <none> for verification_runs and claim_status_history
+
+# 4. a real run through the real adapter
+$env:PERSISTENCE = 'postgres'; $env:CACHE_MODE = 'read-write'
+cd backend; .venv\Scripts\python.exe -m uvicorn app.main:app --port 8012
+#   POST an answer to http://127.0.0.1:8012/api/verify/runs, then read it back:
+#   the run, its claims, its evidence and its events must all come from tev.*
+```
+
+A 500 here is the point of the exercise. The first one was
+`named placeholders require a mapping of parameters`; the second was a dropped
+`claims.extracted` event. Both now have tests, and neither test needs a server.
+
+Do not point `DATABASE_URL` at the shared DataGoblin project to save ten minutes.
+It is the same database another product reads.
+
 ---
 
 ## 10. Frontend notes

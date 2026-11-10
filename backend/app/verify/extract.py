@@ -23,6 +23,7 @@ from app.core.logging import log
 from app.schemas.evidence import locate_quote
 from app.verify.schemas import (ClaimDraft, ClaimExtraction, ClaimType,
                                 Volatility, NON_VERIFIABLE_TYPES)
+from app.verify.store import iso
 from app.verify.value_normalizer import normalize_value
 
 _SYSTEM = """You extract atomic factual claims from an AI-generated answer.
@@ -185,8 +186,9 @@ def extract_claims(client: BifrostClient, *, answer: str, original_prompt: str =
         "request_id": result.request_id, "status": result.status,
         # A replay says *what* it replayed; the receipt says when the answer was
         # originally obtained, so the UI can show the date, not just the word
-        # "snapshot".
-        "created_at": result.created_at,
+        # "snapshot". ISO text, not a datetime: the two stores must record the
+        # same shape, and only one of them has a JSON encoder to fall back on.
+        "created_at": iso(result.created_at),
         "input_tokens": result.input_tokens, "output_tokens": result.output_tokens,
         "cost_usd": result.cost_usd, "latency_ms": result.latency_ms,
         "fallback_attempts": result.fallback_attempts,

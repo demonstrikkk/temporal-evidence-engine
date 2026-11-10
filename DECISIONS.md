@@ -303,3 +303,99 @@ Known limit: migration 021 is written and reviewed but has not been applied to a
 Postgres database in this environment — no dedicated `DATABASE_URL` exists yet,
 and the shared DataGoblin database must not be migrated. The local store path is
 verified.
+
+## D-016 - The Postgres adapter had never been run (2026-11-10)
+
+Everything above was verified through `LocalStore`. The Postgres adapter had
+never touched a database: `DATABASE_URL` pointed at a shared DataGoblin project
+that this product must not migrate, so `PERSISTENCE=postgres` was a code path
+nobody had executed. It was not merely untested. It did not work.
+
+A throwaway PostgreSQL 16.2 cluster on `127.0.0.1:5545` (nothing else; the shared
+project was not touched) found four defects in order, one after another, each
+visible only after the previous one was fixed:
+
+1. **The migration chain could not start on a non-Supabase server.** Migration
+   `001_core.sql` creates policies `TO anon, authenticated`, the roles every
+   Supabase project has. Plain PostgreSQL has neither, so the chain aborted at
+   the first file with `role "anon" does not exist`. `000_roles.sql` now creates
+   `anon`, `authenticated` and `service_role` as `NOLOGIN` roles - names a policy
+   can reference, not accounts anyone can connect as. On Supabase every branch is
+   a no-op. Guard: `test_every_role_a_policy_grants_to_is_created_before_it_is_used`
+   fails on the pre-fix tree.
+2. **`POST /api/verify/runs` answered 500.** `PgStore._one/_all/_write` coerced
+   parameters with `tuple(params)` before handing them to psycopg, so every
+   statement written with named placeholders received a tuple of *keys*:
+   `TypeError: named placeholders require a mapping of parameters`. No hermetic
+   test could see it, because the local store has no SQL. Guard:
+   `test_pg_store.py` drives the real method bodies against a cursor that
+   enforces psycopg's own rule.
+3. **`claims.extracted` was silently dropped.** The event payload carries the
+   model receipt, the receipt carries `created_at`, and psycopg's JSON dumper
+   refuses a `datetime`: `could not append run event ... Object of type datetime
+   is not JSON serializable`. The local store kept the event because Python
+   objects pass through; Postgres lost it. `_jsonb` now encodes
+   datetime/date/time, `Decimal`, `UUID`, `Path` and sets, and both receipts use
+   ISO text so the two stores record the same shape. Since no-silent-failure is a
+   non-negotiable, a dropped event is a product defect, not a logging nit.
+4. **The migration log could not show the tev tables.** `db_migrate.py` counted
+   only `public`, so applying 014-021 printed an unchanged number and looked like
+   a failure. It now reports both schemas.
+
+Environment note: the minimal `pgserver` wheel ships only `plpgsql` and `vector`.
+Migration 012 needs `pg_trgm`, which is contributed by every normal PostgreSQL
+distribution (and by Supabase) but absent there. That is a deployment
+requirement, not a code defect: `PERSISTENCE=postgres` needs a PostgreSQL with
+contrib.
+
+Evidence, all on an empty database:
+
+| check | result |
+|---|---|
+| `python backend\scripts\db_migrate.py` from nothing | `000`-`021` applied, `migrate complete (13 public tables, 12 tev tables)` |
+| re-run | same counts, no errors - the files are idempotent |
+| `information_schema.columns` for `rule_version` | `verification_runs` and `claim_status_history`, both `column_default = <none>` |
+| live verification through `PERSISTENCE=postgres` | see the run recorded in `docs/BUILD-PLAN.md` §16.1 |
+
+The recipe is reproducible without Docker and without touching the shared
+project; it is written down in `docs/RUNBOOK.md` so the next person can repeat it
+rather than trust this paragraph.
+
+## D-017 - The audit columns did not hold what their names said (2026-11-10)
+
+Found by reading a row back out of Postgres, not by a test. `claim_evidence` has
+two columns either side of the model's proposal:
+
+```sql
+relationship_settled  text,   -- schema says: supports|contradicts|mentions_only|silent
+settlement_status     text,   -- schema says: verified|unverified
+```
+
+The writer stored `'settled'` / `'unsettled'` in the first and `'settled'` /
+`'not_settled'` in the second. So a settlement word sat in a relationship column,
+and the two columns mostly agreed on a word that described neither question. A
+reviewer querying `relationship_settled = 'contradicts'` — the vocabulary the
+schema itself documents — matched nothing, and the evidence pack printed
+`— settled` where a reader expects to learn *what the source did*.
+
+The columns now answer their own names:
+
+| column | value | meaning |
+|---|---|---|
+| `relationship_settled` | `supports` / `contradicts` / `mentions_only` / `silent`, `NULL` | which relationship survived the gate |
+| `settlement_status` | `accepted` / `rejected` | did the gate accept this proposal |
+
+`verified` is deliberately not one of the values. In this codebase that word
+belongs to `verification_status` — the cell-level promotion that only
+`validator.settle` may grant — and reusing it for the fate of a proposal would
+blur the one distinction `test_promotion_chokepoint.py` exists to protect.
+
+Nothing about a verdict changes: `decision.py` reads in-memory facts and never
+these columns. This is record fidelity. Migration `022` adds column comments
+stating the vocabulary and rewrites no rows — an audit trail edited to match a
+later vocabulary is no longer evidence of what happened. Rows written before
+this decision keep the words they were written with.
+
+The regression is pinned where the values are produced:
+`test_pipeline.py` asserts an accepted row carries its relationship and a
+rejected row carries `NULL`.

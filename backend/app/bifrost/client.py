@@ -30,6 +30,8 @@ from typing import Any, Literal
 
 import httpx
 
+from app.cache.coordinator import CacheCoordinator
+from app.cache.keys import model_kv_key
 from app.core.config import settings
 from app.core.logging import log
 from app.verify.store import VerifyStore, iso, new_id, now, parse_iso
@@ -40,6 +42,8 @@ _STAGE_MODEL = {
     "propose_relationship": "BIFROST_MODEL_JUDGE",
     "replacement_value": "BIFROST_MODEL_JUDGE",
     "plan_research": "BIFROST_MODEL_EXTRACTOR",
+    "synthesize_answer": "BIFROST_MODEL_SYNTHESIZER",
+    "repair_answer": "BIFROST_MODEL_SYNTHESIZER",
 }
 
 Kind = Literal["transient", "fatal", "cache_miss", "budget"]
@@ -118,16 +122,19 @@ def _retry_delay(exc: BifrostError, attempt: int, cap: float) -> float:
     run. The requested delay is honoured up to `cap`: a verifier may wait for a
     provider, but it must not hang on one that asks for an hour.
     """
-    delay = 0.4 * (2 ** attempt)
-    if exc.status == 429:
-        raw = (exc.detail or {}).get("retry_after")
-        try:
-            asked = float(str(raw))
-        except (TypeError, ValueError):
-            asked = 0.0
+    raw = (exc.detail or {}).get("retry_after")
+    try:
+        asked = float(str(raw))
+    except (TypeError, ValueError):
+        asked = 0.0
+    try:
+        from app.bifrost.scheduler import scheduler
+        return scheduler.retry_policy.calculate_delay(attempt, retry_after=asked, cap=cap)
+    except Exception:
+        delay = 0.4 * (2 ** attempt)
         if asked > 0:
             delay = max(delay, min(asked, cap))
-    return delay
+        return delay
 
 
 class BifrostClient:
@@ -149,6 +156,7 @@ class BifrostClient:
         self.budget_usd = settings.BIFROST_BUDGET_USD if budget_usd is None \
             else budget_usd
         self.cache_mode = cache_mode or settings.CACHE_MODE
+        self.cache = CacheCoordinator(store)
 
     # -- configuration ----------------------------------------------------
     def model_for(self, stage: str) -> str:
@@ -183,6 +191,24 @@ class BifrostClient:
         return {"ok": False, "detail": "gateway did not answer a health probe",
                 "base_url": self.base_url}
 
+    def diagnostics(self) -> dict[str, Any]:
+        """Complete diagnostics including health, rate limiter, circuit breaker, and models."""
+        h = self.health()
+        from app.bifrost.model_profiles import model_registry
+        from app.bifrost.scheduler import scheduler
+        sched_stats = scheduler.stats()
+        return {
+            "health": h,
+            "configured": self.configured(),
+            "base_url": self.base_url,
+            "budget_usd": self.budget_usd,
+            "spent_usd": self.spent(),
+            "cache_mode": self.cache_mode,
+            "models": model_registry.describe_all(),
+            "scheduler": sched_stats,
+            "ollama_available": False,  # Ollama fallback is not operational on this host
+        }
+
     # -- budget -----------------------------------------------------------
     def spent(self) -> float:
         try:
@@ -197,6 +223,30 @@ class BifrostClient:
                  json_mode: bool = True) -> BifrostResult:
         model = model or self.model_for(stage)
         digest = prompt_hash(system, prompt, model, stage, temperature, max_tokens)
+        kv_key = model_kv_key(model, stage, system, prompt, temperature,
+                              max_tokens, json_mode)
+
+        # L2: Check CacheCoordinator exact KV cache first
+        if self.cache_mode != "off":
+            cached = self.cache.get_l2(
+                model=model, stage=stage, system=system, user=prompt,
+                temperature=temperature, max_tokens=max_tokens, json_mode=json_mode)
+            if cached:
+                log.info("bifrost l2 cache hit", extra={"data": {
+                    "stage": stage, "model": model, "key": kv_key[:16]}})
+                return BifrostResult(
+                    text=str(cached.get("text") or ""),
+                    provider=str(cached.get("provider") or ""),
+                    model=str(cached.get("resolved_model")
+                          or cached.get("model") or model),
+                    request_id=str(cached.get("request_id") or ""),
+                    input_tokens=_int(cached.get("input_tokens")),
+                    output_tokens=_int(cached.get("output_tokens")),
+                    cost_usd=_num(cached.get("cost_usd")),
+                    latency_ms=_int(cached.get("latency_ms")),
+                    fallback_attempts=_int(cached.get("fallback_attempts")),
+                    status="snapshot", created_at=parse_iso(cached.get("created_at")) or now(),
+                    raw=cached.get("raw") or {})
 
         if self.cache_mode != "off":
             cached = self.store.find_model_call(digest, model, stage)
@@ -255,9 +305,18 @@ class BifrostClient:
         last_error: BifrostError | None = None
         for attempt in range(max(0, self.retries) + 1):
             try:
-                result = self._post(body, stage=stage, claim_id=claim_id,
-                                    digest=digest, model=model,
-                                    started=started)
+                from app.bifrost.scheduler import scheduler
+                result = scheduler.execute(
+                    lambda: self._post(body, stage=stage, claim_id=claim_id,
+                                       digest=digest, model=model,
+                                       started=started, system=system,
+                                       prompt=prompt, temperature=temperature,
+                                       max_tokens=max_tokens,
+                                       json_mode=json_mode),
+                    stage=stage,
+                    estimated_tokens=max_tokens // 2,
+                    timeout=float(self.timeout),
+                )
                 return result
             except BifrostError as exc:
                 last_error = exc
@@ -271,7 +330,9 @@ class BifrostClient:
         raise last_error
 
     def _post(self, body: dict[str, Any], *, stage: str, claim_id: str | None,
-              digest: str, model: str, started: float) -> BifrostResult:
+              digest: str, model: str, started: float, system: str = "",
+              prompt: str = "", temperature: float = 0.0,
+              max_tokens: int = 1400, json_mode: bool = True) -> BifrostResult:
         headers = {"Authorization": f"Bearer {self.virtual_key}",
                    "Content-Type": "application/json",
                    "x-bf-vk": self.virtual_key}
@@ -285,6 +346,12 @@ class BifrostClient:
             raise BifrostError("transient", f"Bifrost transport error: {exc}") from exc
 
         latency_ms = int((time.perf_counter() - started) * 1000)
+        try:
+            from app.bifrost.scheduler import scheduler
+            scheduler.limiter.update_from_headers(response.headers)
+        except Exception:
+            pass
+
         if response.status_code == 429 or response.status_code >= 500:
             raise BifrostError(
                 "transient", f"Bifrost answered {response.status_code}: "
@@ -370,6 +437,18 @@ class BifrostClient:
             "cacheable": self.cache_mode != "off",
             "created_at": iso(result.created_at),
         })
+        # L2: Write successful response to CacheCoordinator KV cache
+        if self.cache_mode != "off":
+            self.cache.put_l2(
+                model=model, stage=stage, system=system, user=prompt,
+                payload={"text": text, "raw": payload, "request_id": request_id,
+                         "provider": provider, "resolved_model": result.model,
+                         "input_tokens": result.input_tokens,
+                         "output_tokens": result.output_tokens,
+                         "cost_usd": result.cost_usd, "latency_ms": latency_ms,
+                         "fallback_attempts": fallbacks,
+                         "created_at": iso(result.created_at)},
+                temperature=0.0, max_tokens=max_tokens, json_mode=json_mode)
         log.info("bifrost call", extra={"data": {
             "stage": stage, "model": result.model, "provider": provider,
             "request_id": request_id, "latency_ms": latency_ms,

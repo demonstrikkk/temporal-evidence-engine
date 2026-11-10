@@ -72,7 +72,14 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list(),
 #: upstream substrate) but the verifier is what this application is for.
 from app.api.verify import router as verify_router  # noqa: E402
 
+from app.api.cache import router as cache_router  # noqa: E402
+from app.api.chat import router as chat_router  # noqa: E402
+from app.api.governance import router as governance_router  # noqa: E402
+
 app.include_router(verify_router)
+app.include_router(chat_router)
+app.include_router(governance_router)
+app.include_router(cache_router)
 
 PLANS: dict[str, dict] = {}
 RUNS: dict[str, dict] = {}

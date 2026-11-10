@@ -23,11 +23,17 @@ def _tidy(text: str, limit: int = 220) -> str:
     return value[:limit].strip()
 
 
-def plan_queries(claim: ClaimDraft) -> list[str]:
+def plan_queries(claim: ClaimDraft, budget_mode: str = "balanced") -> list[str]:
+    if budget_mode == "offline":
+        return []
+
     subject = _tidy(claim.subject or "", 100)
     predicate = _tidy(claim.predicate or "", 100)
     value = _tidy(claim.object_raw or "", 80)
     text = _tidy(claim.claim_text, 220)
+
+    # In conserve mode: at most 1 query; deep mode: up to 3 queries
+    max_queries = 1 if budget_mode == "conserve" else (3 if budget_mode == "deep" else settings.RESEARCH_MAX_QUERIES_PER_CLAIM)
 
     candidates: list[str] = []
     if subject and predicate:
@@ -39,6 +45,17 @@ def plan_queries(claim: ClaimDraft) -> list[str]:
     if subject and predicate:
         candidates.append(f"{subject} {predicate} official")
 
+    # Domain-specific templates from intelligence layer
+    if subject:
+        try:
+            from app.intelligence.query_templates import generate_deterministic_queries
+            templates = generate_deterministic_queries(subject, predicate, value, text, getattr(claim, "qualifiers", None))
+            for t in templates:
+                if t not in candidates:
+                    candidates.append(t)
+        except Exception:
+            pass
+
     seen: set[str] = set()
     out: list[str] = []
     for query in candidates:
@@ -47,6 +64,6 @@ def plan_queries(claim: ClaimDraft) -> list[str]:
             continue
         seen.add(key)
         out.append(query)
-        if len(out) >= settings.RESEARCH_MAX_QUERIES_PER_CLAIM:
+        if len(out) >= max_queries:
             break
     return out

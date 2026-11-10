@@ -34,6 +34,8 @@ from app.verify.schemas import (AnswerIn, ClaimDraft, ClaimStatus, ReasonCode,
 from app.verify.settlement import settle_assertion
 from app.verify.store import VerifyStore, build_store, iso, new_id, now, parse_iso
 from app.verify.temporal import event_date_from_quote
+from app.cache.coordinator import CacheCoordinator
+from app.cache.keys import claim_fingerprint
 
 #: Negation cues that can contradict a claim without naming a replacement value.
 _NEGATIONS = ("no longer", "not available", "no longer available",
@@ -173,6 +175,7 @@ class Verifier:
         self.run_id = run_id
         self.bifrost = bifrost or BifrostClient(store, run_id)
         self.tavily = tavily or TavilyClient(store)
+        self.cache = CacheCoordinator(store)
         self.failures: list[dict[str, Any]] = []
         self.counters: dict[str, int] = {
             "claims": 0, "queries": 0, "sources": 0, "evidence": 0,
@@ -311,11 +314,60 @@ class Verifier:
         self.emit("claim.started", {"claim_id": claim_id,
                                     "claim": draft.claim_text})
 
-        queries = plan_queries(draft)
+        run_meta = self.store.get_run(self.run_id) or {}
+        budget_mode = run_meta.get("budget_mode") or "balanced"
+        queries = plan_queries(draft, budget_mode=budget_mode)
         if not queries:
             self._settle_empty(claim_row, draft,
                                ReasonCode.NO_SOURCE,
                                "No search query could be derived from this claim.")
+            return
+
+        # L5: Check claim-evidence reuse cache before Tavily search
+        value_scope = draft.object_raw or ""
+        fp_key = claim_fingerprint(
+            subject=draft.subject,
+            predicate=draft.predicate,
+            qualifiers=draft.qualifiers,
+            value_scope=value_scope)
+        cached_evidence = self.cache.get_l5(
+            subject=draft.subject,
+            predicate=draft.predicate,
+            qualifiers=draft.qualifiers,
+            value_scope=value_scope)
+        revision_ids: list[str] = []
+        facts: list[EvidenceFact] = []
+        if cached_evidence:
+            # Reuse cached evidence; recompute temporal verdict for this generated_at
+            for ev in cached_evidence:
+                try:
+                    ev_date = None
+                    if ev.get("event_date"):
+                        ev_date = parse_iso(ev["event_date"])
+                    pub_date = None
+                    if ev.get("publication_date"):
+                        pub_date = parse_iso(ev["publication_date"])
+                    facts.append(EvidenceFact(
+                        evidence_id=str(ev["evidence_id"]),
+                        relationship=Relationship.parse(ev.get("relationship")),
+                        quote_located=bool(ev.get("quote_located")),
+                        settled=bool(ev.get("settled")),
+                        event_date=ev_date,
+                        event_date_status=str(ev.get("event_date_status", "missing")),
+                        candidate_value=ev.get("candidate_value"),
+                        publication_date=pub_date,
+                        credibility=str(ev.get("credibility", "secondary")),
+                        retrieved_at=parse_iso(ev.get("retrieved_at")),
+                    ))
+                    revision_ids.append(str(ev["evidence_id"]))
+                except Exception:
+                    continue
+            self.emit("claim.evidence_reused", {"claim_id": claim_id,
+                                                "evidence_count": len(facts)})
+            self.counters["evidence"] += len(facts)
+            decision = decide(claim_value=draft.object_raw,
+                              answer_generated_at=generated_at, facts=facts)
+            self._record(claim_row, draft, decision, facts, generated_at)
             return
 
         revision_ids: list[str] = []
@@ -392,6 +444,30 @@ class Verifier:
                     "status": extract.status})
 
         facts = self._settle(claim_id, draft, revision_ids)
+        # L5: Store settled evidence for future claim-evidence reuse
+        evidence_list = []
+        for f in facts:
+            evidence_list.append({
+                "evidence_id": f.evidence_id,
+                "relationship": f.relationship.value,
+                "quote_located": f.quote_located,
+                "settled": f.settled,
+                "event_date": f.event_date.isoformat() if f.event_date else None,
+                "event_date_status": f.event_date_status,
+                "candidate_value": f.candidate_value,
+                "publication_date": f.publication_date.isoformat() if f.publication_date else None,
+                "credibility": f.credibility,
+                "retrieved_at": f.retrieved_at.isoformat() if f.retrieved_at else None,
+            })
+        self.cache.put_l5(
+            subject=draft.subject,
+            predicate=draft.predicate,
+            evidence_list=evidence_list,
+            qualifiers=draft.qualifiers,
+            value_scope=draft.object_raw or "",
+            claim_type=draft.claim_type.value,
+            volatility_class=draft.volatility_class.value,
+        )
         decision = decide(claim_value=draft.object_raw,
                           answer_generated_at=generated_at, facts=facts)
         self._record(claim_row, draft, decision, facts, generated_at)

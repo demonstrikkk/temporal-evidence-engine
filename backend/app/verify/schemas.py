@@ -113,6 +113,7 @@ class AnswerIn(BaseModel):
     domain_filter: list[str] = Field(default_factory=list, max_length=20)
     skip_non_factual: bool = True
     locale: str = "en"
+    budget_mode: Literal["balanced", "conserve", "deep", "offline"] = "balanced"
 
     @field_validator("generated_at_source", mode="before")
     @classmethod

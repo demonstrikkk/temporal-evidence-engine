@@ -37,6 +37,7 @@ from app.core.logging import log
 COLLECTIONS = (
     "answers", "runs", "claims", "sources", "revisions", "evidence", "links",
     "assertions", "history", "events", "calls", "queries", "cache",
+    "cache_entries", "conversations", "messages", "quota_ledger",
 )
 
 
@@ -112,6 +113,26 @@ class VerifyStore(Protocol):
     def gateway_stats(self, run_id: str | None = None) -> dict: ...
     def list_model_calls(self, limit: int = 25,
                          run_id: str | None = None) -> list[dict]: ...
+
+    # multi-layer cache entries
+    def get_cache_entry(self, cache_key: str) -> dict | None: ...
+    def put_cache_entry(self, row: dict) -> dict: ...
+    def touch_cache_entry(self, cache_key: str) -> None: ...
+    def purge_cache(self, cache_type: str | None = None) -> int: ...
+    def find_revision_by_hash(self, canonical_url: str, content_hash: str) -> dict | None: ...
+
+    # quota ledger
+    def record_quota_usage(self, row: dict) -> dict: ...
+    def get_quota_usage(self, provider: str, resource_type: str, window_type: str) -> dict | None: ...
+
+    # conversations & messages
+    def create_conversation(self, row: dict) -> dict: ...
+    def get_conversation(self, conv_id: str) -> dict | None: ...
+    def list_conversations(self, limit: int = 50) -> list[dict]: ...
+    def update_conversation(self, conv_id: str, **fields: Any) -> dict | None: ...
+    def create_message(self, row: dict) -> dict: ...
+    def list_messages(self, conv_id: str) -> list[dict]: ...
+
     def close(self) -> None: ...
 
 
@@ -385,6 +406,142 @@ class LocalStore:
                 "cost_usd", "latency_ms", "fallback_attempts", "status",
                 "created_at")
         return [{k: row.get(k) for k in keys} for row in rows[:limit]]
+
+    # -- multi-layer cache entries ----------------------------------------
+    def get_cache_entry(self, cache_key: str) -> dict | None:
+        with self._lock:
+            return self._find("cache_entries", cache_key=cache_key)
+
+    def put_cache_entry(self, row: dict) -> dict:
+        with self._lock:
+            existing = self._find("cache_entries", cache_key=row["cache_key"])
+            if existing:
+                for k, v in row.items():
+                    existing[k] = v
+                existing["last_accessed_at"] = iso(now())
+                self._save()
+                return existing
+            clean = {
+                "hit_count": 0,
+                "created_at": iso(now()),
+                "last_accessed_at": iso(now()),
+                "metadata": {},
+                **row,
+            }
+            return self._insert("cache_entries", clean)
+
+    def touch_cache_entry(self, cache_key: str) -> None:
+        with self._lock:
+            entry = self._find("cache_entries", cache_key=cache_key)
+            if entry:
+                entry["hit_count"] = int(entry.get("hit_count") or 0) + 1
+                entry["last_accessed_at"] = iso(now())
+                self._save()
+
+    def purge_cache(self, cache_type: str | None = None) -> int:
+        with self._lock:
+            before = len(self._data.get("cache_entries") or [])
+            if cache_type is None:
+                self._data["cache_entries"] = []
+            else:
+                self._data["cache_entries"] = [
+                    e for e in self._data.get("cache_entries") or []
+                    if e.get("cache_type") != cache_type
+                ]
+            removed = before - len(self._data.get("cache_entries") or [])
+            if removed > 0:
+                self._save()
+            return removed
+
+    def find_revision_by_hash(self, canonical_url: str, content_hash: str) -> dict | None:
+        with self._lock:
+            src = self._find("sources", canonical_url=canonical_url)
+            if not src:
+                return None
+            return self.find_revision(src["id"], content_hash)
+
+    # -- quota ledger -----------------------------------------------------
+    def record_quota_usage(self, row: dict) -> dict:
+        with self._lock:
+            for r in self._data.get("quota_ledger") or []:
+                if (r.get("provider") == row.get("provider")
+                        and r.get("resource_type") == row.get("resource_type")
+                        and r.get("window_type") == row.get("window_type")
+                        and r.get("window_start") == row.get("window_start")):
+                    r["used_amount"] = int(r.get("used_amount") or 0) + int(row.get("used_amount") or 0)
+                    if "allocated_limit" in row:
+                        r["allocated_limit"] = int(row["allocated_limit"])
+                    r["last_updated_at"] = iso(now())
+                    self._save()
+                    return r
+            clean = {
+                "id": row.get("id") or new_id(),
+                "used_amount": 0,
+                "last_updated_at": iso(now()),
+                **row,
+            }
+            return self._insert("quota_ledger", clean)
+
+    def get_quota_usage(self, provider: str, resource_type: str, window_type: str) -> dict | None:
+        with self._lock:
+            matches = [
+                r for r in self._data.get("quota_ledger") or []
+                if r.get("provider") == provider
+                and r.get("resource_type") == resource_type
+                and r.get("window_type") == window_type
+            ]
+            matches.sort(key=lambda x: str(x.get("window_start") or ""), reverse=True)
+            return matches[0] if matches else None
+
+    # -- conversations & messages -----------------------------------------
+    def create_conversation(self, row: dict) -> dict:
+        clean = {
+            "id": row.get("id") or new_id(),
+            "title": row.get("title") or "New Research Conversation",
+            "budget_mode": row.get("budget_mode") or "balanced",
+            "structured_memory": row.get("structured_memory") or {},
+            "created_at": iso(now()),
+            "updated_at": iso(now()),
+        }
+        return self._insert("conversations", clean)
+
+    def get_conversation(self, conv_id: str) -> dict | None:
+        return self._find("conversations", id=conv_id)
+
+    def list_conversations(self, limit: int = 50) -> list[dict]:
+        rows = list(self._data.get("conversations") or [])
+        rows.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
+        return rows[:limit]
+
+    def update_conversation(self, conv_id: str, **fields: Any) -> dict | None:
+        with self._lock:
+            conv = self._find("conversations", id=conv_id)
+            if not conv:
+                return None
+            for k, v in fields.items():
+                conv[k] = v
+            conv["updated_at"] = iso(now())
+            self._save()
+            return conv
+
+    def create_message(self, row: dict) -> dict:
+        clean = {
+            "id": row.get("id") or new_id(),
+            "conversation_id": row["conversation_id"],
+            "role": row["role"],
+            "content": row["content"],
+            "run_id": row.get("run_id"),
+            "citations": row.get("citations") or [],
+            "quality_metrics": row.get("quality_metrics") or {},
+            "created_at": iso(now()),
+        }
+        return self._insert("messages", clean)
+
+    def list_messages(self, conv_id: str) -> list[dict]:
+        rows = [m for m in self._data.get("messages") or []
+                if m.get("conversation_id") == conv_id]
+        rows.sort(key=lambda m: str(m.get("created_at") or ""))
+        return rows
 
     def close(self) -> None:  # nothing to release
         return None
@@ -745,6 +902,127 @@ class PgStore:
                 FROM model_calls {where}
                 ORDER BY created_at DESC LIMIT %s""",
             (*params, limit))
+
+    # -- multi-layer cache entries ----------------------------------------
+    def get_cache_entry(self, cache_key: str) -> dict | None:
+        return self._one("SELECT * FROM cache_entries WHERE cache_key = %s", (cache_key,))
+
+    def put_cache_entry(self, row: dict) -> dict:
+        return self._write(
+            """INSERT INTO cache_entries (cache_key, cache_type, cache_version,
+                   payload, created_at, expires_at, last_accessed_at, hit_count, metadata)
+               VALUES (%(cache_key)s, %(cache_type)s, %(cache_version)s,
+                   %(payload)s, NOW(), %(expires_at)s, NOW(), 0, %(metadata)s)
+               ON CONFLICT (cache_key) DO UPDATE SET
+                   payload = EXCLUDED.payload,
+                   expires_at = EXCLUDED.expires_at,
+                   last_accessed_at = NOW(),
+                   metadata = EXCLUDED.metadata
+               RETURNING *""",
+            {
+                "expires_at": row.get("expires_at"),
+                "metadata": _jsonb(row.get("metadata") or {}),
+                **row,
+                "payload": _jsonb(row.get("payload")),
+            })
+
+    def touch_cache_entry(self, cache_key: str) -> None:
+        self._write(
+            """UPDATE cache_entries
+               SET hit_count = hit_count + 1, last_accessed_at = NOW()
+               WHERE cache_key = %s""",
+            (cache_key,))
+
+    def purge_cache(self, cache_type: str | None = None) -> int:
+        if cache_type is None:
+            res = self._write("DELETE FROM cache_entries RETURNING cache_key")
+            return 1 if res else 0
+        res = self._write("DELETE FROM cache_entries WHERE cache_type = %s RETURNING cache_key", (cache_type,))
+        return 1 if res else 0
+
+    def find_revision_by_hash(self, canonical_url: str, content_hash: str) -> dict | None:
+        return self._one(
+            """SELECT r.* FROM source_revisions r
+               JOIN sources s ON r.source_id = s.id
+               WHERE s.canonical_url = %s AND r.content_hash = %s""",
+            (canonical_url, content_hash))
+
+    # -- quota ledger -----------------------------------------------------
+    def record_quota_usage(self, row: dict) -> dict:
+        clean = {
+            "id": row.get("id") or new_id(),
+            "allocated_limit": row.get("allocated_limit", 0),
+            **row,
+        }
+        return self._write(
+            """INSERT INTO quota_ledger (id, provider, resource_type, window_type,
+                   window_start, window_end, used_amount, allocated_limit, last_updated_at)
+               VALUES (%(id)s, %(provider)s, %(resource_type)s, %(window_type)s,
+                   %(window_start)s, %(window_end)s, %(used_amount)s, %(allocated_limit)s, NOW())
+               ON CONFLICT (provider, resource_type, window_type, window_start) DO UPDATE SET
+                   used_amount = quota_ledger.used_amount + EXCLUDED.used_amount,
+                   allocated_limit = EXCLUDED.allocated_limit,
+                   last_updated_at = NOW()
+               RETURNING *""", clean)
+
+    def get_quota_usage(self, provider: str, resource_type: str, window_type: str) -> dict | None:
+        return self._one(
+            """SELECT * FROM quota_ledger
+               WHERE provider = %s AND resource_type = %s AND window_type = %s
+               ORDER BY window_start DESC LIMIT 1""",
+            (provider, resource_type, window_type))
+
+    # -- conversations & messages -----------------------------------------
+    def create_conversation(self, row: dict) -> dict:
+        clean = {
+            "id": row.get("id") or new_id(),
+            "title": row.get("title") or "New Research Conversation",
+            "budget_mode": row.get("budget_mode") or "balanced",
+            "structured_memory": _jsonb(row.get("structured_memory") or {}),
+        }
+        return self._write(
+            """INSERT INTO conversations (id, title, budget_mode, created_at, updated_at, structured_memory)
+               VALUES (%(id)s, %(title)s, %(budget_mode)s, NOW(), NOW(), %(structured_memory)s)
+               RETURNING *""", clean)
+
+    def get_conversation(self, conv_id: str) -> dict | None:
+        return self._one("SELECT * FROM conversations WHERE id = %s", (conv_id,))
+
+    def list_conversations(self, limit: int = 50) -> list[dict]:
+        return self._all("SELECT * FROM conversations ORDER BY updated_at DESC LIMIT %s", (limit,))
+
+    def update_conversation(self, conv_id: str, **fields: Any) -> dict | None:
+        allowed = {"title", "budget_mode", "structured_memory"}
+        clean = {k: v for k, v in fields.items() if k in allowed}
+        if not clean:
+            return self.get_conversation(conv_id)
+        params = {"id": conv_id}
+        for k, v in clean.items():
+            params[k] = _jsonb(v) if k == "structured_memory" else v
+        sets = ", ".join(f"{k} = %({k})s" for k in clean)
+        return self._write(
+            f"UPDATE conversations SET {sets}, updated_at = NOW() WHERE id = %(id)s RETURNING *",
+            params)
+
+    def create_message(self, row: dict) -> dict:
+        clean = {
+            "id": row.get("id") or new_id(),
+            "conversation_id": row["conversation_id"],
+            "role": row["role"],
+            "content": row["content"],
+            "run_id": row.get("run_id"),
+            "citations": _jsonb(row.get("citations") or []),
+            "quality_metrics": _jsonb(row.get("quality_metrics") or {}),
+        }
+        return self._write(
+            """INSERT INTO messages (id, conversation_id, role, content, run_id, citations, quality_metrics, created_at)
+               VALUES (%(id)s, %(conversation_id)s, %(role)s, %(content)s, %(run_id)s, %(citations)s, %(quality_metrics)s, NOW())
+               RETURNING *""", clean)
+
+    def list_messages(self, conv_id: str) -> list[dict]:
+        return self._all(
+            "SELECT * FROM messages WHERE conversation_id = %s ORDER BY created_at ASC",
+            (conv_id,))
 
     def close(self) -> None:
         return None

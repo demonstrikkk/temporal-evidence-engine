@@ -25,6 +25,8 @@ from typing import Any, Literal
 
 import httpx
 
+from app.cache.coordinator import CacheCoordinator
+from app.cache.keys import source_snapshot_key, tavily_query_key
 from app.core.config import settings
 from app.core.logging import log
 from app.verify.store import VerifyStore, iso, now
@@ -98,6 +100,7 @@ class TavilyClient:
         self.base_url = (base_url or settings.TAVILY_BASE_URL).rstrip("/")
         self.timeout = timeout or settings.TAVILY_TIMEOUT_S
         self.cache_mode = cache_mode or settings.CACHE_MODE
+        self.cache = CacheCoordinator(store)
 
     def configured(self) -> bool:
         return bool(self.api_key)
@@ -204,7 +207,31 @@ class TavilyClient:
         if end_date:
             payload["end_date"] = end_date
 
-        data, replayed = self._post("search", payload)
+        # L3: Check CacheCoordinator Tavily query cache before calling API
+        if self.cache_mode != "off":
+            l3_key = tavily_query_key(
+                query, settings.TAVILY_SEARCH_DEPTH,
+                include_domains=include_domains,
+                max_results=max_results or settings.TAVILY_MAX_RESULTS)
+            cached_l3 = self.cache.get_l3(
+                query=query, search_depth=settings.TAVILY_SEARCH_DEPTH,
+                include_domains=include_domains,
+                max_results=max_results or settings.TAVILY_MAX_RESULTS)
+            if cached_l3:
+                log.info("tavily l3 cache hit", extra={"data": {
+                    "query": query[:80], "key": l3_key[:16]}})
+                data = cached_l3
+                replayed = True
+            else:
+                data, replayed = self._post("search", payload)
+                # L3: Write successful search results to cache
+                self.cache.put_l3(
+                    query=query, payload=data,
+                    search_depth=settings.TAVILY_SEARCH_DEPTH,
+                    include_domains=include_domains,
+                    max_results=max_results or settings.TAVILY_MAX_RESULTS)
+        else:
+            data, replayed = self._post("search", payload)
         hits = []
         for item in data.get("results") or []:
             url = str(item.get("url") or "")[:2000]

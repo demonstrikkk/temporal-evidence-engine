@@ -363,10 +363,20 @@ async def verify_field(value: object, quote: str, source_text: str,
 async def wrap_record(fields_spec: list[dict], raw: dict, source_text: str,
                       source_url: str, source_title: str, now: str = "",
                       references: str = "", page_id: str = "",
-                      budget: JudgeBudget | None = None) -> dict:
+                      budget: JudgeBudget | None = None,
+                      valid_time: str = "",
+                      temporal: dict | None = None) -> dict:
     from app.schemas.run import RecordRow  # local import: schemas must not import services
+    from app.services import temporal as temporal_svc
 
     ts = now or (datetime.datetime.utcnow().isoformat() + "Z")
+    # The date the source published its content, when one was supplied. Falls
+    # back to the record's own field so a caller that already carries it on the
+    # raw record does not have to thread it twice.
+    vt = temporal_svc.normalize_date(valid_time or raw.get("published_date") or "")
+    # Computed once per record: every cell from the same page shares the same
+    # date, and the check is advisory — it never touches `verification_status`.
+    tcheck = temporal_svc.check(vt, temporal or {})
     wrapped: dict = {}
     # Normalised once for every field below. See verify_field: this used to be
     # recomputed per field, scanning the entire page each time.
@@ -421,8 +431,14 @@ async def wrap_record(fields_spec: list[dict], raw: dict, source_text: str,
         # every cell that predates this went through the model. Built from the
         # settled status, so a cell `settle` demoted cannot keep a confident
         # receipt.
-        wrapped[name] = {**cell, **_receipt_for(
-            raw, name, cell["verification_status"], route)}
+        wrapped[name] = {**cell,
+                         # Siblings of the source, not members of it: retrieval
+                         # time says when we looked, validity says when the fact
+                         # was true. See plan.ProvenanceField.
+                         "valid_time": vt,
+                         "temporal_check": tcheck,
+                         **_receipt_for(
+                             raw, name, cell["verification_status"], route)}
     # Shape-drift guard: every wrapped row must satisfy the RecordRow contract.
     # Return the inner fields dict (callers expect {name: provenance-field}).
     return RecordRow.model_validate({"fields": wrapped}).model_dump()["fields"]

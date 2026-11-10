@@ -5,10 +5,12 @@ EXTRACTING -> VALIDATING (+Jev-B) -> NORMALIZE -> DEDUPLICATING -> FINALIZING (a
 Partial-safe, cancel-aware, runtime-capped. Emits the 14 SSE event types.
 """
 import asyncio
+import contextlib
 import datetime
 import inspect
 import time
 
+from app.core import pacing
 from app.core.config import settings
 from app.core.constants import RunStage
 from app.services import autofill as autofill_svc
@@ -113,6 +115,68 @@ async def _emit(emit: object, ev: dict) -> None:
     await emit(ev)
 
 
+def _issued_queries(stats: dict, projection: dict) -> int:
+    """Bill what discovery issued, not what the plan projected.
+
+    Falls back to the projection only when the caller did not report — a fake
+    injected by a test, or an older call path.
+    """
+    value = stats.get("queries") if isinstance(stats, dict) else None
+    if value is None:
+        return int((projection or {}).get("queries", 0))
+    return max(0, int(value))
+
+
+async def _cut_at_page_timeout(coro, limit: float, scope: pacing.WaitScope):
+    """Await `coro`, cutting it at `limit` seconds of *work*, not of queueing.
+
+    `asyncio.wait_for` used to charge the provider's pacing queue to the page.
+    With the Groq free tier's 8,000 TPM budget that is most of a page's wall
+    time, so the fourth page of a 12-page run spent its whole 150s before its
+    first call and was reported `timeout` — the run blamed the page for the
+    provider's throughput. Here the clock still runs, but the seconds the
+    provider recorded as waiting for capacity are credited back.
+
+    A page whose provider never records a wait (a genuine hang, a dead rung)
+    is cut at exactly `limit`, which is the behaviour the suite pins.
+    """
+    task = asyncio.ensure_future(coro)
+    deadline = time.monotonic() + limit
+    credited = 0.0
+    try:
+        while True:
+            if task.done():
+                return task.result()
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                # `wait`, not `wait_for`: wait_for cancels the *awaiter* on
+                # timeout, and a cancellation aimed at the watchdog was reaching
+                # the page's own task through the shield. `wait` returns the
+                # done set and leaves the page alone.
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+                if done:
+                    return task.result()
+            # Credit the wait that has accrued since the last check. This runs
+            # on a deadline hit as well as a timer hit: a wait can end exactly
+            # when the deadline lands, so the last slice would otherwise be
+            # lost and a page whose only cost was queueing would be cut.
+            fresh = scope.total(time.monotonic()) - credited
+            if fresh <= 0.005:
+                # Let a completion that landed in this same tick be observed;
+                # finishing is never a timeout.
+                await asyncio.wait({task}, timeout=0)
+                if task.done():
+                    return task.result()
+                raise asyncio.TimeoutError
+            deadline += fresh
+            credited += fresh
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+
+
 async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
                 budget: "_Budget | None" = None,
                 progress: dict | None = None) -> dict:
@@ -194,7 +258,14 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
 
     requested_pages = min(int(plan.get("max_pages", settings.RUN_MAX_PAGES)),
                           settings.RUN_MAX_PAGES)
-    allowed_pages = meter.clamp_pages(requested_pages)
+    # How many searches discovery will actually issue. Reserving one made a
+    # tight budget look roomier than it was: the supervisor can run up to
+    # SUPERVISOR_MAX_QUERIES searches, and the diversity top-up two more.
+    planned_queries = max(1, min(
+        len([q for q in (plan.get("search_queries") or []) if str(q).strip()]),
+        settings.SUPERVISOR_MAX_QUERIES))
+    allowed_queries = meter.clamp_queries(planned_queries)
+    allowed_pages = meter.clamp_pages(requested_pages, allowed_queries)
     if meter.budget and allowed_pages <= 0:
         await _emit(emit, {"type": "run.failed", "run_id": run_id, "stage": RunStage.FAILED,
                            "message": f"credit budget exhausted before start "
@@ -206,7 +277,8 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
         await _emit(emit, {"type": "stage.progress", "run_id": run_id,
                            "stage": RunStage.DISCOVERING,
                            "message": f"budget clamp: max_pages {requested_pages} -> "
-                                      f"{allowed_pages} (budget {meter.budget}, "
+                                      f"{allowed_pages}, queries {planned_queries} -> "
+                                      f"{allowed_queries} (budget {meter.budget}, "
                                       f"projected {projection['total']})",
                            "progress": 8, "timestamp": _now()})
 
@@ -239,12 +311,26 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
     # for the cause, not silence.
     discovery_cap = max(60.0, budget.total * 0.25)
     _prior = await _prior_map()
+    # Discovery reports what it actually issued. The projection is an estimate;
+    # billing it charged for queries that a short-circuited or fatal discovery
+    # never ran.
+    discovery_stats: dict = {}
+    discovery_kwargs: dict = {"host_prior": _prior, "stats": discovery_stats}
+    if not meter.unlimited:
+        # Only a bounded run is capped. An unlimited run's supervisor decides
+        # how many queries the question needs; the plan's query list is a
+        # starting point, not a ceiling. Passing the cap only when bounded also
+        # keeps older injected `discover` doubles (no such parameter) working.
+        discovery_kwargs["query_budget"] = allowed_queries
     try:
         sources = await asyncio.wait_for(
             discovery_svc.discover(run_id, plan, search_fn, llm, _discover_emit,
-                                   host_prior=_prior),
+                                   **discovery_kwargs),
             timeout=discovery_cap)
     except asyncio.TimeoutError:
+        # The queries it managed to issue were really spent even though the
+        # stage failed, so the ledger records them.
+        await _bill("discover_query", _issued_queries(discovery_stats, projection))
         reason = (f"source discovery did not finish within "
                   f"{discovery_cap:.0f}s")
         await _emit(emit, {"type": "run.failed", "run_id": run_id,
@@ -253,7 +339,17 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
                            "data": {"no_yield_reason": reason}})
         return {"status": "FAILED", "records": [], "error": reason,
                 "no_yield_reason": reason}
-    await _bill("discover_query", projection["queries"])
+    await _bill("discover_query", _issued_queries(discovery_stats, projection))
+    if discovery_stats.get("fatal"):
+        # Search was refused outright (key/plan/quota). Seeds can still complete
+        # the run, but silence here reads as "the web had nothing", which is a
+        # different and much worse claim than the truth.
+        note = f"source search unavailable: {discovery_stats['fatal']}"
+        if not sources:
+            progress["no_yield_reason"] = note
+        await _emit(emit, {"type": "stage.progress", "run_id": run_id,
+                           "stage": RunStage.DISCOVERING, "message": note,
+                           "progress": 20, "timestamp": _now()})
     _apply_adaptive_domain_caps(plan, sources, await _prior_map())
     if cancelled():
         return {"status": "CANCELLED", "records": []}
@@ -328,10 +424,11 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
 
     async def _extract_one(p: dict) -> tuple[list[dict], str]:
         async with extract_sem:
+            scope = pacing.open_scope()
             try:
-                return await asyncio.wait_for(
+                return await _cut_at_page_timeout(
                     extractor_svc.extract_page(plan, p, llm),
-                    timeout=settings.EXTRACT_PAGE_TIMEOUT_S)
+                    settings.EXTRACT_PAGE_TIMEOUT_S, scope)
             except (asyncio.TimeoutError, TimeoutError):
                 return [], "timeout"  # stalled page: skip, never stall run
 
@@ -416,7 +513,12 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
             references=raw.get("references", ""),
             # The stored page this record came from, so its quote and offsets
             # address evidence that still exists after the run.
-            page_id=raw.get("page_id", ""), budget=judge_budget)
+            page_id=raw.get("page_id", ""), budget=judge_budget,
+            # When the source said its content was from, and what the prompt
+            # asked for in time. Both are advisory and neither can promote or
+            # demote a cell; `settle` remains the only chokepoint.
+            valid_time=raw.get("published_date", ""),
+            temporal=plan.get("temporal") or {})
         # The gate. Previously nothing ever raised DropItem, so a record whose
         # every field failed verification was still written to the dataset with
         # null values - the pipeline annotated failures instead of rejecting
@@ -546,7 +648,11 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
                            "data": {"drops": gate_drops[:20]}})
     await _emit(emit, {"type": "stage.started", "run_id": run_id, "stage": RunStage.DEDUPLICATING,
                        "message": "Deduplicating", "progress": 85, "timestamp": _now()})
-    canonical, merged = deduper_svc.dedupe_records(gated, plan.get("dedupe_keys", []))
+    canonical, merged = deduper_svc.dedupe_records(
+        gated, plan.get("dedupe_keys", []),
+        # The declared types are what tell a conflict from two spellings of one
+        # date; without them the deduper compares strings.
+        field_types=deduper_svc.plan_field_types(plan))
     # Published before the slow conflict-adjudication step, which is the last
     # thing between here and a stored dataset.
     progress["verified"], progress["canonical"] = verified, canonical
@@ -597,9 +703,9 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
     # A second, bounded pass over the fields the first crawl could not fill.
     # After `store`, because gap-fill operates on the saved dataset and writes
     # cells into it; never fatal, because the dataset already exists.
-    autofill = await _autofill_pass(
+    autofill = await _autofill_within_budget(
         emit, run_id, plan, ctx.get("repo"), dataset_id, canonical, llm,
-        search_fn, fetch_fn, _persist_page)
+        search_fn, fetch_fn, _persist_page, budget)
     if autofill.get("cells_written"):
         # The saved cells changed under the summary above; recompute the view the
         # caller reads rather than understate what is now proven. A read failure
@@ -650,6 +756,40 @@ async def _body(run_id: str, plan: dict, ctx: dict, emit: object,
         return {"status": "PARTIAL", "records": len(canonical),
                 "dataset_id": dataset_id, "partial": True, "error": reason}
     return {"status": "COMPLETED", "records": len(canonical), "dataset_id": dataset_id}
+
+
+async def _autofill_within_budget(emit: object, run_id: str, plan: dict,
+                                  repo: object, dataset_id: str, records: list,
+                                  llm: object, search_fn: object, fetch_fn: object,
+                                  persist_page: object, budget: "_Budget") -> dict:
+    """Gap-fill gets the run budget that is left, and no more.
+
+    "Bounded" used to mean a search count, not a clock. Eight searches can each
+    fetch and extract a page, and against a paced free-tier provider that
+    outran `RUN_MAX_RUNTIME_S` entirely: a live run sat at FINALIZING 95% for
+    half an hour with its dataset already written and nothing left to report.
+    The pass is cut at the remaining budget and says so; the saved dataset is
+    never rolled back.
+    """
+    if not settings.RUN_AUTOFILL:
+        return {}
+    if budget.expired():
+        return {"stopped": "runtime budget already spent before gap-fill"}
+    left = max(1.0, budget.total - budget.elapsed())
+    try:
+        return await asyncio.wait_for(
+            _autofill_pass(emit, run_id, plan, repo, dataset_id, records, llm,
+                           search_fn, fetch_fn, persist_page),
+            timeout=left)
+    except (asyncio.TimeoutError, TimeoutError):
+        stopped = {"stopped": "runtime budget exhausted during gap-fill"}
+        await _emit(emit, {"type": "stage.progress", "run_id": run_id,
+                           "stage": RunStage.FINALIZING,
+                           "message": "Gap-fill stopped at the runtime budget; "
+                                      "the saved dataset is unchanged",
+                           "progress": 98, "timestamp": _now(),
+                           "data": stopped})
+        return stopped
 
 
 async def _autofill_pass(emit: object, run_id: str, plan: dict, repo: object,

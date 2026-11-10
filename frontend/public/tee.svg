@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Temporal Evidence Engine">
+  <rect width="64" height="64" rx="13" fill="#f6f3ee"/>
+  <circle cx="32" cy="32" r="20" fill="none" stroke="#9a6b3f" stroke-width="2.2"/>
+  <path d="M32 17v3.5M32 43.5V47M17 32h3.5M43.5 32H47" stroke="#9a6b3f" stroke-width="2" stroke-linecap="round" opacity=".55"/>
+  <path d="M22.5 32.5l6 6L42 25.5" fill="none" stroke="#1c1917" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

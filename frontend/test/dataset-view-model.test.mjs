@@ -514,6 +514,43 @@ check('counter strings are coerced, because two run generations both wrote them'
   assert.equal(c.counted, true);
 });
 
+console.log('=== temporal accounting is separate from verification ===');
+
+check('dated cells and their window are read off the counters', () => {
+  const c = countersOf({
+    counts: {
+      fields_verified: 10,
+      cells_dated: 8,
+      temporal_within: 6,
+      temporal_before: 1,
+      temporal_after: 1,
+      temporal_uncertain: 0,
+      temporal_unknown: 2,
+    },
+  });
+  assert.equal(c.temporal.dated, 8);
+  assert.equal(c.temporal.within, 6);
+  assert.equal(c.temporal.offWindow, 2);
+  assert.equal(c.temporal.unknown, 2);
+  assert.equal(c.temporal.counted, true);
+  // A mismatch must never shrink or inflate the proven figure.
+  assert.equal(c.proven, 10);
+  assert.equal(c.fieldTotal, 10);
+});
+
+check('a run with no temporal columns is not counted, not zero-dated', () => {
+  const c = countersOf({ counts: { fields_verified: 4 } });
+  assert.equal(c.temporal.counted, false);
+  assert.equal(c.temporal.dated, 0);
+  assert.equal(c.temporal.offWindow, 0);
+});
+
+check('an empty dataset does not throw on temporal keys', () => {
+  const c = countersOf({});
+  assert.equal(c.temporal.counted, false);
+  assert.equal(c.temporal.within, 0);
+});
+
 /* ------------------------------------------------------------------ report */
 
 console.log('');

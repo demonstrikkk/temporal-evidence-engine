@@ -38,6 +38,7 @@ from app.core.logging import log
 from app.providers.crawl import fetcher
 from app.services import impersonation as impersonation_svc
 from app.services import politeness as politeness_svc
+from app.services import pubdate as pubdate_svc
 from app.services import reducer as reducer_svc
 from app.services.source_router import triage_source
 
@@ -516,6 +517,19 @@ def _pick_index(queue: list[tuple[dict, int]], settled: dict[str, int]) -> int:
         if best_key is None or key < best_key:
             best, best_key = i, key
     return best
+
+
+def _page_published_date(page: dict) -> str:
+    """The page's own publication date, read from its HTML.
+
+    Best-effort by design: a date is never worth failing a fetch over, and an
+    absent one is reported as `unknown` rather than guessed. See
+    `pubdate` for why only the page's own statement counts.
+    """
+    try:
+        return pubdate_svc.from_page(page)
+    except Exception:  # noqa: BLE001 (a date is never worth a failed page)
+        return ""
 
 
 def _status_for_error(err: object) -> str:
@@ -1110,6 +1124,14 @@ async def fetch_all(urls: list[dict], fetch_fn: Any, emit: Any, persist_source: 
                     "content_hash": stored.get("content_hash", ""),
                     "method": stored.get("method", "") or "reused",
                     "page_id": str(stored.get("id", "")),
+                    # The date the page itself published, carried through reuse
+                    # so a re-used page's cells keep their `valid_time`. When the
+                    # stored row has none, the raw HTML it kept is re-read —
+                    # deterministic, and the same answer the fetch produced.
+                    "published_date": (stored.get("published_date", "")
+                                       or item.get("published_date", "")
+                                       or pubdate_svc.from_html(
+                                           stored.get("raw_html", "") or "")),
                     "depth": depth,
                     "parent_url": item.get("parent_url", "") or "",
                     "reused_from_run_id": str(stored.get("run_id", "")),
@@ -1177,6 +1199,13 @@ async def fetch_all(urls: list[dict], fetch_fn: Any, emit: Any, persist_source: 
             return
         ok += 1
         page["title"] = page.get("title") or item.get("title", "")
+        # The search result's publication date when the engine exposed one;
+        # otherwise the page's own declaration (`article:published_time`, or
+        # JSON-LD `datePublished`). The engine dates news and little else, and a
+        # cell cannot carry a `valid_time` that nothing supplied.
+        page["published_date"] = (page.get("published_date")
+                                  or item.get("published_date", "")
+                                  or _page_published_date(page))
         page["depth"] = depth
         page["parent_url"] = item.get("parent_url", "") or ""
         snapshot_chars = len(page.get("rendered_html", "") or page.get("html", "")
@@ -1204,6 +1233,11 @@ async def fetch_all(urls: list[dict], fetch_fn: Any, emit: Any, persist_source: 
                     "parent_url": page["parent_url"], "depth": depth,
                     "method": page.get("method", ""), "status": "ok", "error": "",
                     "content_hash": page.get("content_hash", ""),
+                    # When the page said its content was from. Stored so a
+                    # later reuse of this page still knows, and so a cell's
+                    # `valid_time` is reproducible rather than a fact that
+                    # existed only in this process. See 013_temporal.sql.
+                    "published_date": page.get("published_date", ""),
                     # Shared with the extractor, so a verified quote always
                     # resolves against the stored copy.
                     "markdown": await asyncio.to_thread(reducer_svc.page_evidence_text, page),

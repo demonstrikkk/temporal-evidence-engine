@@ -24,21 +24,24 @@ flowchart TB
     end
 
     subgraph PLAN[Plan compiler — providers/llm/generate.py]
-        GEM[Gemini structured<br/>primary]
-        GROQ[Groq strict JSON<br/>fallback]
+        OC[OpenCode server<br/>primary]
+        GROQ[Groq JSON<br/>fallback]
+        GEM[Gemini<br/>last resort]
         INST[Instructor → Pydantic<br/>WorkflowPlan schema]
-        GEM -->|429/err| GROQ
-        GEM --> INST
+        OC -->|quota/down| GROQ
+        GROQ -->|429/err| GEM
+        OC --> INST
         GROQ --> INST
+        GEM --> INST
     end
 
-    subgraph RUN[Deterministic Runner — services/runner.py<br/>ONLY stage owner<br/>GENERATE Gemini/Groq → ORCHESTRATE LangGraph → JUDGE Jev → EXECUTE code → PROVE evidence]
+    subgraph RUN[Deterministic Runner — services/runner.py<br/>ONLY stage owner<br/>GENERATE OpenCode/Groq → ORCHESTRATE LangGraph → JUDGE Jev → EXECUTE code → PROVE evidence]
         direction TB
         ST0[PLANNING → DISCOVERING]
         AG[AGENTIC SUPERVISOR — LangGraph moves state<br/>SEARCH → COLLECT → ask_jev → REFINE/FETCH<br/>≤3 iterations — Jev family D judges]
         FE[FETCH MVP — HTTPX → Crawl4AI only<br/>retry once → alternate → skip<br/>Jev-A screens pre-fetch]
         RD[REDUCE — Trafilatura 30k cap]
-        EX[EXTRACT — Gemini/Groq + Pydantic<br/>records + verbatim quotes]
+        EX[EXTRACT — OpenCode/Groq + Pydantic<br/>records + verbatim quotes]
         JV[JUDGE — Jev CORE 4 families<br/>A screen B evidence C conflict D continuation<br/>probabilities + policy → status]
         VA[VALIDATE — guard + Jev-B<br/>verified/unverified/conflicting]
         NO[NORMALIZE — original + normalized]
@@ -106,16 +109,16 @@ flowchart TB
 | Layer | Files |
 |---|---|
 | API | `backend/app/main.py` (13 endpoints + SSE EventSourceResponse ping 15) |
-| Config/constants | `core/config.py` (caps: RUN_MAX_PAGES 12, RUN_MAX_DEPTH 2, EXTRACT_PAGE_CONCURRENCY 3, RUN_MAX_JUDGE_CALLS 400, RUN_MAX_RUNTIME_S, FETCH_* timeouts), `core/constants.py` (11 RunStages, 13 emitted event types - see docs/16), `core/logging.py` |
+| Config/constants | `core/config.py` (caps: RUN_MAX_PAGES 12, RUN_MAX_DEPTH 2, EXTRACT_PAGE_CONCURRENCY 6, RUN_MAX_JUDGE_CALLS 400, RUN_MAX_RUNTIME_S, FETCH_* timeouts), `core/constants.py` (11 RunStages, 13 emitted event types - see docs/16), `core/logging.py`, `core/pacing.py` (queue-time credit so `EXTRACT_PAGE_TIMEOUT_S` cuts work, not a provider's token window) |
 | Schemas | `schemas/plan.py` (WorkflowPlan/ProvenanceField/RunEvent mirror contracts), `schemas/base.py` (Search/PageFetcher/LLM/Dedup protocols) |
-| Planner/LLM | `providers/llm/generate.py` (Gemini→Groq fallback, identity stamps) + `providers/llm/langchain_client.py` (supervisor structured output seam) |
+| Planner/LLM | `providers/llm/generate.py` (OpenCode → Groq → Gemini, identity stamps; Groq keeps its own 8,000 TPM budget and one in-flight call, and retries a `json_validate_failed` generation without JSON mode; `GEMINI_ENABLED=false` keeps a configured-but-dead rung out of the ladder) + `providers/llm/langchain_client.py` (supervisor structured output seam) |
 | Planner | `services/planner.py` (Instructor `from_provider` + `response_model` + `max_retries` primary; direct-SDK second; marked fallback last) |
 | Discovery | `services/discovery.py` (run_id-stamped, Tavily include_domains from seed/allowed, drives `run_supervisor`) |
 | Triage/fetch | `services/source_router.py` (scheme allowlist; full SSRF in fetcher) + `providers/crawl/fetcher.py` (pooled httpx, robots cache+delay, per-host throttle, backoff, content-type guard, sha256 content_hash, same-host link extractor) + `services/crawler.py` (backoff-alternate-skip, depth<2 + per-domain + global budgets, progressive persist with hash) |
 | Agentic | `agents/state.py` (reducers incl. last_searched), `agents/decisions.py` (validated SupervisorDecision), `agents/tools.py` (DEAD CODE - no production importer), `agents/policies.py` (budgets), `agents/graph.py` (search→screen→decide→refine/fetch; compiled LangGraph w/ InMemorySaver+thread_id or identical manual stepping; no-progress exit) |
 | Decisions | `providers/decision/jev.py` (CORE 4 families + real `/v1/systemone` path + deterministic stubs; free Zen `jev-1.13-free` tried before the paid OpenRouter rung) |
-| Free LLM fan-out | `providers/llm/zen.py` (curated 10 text + 1 decision registry; direct Zen REST for the one ungated model, OpenCode for the nine the policy gates, `/systemone` for Jev) + `providers/llm/opencode.py` (1.18.32 wire protocol: `POST /session` → `POST /session/{id}/message`, model in the body, synchronous; exclusive-checkout session pool; a shared session cross-served concurrent callers) + `providers/llm/classify.py` (shared transient/fatal) + `services/fanout.py` (bounded concurrency, per-model isolation, semantic-keyed agreement clusters) — see §23-ENVIRONMENT |
-| Pipeline | `services/reducer.py` (`page_evidence_text`: the one definition of quotable text, shared with the store), `services/extractor.py` (capped, envelope-validated, chunks AND pages concurrent), `services/validator.py` (required+type enforced, records DROPPED not annotated, `judgment_unavailable` when no judge ruled), `services/normalizer.py`, `services/deduper.py` (L1→L2, rivals preserved, `adjudicate_conflicts` JUDGE step), `services/provenance.py`, `services/exporter.py` (caps, CSV-injection guard), `services/runner.py` (runtime budget checked per stage AND per page; records published per page so a timeout keeps them; JUDGE emits stats; cancel-aware) |
+| Free LLM fan-out | `providers/llm/zen.py` (curated 10 text + 1 decision registry; direct Zen REST for the one ungated model, OpenCode for the nine the policy gates, `/systemone` for Jev) + `providers/llm/opencode.py` (two wires, auto-detected per base URL: v1 `POST /session` → `POST /session/{id}/message` with an exclusive-checkout session pool, and v2 `GET /api/info` + `POST /api/experimental/generate/text` which is stateless and needs no pool; measure for v2 wraps provider quota failures in 502 with `reason: rate_limit`, mapped transient so Groq can serve) + `providers/llm/classify.py` (shared transient/fatal) + `services/fanout.py` (bounded concurrency, per-model isolation, semantic-keyed agreement clusters) — see §23-ENVIRONMENT |
+| Pipeline | `services/reducer.py` (`page_evidence_text`: the one definition of quotable text, shared with the store), `services/extractor.py` (capped, envelope-validated, chunks AND pages concurrent), `services/validator.py` (required+type enforced, records DROPPED not annotated, `judgment_unavailable` when no judge ruled), `services/normalizer.py`, `services/deduper.py` (L1→L2, rivals preserved, `adjudicate_conflicts` JUDGE step), `services/provenance.py`, `services/exporter.py` (caps, CSV-injection guard), `services/runner.py` (runtime budget checked per stage AND per page; records published per page so a timeout keeps them; gap-fill cut at the remaining budget rather than a search count; JUDGE emits stats; cancel-aware) |
 | DB | `repositories/postgres_repo.py` (psycopg against `DATABASE_URL`; one COPY for records, atomic finalize) + `local_repo.py` JSONL as **explicit** `PERSISTENCE=local` opt-in; adapter reported by `/api/health`. Tables per 14-DATABASE-SCHEMA. |
 
 ## 3. Runtime path (one run)

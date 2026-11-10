@@ -3,22 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <title>Datagoblin — evidence-first data intelligence</title>
+    <title>Temporal Evidence Engine — claim-level verification</title>
     <meta
       name="description"
-      content="Describe the data you need. Datagoblin plans the sources, collects permitted pages, extracts records, and proves every claim against stored evidence."
+      content="Paste an AI-generated answer and the time it was produced. Get atomic claims, live research, exact quotes from stored sources, and a deterministic verdict for each claim."
     />
     <meta name="theme-color" content="#f6f3ee" />
     <meta name="color-scheme" content="light" />
 
-    <link rel="icon" type="image/png" href="/favicon-32.png" />
-    <link rel="apple-touch-icon" href="/apple-touch.png" />
-    <meta property="og:title" content="Datagoblin — evidence-first data intelligence" />
+    <link rel="icon" type="image/svg+xml" href="/tee.svg" />
+    <meta property="og:title" content="Temporal Evidence Engine" />
     <meta
       property="og:description"
-      content="Describe the data you need. Datagoblin plans the sources, collects permitted pages, extracts records, and proves every claim against stored evidence."
+      content="A claim is supported, changed, contradicted or unverifiable — with the exact source text and the event date that decided it."
     />
-    <meta property="og:image" content="/logo.png" />
+    <meta property="og:image" content="/tee.svg" />
     <meta name="twitter:card" content="summary" />
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -29,12 +28,10 @@
     />
 
     <style>
-      /* Painted before the bundle evaluates, so the first frame is the paper
-         colour rather than a white flash. The shader layers in on top. */
+      /* The first frame is paper, not white. The boot mark is plain CSS so it
+         cannot depend on an asset that the bundle has not requested yet. */
       html { background: #f6f3ee; }
       #root { min-height: 100%; }
-      /* The shell is JS-rendered; until it mounts, show nothing rather than a
-         half-styled frame. */
       #boot {
         position: fixed;
         inset: 0;
@@ -42,51 +39,22 @@
         place-items: center;
         transition: opacity 260ms ease;
       }
-      #boot[hidden] { display: none; }
-      /* The mark, rounded to match how it sits in the nav rail, so the first
-         frame and the mounted app agree on the brand's shape. */
-      #boot img {
-        width: 88px;
-        height: 88px;
+      #boot span {
+        display: grid;
+        place-items: center;
+        width: 56px;
+        height: 56px;
         border-radius: 14px;
-        opacity: 0.92;
+        border: 1px solid #d3cabb;
+        background: #fbf9f6;
+        color: #9a6b3f;
+        font: 24px/1 'Instrument Serif', Georgia, serif;
       }
     </style>
   </head>
   <body>
-    <!--
-      DATAGOBLIN landing surface (/welcome) — direction contract.
-      First child of <body> on purpose: it survives the production build, so
-      `grep 32f41c97 dist/` audits what this page was actually made to be.
-
-      THESIS: the record is the hero. The page shows its evidence table before
-      its argument, because the visitor has already been burned defending a
-      number a model produced, and an assertion they can audit persuades where
-      one they must trust does not. It refuses the headline-and-three-feature-
-      cards template and the hero-metric template: the first viewport is a real
-      dataset from a real run with a live proof rail.
-      OWN-WORLD: inherited from the operator console, not reinvented. Warm paper
-      and ink, one bronze accent, judge purple reserved for judge decisions.
-      Instrument Serif for anything a human wrote, DM Mono for anything
-      machine-derived. Hairline-ruled citation dossiers over the console's own
-      ambient WebGL field, and the signature proof highlight: a value sitting
-      inside the sentence that supports it.
-      STORY: any cell opens onto the exact stored text; then a quote that
-      resolves perfectly turns out to be the wrong column; then the vocabulary
-      that will not let "nobody ruled on this" pass as verified. Belief:
-      provenance is a system, not a promise. Action: run it and check the rail.
-      FIRST VIEWPORT: left, the claim in serif over a lede and two actions;
-      right and dominant, the dossier — a recorded prompt, seven rows of a real
-      run, and a proof rail opening under any value.
-      FORM: candidate 7 of the grounded list, the "record is the hero" dossier.
-      Seed key 32f41c97.
-      FINISH: unreviewed and undocumented is unfinished; this build ends with
-      the finish review, the verdict, and DESIGN.md.
-    -->
     <div id="root"></div>
-    <div id="boot" aria-hidden="true">
-      <img src="/mark-88.png" alt="" width="88" height="88" />
-    </div>
+    <div id="boot" aria-hidden="true"><span>⏱</span></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

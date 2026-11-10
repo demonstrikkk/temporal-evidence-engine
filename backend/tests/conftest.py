@@ -73,6 +73,21 @@ def _no_provider_keys(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_groq_budget():
+    """Each test gets an empty Groq token window.
+
+    The pacing gate is process-wide by design, so without this a test that
+    really calls the rung would inherit the previous test's spend and wait out
+    a minute that no network call ever used.
+    """
+    from app.providers.llm import generate as gen
+
+    gen._reset_session_cache()
+    yield
+    gen._reset_session_cache()
+
+
+@pytest.fixture(autouse=True)
 def _judge_available(monkeypatch):
     """A judge that says SUPPORTED, by default, for every test.
 

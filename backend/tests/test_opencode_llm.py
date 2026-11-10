@@ -24,10 +24,14 @@ def run(coro):
 
 
 class _Resp:
-    def __init__(self, status=200, payload=None):
+    def __init__(self, status=200, payload=None, headers=None):
         self.status_code = status
         self._payload = payload if payload is not None else {}
         self.text = str(self._payload)[:300]
+        # The real v1 server answers JSON. The default keeps every existing
+        # fake honest; a v2 server is modelled by overriding it with text/html.
+        self.headers = headers if headers is not None else {
+            "content-type": "application/json"}
 
     def json(self):
         if isinstance(self._payload, Exception):
@@ -46,6 +50,12 @@ class _Client:
     served_override: str = ""
     #: Delay the /message reply so concurrent calls genuinely overlap in time.
     message_delay: float = 0.0
+    #: Override the GET the health probe makes, to model a non-v1 server.
+    get_response: object = None
+    #: "v1" (default, `/api/info` 404s) or "v2" (`/api/info` answers JSON).
+    wire: str = "v1"
+    #: Reply for v2's one-shot generate endpoint.
+    next_generate: object = None
 
     def __init__(self, *a, **k):
         pass
@@ -79,6 +89,12 @@ class _Client:
                                                      "headers": headers})
         if isinstance(_Client.next_post, Exception):
             raise _Client.next_post
+        if url.endswith("/api/experimental/generate/text"):
+            if isinstance(_Client.next_generate, _Resp):
+                return _Client.next_generate
+            if isinstance(_Client.next_post, _Resp):
+                return _Client.next_post
+            return _Resp(200, {"data": {"text": _Client.answer}})
         if url.endswith("/message"):
             if _Client.message_delay:
                 import asyncio as _a
@@ -93,6 +109,12 @@ class _Client:
 
     async def get(self, url, params=None, headers=None):
         _Client.seen["get"] = {"url": url, "params": params}
+        if isinstance(_Client.get_response, _Resp):
+            return _Client.get_response
+        if url.endswith("/api/info"):
+            # v2 has it, v1 does not. That 404 is what makes detection free.
+            return (_Resp(200, {"version": "2.2.0"}) if _Client.wire == "v2"
+                    else _Resp(404, {}))
         return _Resp(200, {})
 
     async def delete(self, url, headers=None):
@@ -118,6 +140,9 @@ def _opencode_cfg(monkeypatch):
     _Client.next_post = None
     _Client.next_message = None
     _Client.served_override = ""
+    _Client.get_response = None
+    _Client.wire = "v1"
+    _Client.next_generate = None
     yield
     gen._reset_session_cache()
 
@@ -169,9 +194,14 @@ def test_opencode_reports_server_reported_model():
 
 
 def test_opencode_no_polling_needed():
-    """v1 is synchronous: no GET message poll, so no 4s dead wait per call."""
+    """v1 is synchronous: no GET message poll, so no 4s dead wait per call.
+
+    The only GET allowed here is the one-time wire probe (`/api/info`), which
+    is what makes a v2 server usable; polling looks for `/message`.
+    """
     run(gen.opencode_structured("x", {}))
-    assert "get" not in _Client.seen
+    last_get = _Client.seen.get("get") or {}
+    assert "/message" not in (last_get.get("url") or ""), last_get
 
 
 def test_opencode_401_fatal():
@@ -266,6 +296,77 @@ def test_opencode_disabled_and_unconfigured(monkeypatch):
     with pytest.raises(AppError) as ei3:
         run(gen.opencode_structured("x", {}))
     assert "OPENCODE_MODEL" in (ei3.value.message or "")
+
+
+def test_configured_only_when_enabled_and_addressed(monkeypatch):
+    """`configured()` is the cascade's gate; it must not be true for a rung
+    that would raise on its first call."""
+    monkeypatch.setattr(config_mod.settings, "OPENCODE_ENABLED", True)
+    monkeypatch.setattr(config_mod.settings, "OPENCODE_BASE_URL", "http://x:1")
+    assert oc.configured() is True
+    monkeypatch.setattr(config_mod.settings, "OPENCODE_ENABLED", False)
+    assert oc.configured() is False
+    monkeypatch.setattr(config_mod.settings, "OPENCODE_ENABLED", True)
+    monkeypatch.setattr(config_mod.settings, "OPENCODE_BASE_URL", "")
+    assert oc.configured() is False
+
+
+def test_chain_skips_a_disabled_rung_and_lets_groq_serve(monkeypatch):
+    """`OPENCODE_ENABLED=false` is a deployment choice, not a broken provider.
+
+    It used to raise the rung's fatal preflight error, so a request Groq could
+    answer failed outright -- while `preflight()` had already approved the same
+    run on the grounds that a cloud provider would serve it.
+    """
+    monkeypatch.setattr(config_mod.settings, "OPENCODE_ENABLED", False)
+    called: list[str] = []
+
+    async def _groq(prompt, schema):
+        called.append("groq")
+        return {"data": {"ok": True}, "provider": "groq", "model": "m"}
+
+    async def _gemini(prompt, schema):
+        raise AssertionError("groq answered; gemini must not be reached")
+
+    monkeypatch.setattr(gen, "groq_structured", _groq)
+    monkeypatch.setattr(gen, "gemini_structured", _gemini)
+    out = run(gen.structured_generate("Do it.", {"type": "object"}))
+    assert out["provider"] == "groq" and called == ["groq"]
+
+
+def test_skipping_is_only_for_absent_config_not_a_real_fatal(monkeypatch):
+    """A configured rung that rejects credentials still stops the cascade."""
+    _Client.next_post = _Resp(401, {})
+
+    async def _groq(prompt, schema):
+        raise AssertionError("must not reach groq after an opencode auth failure")
+
+    monkeypatch.setattr(gen, "groq_structured", _groq)
+    with pytest.raises(AppError) as ei:
+        run(gen.structured_generate("Do it.", {}))
+    assert ei.value.code == "E_PROVIDER_FATAL"
+
+
+def test_strict_mode_does_not_route_around_a_switched_off_reader(monkeypatch):
+    """Strict mode ignores `configured()`: the local reader is the only one
+    allowed, so an unconfigured rung is reported rather than silently billed
+    to a cloud provider."""
+    monkeypatch.setattr(config_mod.settings, "OPENCODE_STRICT", True)
+    monkeypatch.setattr(config_mod.settings, "OPENCODE_ENABLED", False)
+    called: list[str] = []
+
+    async def _oc(prompt, schema):
+        called.append("opencode")
+        raise AppError("E_PROVIDER_FATAL", "OpenCode rung disabled", 424)
+
+    async def _groq(prompt, schema):
+        raise AssertionError("strict mode must not reach groq")
+
+    monkeypatch.setattr(gen, "opencode_structured", _oc)
+    monkeypatch.setattr(gen, "groq_structured", _groq)
+    with pytest.raises(AppError) as ei:
+        run(gen.structured_generate("Do it.", {}))
+    assert ei.value.code == "E_PROVIDER_FATAL" and called == ["opencode"]
 
 
 def test_chain_falls_back_through_groq_to_gemini(monkeypatch):
@@ -467,3 +568,93 @@ def test_available_never_raises():
     out = run(oc.available())
     assert out["reachable"] is True
     assert out["base_url"] == "http://127.0.0.1:4096"
+
+
+def test_a_v2_web_ui_is_not_mistaken_for_a_session_api():
+    """Measured on opencode 2.2.0.
+
+    `/session` is served by the web UI there, so GET answers 200 text/html. A
+    v2 server is supported now, but only when `/api/info` answers JSON; this
+    fake answers HTML on both probes, which is neither wire. A 200 that is not
+    an API must be reported as unusable, with the reason.
+    """
+    _Client.get_response = _Resp(200, {}, {"content-type": "text/html; charset=utf-8"})
+    out = run(oc.available())
+    assert out["reachable"] is False
+    assert out["wire_mismatch"] is True
+    assert "v1" in out["error"] and "v2" in out["error"]
+    assert "v2" in oc.explain_unusable(out)
+
+
+# --- v2 transport -----------------------------------------------------------
+
+
+def test_a_v2_server_is_healthy_and_named_as_such():
+    _Client.wire = "v2"
+    out = run(oc.available())
+    assert out["reachable"] is True
+    assert out.get("wire") == "v2" and out.get("version") == "2.2.0"
+
+
+def test_v2_generation_uses_the_one_shot_endpoint_and_pins_the_model():
+    """No session, no agent, no tools: one prompt in, one text out.
+
+    `Model.Ref` is {providerID, id}; the v1 body used {providerID, modelID}.
+    Sending the v1 shape to v2 is a 400, which is why this asserts the body.
+    """
+    _Client.wire = "v2"
+    out = run(gen.opencode_structured("Extract.", {"type": "object"}))
+    post = _Client.seen["posts"][-1]
+    assert post["url"].endswith("/api/experimental/generate/text")
+    assert post["json"]["model"] == {"providerID": "opencode", "id": "test-model"}
+    assert out["data"] == {"records": [], "coverage": "none"}
+    assert out["provider"] == "opencode" and out["model"] == "test-model"
+    assert _Client.seen.get("n_sessions") is None, (
+        "v2 must not create a session for a one-shot generation")
+
+
+def test_v2_system_prompt_is_carried_into_the_prompt_text():
+    _Client.wire = "v2"
+
+    async def _go():
+        return await oc.chat("test-model", "USER", system="SYSTEM")
+
+    run(_go())
+    body = _Client.seen["posts"][-1]["json"]
+    assert body["prompt"].index("SYSTEM") < body["prompt"].index("USER")
+
+
+def test_v2_rate_limit_is_transient_so_groq_can_serve(monkeypatch):
+    """The live v2 server wraps provider quota failures in HTTP 502 with
+    status 429 and retryAfterMs. That is transient: the free tier being spent
+    must not abort a request Groq could answer."""
+    _Client.wire = "v2"
+    _Client.next_post = _Resp(502, {
+        "_tag": "ProviderRequestError", "providerID": "opencode",
+        "reason": "rate_limit", "status": 429, "retryAfterMs": 65_111_000,
+        "message": "Free usage limit reached."})
+    called: list[str] = []
+
+    async def _groq(prompt, schema):
+        called.append("groq")
+        return {"data": {"ok": True}, "provider": "groq", "model": "m"}
+
+    monkeypatch.setattr(gen, "groq_structured", _groq)
+    out = run(gen.structured_generate("Do it.", {"type": "object"}))
+    assert out["provider"] == "groq" and called == ["groq"]
+
+
+def test_v2_unsupported_model_stops_the_cascade(monkeypatch):
+    """422 is this server saying the model cannot be used, not luck."""
+    _Client.wire = "v2"
+    _Client.next_post = _Resp(422, {"_tag": "UnsupportedModelError",
+                                    "message": "model cannot generate text"})
+
+    async def _groq(prompt, schema):
+        raise AssertionError("a rejected model must not be billed to another provider")
+
+    monkeypatch.setattr(gen, "groq_structured", _groq)
+    with pytest.raises(AppError) as ei:
+        run(gen.structured_generate("Do it.", {}))
+    assert ei.value.code == "E_PROVIDER_FATAL"
+

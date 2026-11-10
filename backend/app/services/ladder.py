@@ -8,9 +8,11 @@ from a structured feed and a field inferred from prose arrive looking identical.
 So fields are filled by **rungs**, cheapest and most reliable first, and the
 model is only asked about what is still missing:
 
-    1. selectors    a checked-in schema, or pattern-field regexes, against the DOM
-    2. json_ld      schema.org in the page, when the page publishes it
-    3. llm          prose, for whatever the earlier rungs could not answer
+    1. json         a JSON document body, read directly
+    2. selectors    a checked-in schema, or pattern-field regexes, against the DOM
+    3. json_ld      schema.org in the page, when the page publishes it
+    4. labelled     `Label: value` lines a listing page writes out in prose
+    5. llm          prose, for whatever the earlier rungs could not answer
 
 Three rules make this safe rather than merely cheaper.
 
@@ -228,10 +230,15 @@ def json_ld_rung(fields: list[dict], ctx: dict) -> dict[str, dict]:
     if not html:
         return {}
     from app.services import jsonld as jsonld_svc
-    if not jsonld_svc.present(html):
+    # Parsed once for the whole rung: the site-entity check and every field
+    # read the same documents. Before this, `present`, `_site_entity_names`
+    # and each `extract` call each re-scanned the HTML and re-decoded the
+    # blocks, so a ten-field record parsed the page's JSON-LD twelve times.
+    docs = jsonld_svc.documents(html)
+    if not docs:
         return {}
 
-    site_names = _site_entity_names(html)
+    site_names = jsonld_svc.site_entity_names(docs)
 
     out: dict[str, dict] = {}
     for f in fields:
@@ -252,7 +259,7 @@ def json_ld_rung(fields: list[dict], ctx: dict) -> dict[str, dict]:
         if site_names and plan_is_identity_field(name):
             continue
 
-        text, prop = jsonld_svc.extract(html, name)
+        text, prop = jsonld_svc.extract_from(docs, name)
         if text:
             # The page's own text for the value, so the evidence quote locates
             # against the stored page like every other route's does.
@@ -261,40 +268,16 @@ def json_ld_rung(fields: list[dict], ctx: dict) -> dict[str, dict]:
     return out
 
 
-def _norm_text(text: object) -> str:
-    return " ".join(str(text or "").lower().split()).strip(" |-–—:·")
-
-
 def _site_entity_names(html: str) -> set[str]:
     """Names of entities that describe the page rather than its content.
 
-    `WebSite`, `NewsMediaOrganization`, `Blog`, `WebPage` and a bare
-    `Organization` with neither `subOrganization` nor credentials are page
-    furniture. An `Organization` that is clearly the subject — one carrying its
-    own `hasCredential`, an address, or an identifier — is left alone, so a
-    company page that publishes its own Organization still works.
+    Kept as a thin wrapper for callers that only have HTML; the classification
+    itself lives in `jsonld.site_entity_names` so the rung can reuse documents
+    it has already parsed.
     """
     from app.services import jsonld as jsonld_svc
 
-    site: set[str] = set()
-    for node in jsonld_svc.documents(html):
-        raw_type = node.get("@type") or node.get("type") or ""
-        types = raw_type if isinstance(raw_type, list) else [raw_type]
-        names = {str(t).lower() for t in types if t}
-        text = node.get("name")
-        if isinstance(text, dict):
-            text = text.get("@value") or text.get("name")
-        if not isinstance(text, str) or not text.strip():
-            continue
-        if names & {"website", "webpage", "newsmediaorganization", "blog",
-                    "collectionpage", "itemlist", "searchresultspage"}:
-            site.add(_norm_text(text))
-        elif "organization" in names and not any(
-                node.get(k) for k in ("subOrganization", "hasCredential",
-                                      "address", "identifier", "legalName",
-                                      "founder", "numberOfEmployees")):
-            site.add(_norm_text(text))
-    return site
+    return jsonld_svc.site_entity_names(jsonld_svc.documents(html))
 
 
 def summarise(trace: list[dict], filled: dict) -> dict:
@@ -303,13 +286,20 @@ def summarise(trace: list[dict], filled: dict) -> dict:
     `model_avoided` is the number worth showing: fields the model was never asked
     about because a cheaper route already answered them. It is the direct
     consequence of the ladder and the reason to keep it.
+
+    Every rung in the walk here is a deterministic reader. Hard-coding the two
+    original names (`selectors`, `json_ld`) undercounted the moment `json` and
+    `labelled` were added: a run that filled the record from the page's own JSON
+    reported `model_avoided = 0` while the model was never called at all. The
+    count is now "everything the model did not fill", with the model rung named
+    explicitly so a later caller that does put it in the walk stays correct.
     """
     asked = sum(int(t.get("asked") or 0) for t in trace)
     by_rung = {t["rung"]: int(t.get("filled") or 0) for t in trace}
     return {
         "fields_filled": len(filled),
         "field_asks": asked,
-        "model_avoided": by_rung.get("selectors", 0) + by_rung.get("json_ld", 0),
+        "model_avoided": sum(v for k, v in by_rung.items() if k != "llm"),
         "by_rung": by_rung,
         "trace": trace,
     }

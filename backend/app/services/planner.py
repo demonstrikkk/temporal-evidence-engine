@@ -7,7 +7,8 @@ from urllib.parse import urlparse
 from app.core.config import settings
 from app.core.errors import validation
 from app.domain.api import apply_profile, require
-from app.schemas.plan import WorkflowPlan
+from app.schemas.plan import TemporalSpec, WorkflowPlan
+from app.services import temporal as temporal_svc
 
 _ENTITY_HINTS = [  # tie-break order: specific entities before generic company
     ({"job", "jobs", "hiring", "engineer", "engineers", "role", "roles", "salary"}, "job"),
@@ -31,6 +32,25 @@ _FIELD_HINTS = [
 ]
 
 
+#: A duration is not a record count. The old `\b(\d{1,3})\b` read the "6" in
+#: "startups funded in the last 6 months" as `requested_count = 6`, so the plan
+#: asked for six rows and carried no time constraint at all. A four-digit year
+#: escaped only by luck: `\b` cannot sit between the digits of `2024`.
+_DURATION = re.compile(
+    r"\b(?:last|past|next|previous|recent|within|over)\s+\d{1,3}\s+"
+    r"(?:day|week|month|quarter|year)s?\b"
+    r"|\b\d{1,3}\s+(?:day|week|month|quarter|year)s?\s+(?:ago|from\s+now)\b"
+    r"|\b\d{1,3}[- ](?:day|week|month|quarter|year)s?\b",
+    re.I)
+
+
+def _requested_count(text: str) -> int:
+    """The first number that asks for rows, not the first number in the prompt."""
+    cleaned = _DURATION.sub(" ", text or "")
+    m = re.search(r"\b(\d{1,3})\b", cleaned)
+    return max(1, min(int(m.group(1)), 50)) if m else 15
+
+
 def _rule_plan(prompt: str) -> dict:
     """Genuine deterministic compiler: count/entity/fields/queries inferred from the
     prompt text itself (no LLM, no hardcoding to any demo). Same contract as LLM plans."""
@@ -51,8 +71,7 @@ def _rule_plan(prompt: str) -> dict:
 
     entity = max(_ENTITY_HINTS, key=_key)[1] if any(words & h for h, _ in _ENTITY_HINTS) else "item"
 
-    m = re.search(r"\b(\d{1,3})\b", text)
-    count = max(1, min(int(m.group(1)), 50)) if m else 15
+    count = _requested_count(text)
 
     name = "company_name" if entity == "company" else f"{entity}_name"
     fields = [{"name": name, "type": "string", "description": f"{entity.title()} name",
@@ -465,7 +484,38 @@ def _finalize(plan: dict, prompt: str) -> dict:
     plan["allowed_sources"] = list(dict.fromkeys(requested + edition_sources))
     plan = _cap_total_fields(_cap_required(plan))
     plan = _entity_traversal(plan)
+    plan = _temporal_spec(plan, prompt)
     return _merge_field_probes(plan)
+
+
+def _temporal_spec(plan: dict, prompt: str) -> dict:
+    """Attach the time the request asks about.
+
+    The deterministic parser wins over a model-provided spec. Dates are the one
+    part of a plan a model is most likely to paraphrase into a different window,
+    and the parser is the thing a test can pin. A model spec survives only when
+    the prompt itself named no time ("use the plan's dates" is still better than
+    throwing them away).
+
+    A malformed model spec degrades to "no constraint" rather than failing the
+    plan: an unreadable date is not a reason to refuse the request.
+    """
+    parsed = temporal_svc.parse(prompt)
+    if parsed.kind != "none":
+        plan["temporal"] = parsed.model_dump()
+        return plan
+    raw = plan.get("temporal")
+    if isinstance(raw, TemporalSpec):
+        plan["temporal"] = raw.model_dump()
+        return plan
+    if isinstance(raw, dict) and raw:
+        try:
+            plan["temporal"] = TemporalSpec(**raw).model_dump()
+        except Exception:  # noqa: BLE001 (a bad date must not fail the plan)
+            plan["temporal"] = TemporalSpec().model_dump()
+    else:
+        plan["temporal"] = TemporalSpec().model_dump()
+    return plan
 
 
 async def compile_plan(prompt: str, llm: object = None,

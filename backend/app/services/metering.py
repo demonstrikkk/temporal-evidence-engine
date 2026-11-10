@@ -153,14 +153,31 @@ class Meter:
             return None
         return self.ledger.bill(self.job_id, stage, units, seq)
 
-    def clamp_pages(self, requested_pages: int) -> int:
-        """Firecrawl clamp: limit = min(remaining, requested). Unlimited passthrough."""
+    def clamp_queries(self, requested_queries: int) -> int:
+        """How many search calls a bounded run can pay for.
+
+        Discovery bills what it issued *after* issuing it, so this is the only
+        place that can stop the spend before it happens. One credit per query.
+        """
+        requested = max(1, int(requested_queries))
+        if self.unlimited:
+            return requested
+        return max(0, min(requested, self.remaining() or 0))
+
+    def clamp_pages(self, requested_pages: int, queries: int = 1) -> int:
+        """Firecrawl clamp: limit = min(remaining less queries, requested).
+
+        `queries` is what discovery will actually issue, not a hardcoded one.
+        Reserving a single query while discovery issued five allocated pages
+        the budget did not have; those pages were then fetched and could not be
+        billed.
+        """
         requested = max(1, int(requested_pages))
         if self.unlimited:
             return requested
         per_page = PRICES["fetch_page"] + PRICES["extract_page"]
-        discover = PRICES["discover_query"]  # at least one query happens
-        affordable = (self.budget - self.spent - discover) // per_page
+        reserve = max(0, int(queries)) * PRICES["discover_query"]
+        affordable = (self.budget - self.spent - reserve) // per_page
         return max(0, min(requested, affordable))
 
     def summary(self) -> dict[str, Any]:

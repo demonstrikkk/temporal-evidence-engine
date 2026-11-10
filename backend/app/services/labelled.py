@@ -47,12 +47,28 @@ from app.services import confidence as conf_svc
 
 #: `Label: value`, anchored at the start of a line. The label may not contain a
 #: colon (no nesting, no times like 12:30) and the value must be non-empty.
+#:
+#: Reducers wrap labels in emphasis — `**Industry:** AI` is what a bold table
+#: field becomes in markdown — so one layer of `*`, `_` or backtick is allowed on
+#: either side of the colon. It is matched, not stripped: the stored quote has to
+#: stay the page's original line so it still locates.
 _LABELLED = re.compile(
-    r"^([A-Z][A-Za-z0-9][A-Za-z0-9 /&_'-]{1,38}?)\s*:\s*(\S.*)$"
+    r"^(?:\*\*|__|[*_`])?"
+    r"([A-Z][A-Za-z0-9][A-Za-z0-9 /&_'-]{1,38}?)"
+    r"(?:\*\*|__|[*_`])?\s*:\s*(?:\*\*|__|[*_`])?\s*(\S.*)$"
 )
 
 #: A heading that introduces a record, e.g. `## 1. Mistral` or `### Anthropic`.
 _HEADING = re.compile(r"^(#{1,6})\s+(?:[\d]+[.)]\s*)?(.+?)\s*$")
+
+#: Markdown furniture a reducer adds in front of a label: a list bullet or an
+#: ordered-list number. The page still says `Industry: AI`; the marker is the
+#: renderer's, not the source's.
+_BULLET = re.compile(r"^(?:[•·]\s+|[-*+]\s+|\d{1,3}[.)]\s+)")
+
+#: Emphasis markers around a label, e.g. `**Industry:** AI`. Stripped for the
+#: match only; the stored quote stays the original line so it still locates.
+_EMPHASIS = re.compile(r"\*\*|__|`")
 
 #: Field names whose value is a heading rather than a labelled line, so the
 #: heading becomes the value instead of being ignored.
@@ -63,6 +79,16 @@ _NAMEISH = ("company_name", "company", "ngo_name", "startup_name", "entity_name"
 #: the floor because one shared word is not a match: `Location` should not answer
 #: `valuation`, and `Funding` should not answer `founded`.
 _MIN_TOKEN_OVERLAP = 2
+
+#: The longest labelled value this rung will store.
+#:
+#: A labelled value is one line of the page, and the line is also the quote, so
+#: there is no structural need for a tight bound. The old limit of 160 dropped
+#: addresses, funding rounds and short descriptions that the page stated
+#: outright, which then went to the model — the opposite of the rung's purpose.
+#: 500 is long enough for a postal address or a sentence and short enough that a
+#: mis-anchored paragraph cannot become a cell.
+_MAX_VALUE_CHARS = 500
 
 
 def _norm(text: str) -> str:
@@ -113,9 +139,18 @@ def _clean_value(raw: str) -> str:
     rather than part of the value, and markdown emphasis left by the reducer is
     stripped so a bold label does not leak into the cell.
     """
-    v = re.sub(r"\*\*|__|`", "", str(raw or "")).strip()
+    v = _EMPHASIS.sub("", str(raw or "")).strip()
     v = re.sub(r"\s+", " ", v)
     return v.rstrip(" .;,·—-")
+
+
+def _label_match(line: str):
+    """Match `Label: value` through the markdown a reducer adds.
+
+    A list bullet is renderer furniture, not part of the label, so it is removed
+    before matching. The original line is what gets quoted.
+    """
+    return _LABELLED.match(_BULLET.sub("", line.strip()))
 
 
 def labelled_pairs(markdown: str, wanted: list[dict]) -> dict[str, tuple[str, str]]:
@@ -134,13 +169,20 @@ def labelled_pairs(markdown: str, wanted: list[dict]) -> dict[str, tuple[str, st
     into rows, and until a schema exists for this shape it is honest to return one
     correct record rather than thirty spliced ones.
 
+    The record is located by content rather than by "whatever follows the first
+    heading": listing pages usually carry a page title (`# Top AI Companies`)
+    above the records (`## Mistral`), and reading the title's section returned the
+    intro and no fields at all. The first section that prints a recognised label
+    wins, and a heading supplies the entity name only when its level repeats,
+    which is what makes it a listing rather than a page title or a section label.
+
     Values that are really absences are skipped. `Valuation: Not publicly
     disclosed` states that the page has no valuation, and storing it would turn
     an absent field into a string a reader has to know to distrust.
 
-    The value returned is also the quote. That is the basis for trusting it: the
-    quote *is* the line the page printed, so a downstream check that the quote is
-    on the stored page is checking that this line really came from there.
+    The quote is the line the page printed, in its original markdown form; the
+    value is that line's cleaned value. A downstream check that the quote is on
+    the stored page is therefore checking that this line really came from there.
     """
     if not wanted:
         return {}
@@ -150,50 +192,74 @@ def labelled_pairs(markdown: str, wanted: list[dict]) -> dict[str, tuple[str, st
 
     from app.services.normalizer import is_placeholder
 
-    out: dict[str, tuple[str, str]] = {}
-    seen: set[str] = set()
-    started = False
-    headings = 0
-
-    for raw_line in (markdown or "").split("\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-
+    lines = [raw.strip() for raw in (markdown or "").split("\n")]
+    heads: list[tuple[int, int, str, str]] = []
+    for i, line in enumerate(lines):
         head = _HEADING.match(line)
         if head:
-            if started:
-                break  # the first record is complete; a second one is another row
-            started = True
-            headings += 1
-            title = _clean_value(head.group(2))
-            # A heading is only a name on a *listing* page, where each heading
-            # introduces another entity. On a single-record page the first heading
-            # is the page's own subject line — a job posting's is the role title,
-            # so inferring `company_name` from it wrote
-            # "Senior Machine Learning Engineer" where Roku belonged. Counting the
-            # headings first is what tells the two apart, and the cost of being
-            # wrong here is a corrupted identity that dedupe then keys on.
-            if title and len(title) <= 90 and headings >= 2:
-                for spec in by_spec:
-                    name = str(spec.get("name") or "")
-                    if name in seen:
-                        continue
-                    if name in _NAMEISH or name.endswith("_name"):
-                        out[name] = (title, line)
-                        seen.add(name)
-            continue
+            heads.append((i, len(head.group(1)), _clean_value(head.group(2)), line))
+    if not heads:
+        # Nothing before the first heading belongs to a record this rung can
+        # attribute a value to.
+        return {}
 
-        if not started:
-            # No heading opened a record, so nothing before the first one belongs
-            # to a record this rung can attribute a value to.
-            continue
+    def _usable(label: str, value: str) -> bool:
+        return (bool(value) and len(value) <= _MAX_VALUE_CHARS
+                and not is_placeholder(value)
+                and any(_label_matches(label, s) for s in by_spec))
 
-        m = _LABELLED.match(line)
+    def _opens_a_record(section: list[str]) -> bool:
+        for line in section:
+            m = _label_match(line)
+            if m and _usable(m.group(1).strip(), _clean_value(m.group(2))):
+                return True
+        return False
+
+    level_count: dict[int, int] = {}
+    for _i, level, _title, _line in heads:
+        level_count[level] = level_count.get(level, 0) + 1
+
+    # The first section that actually prints a field is the first record. On a
+    # listing page the page title is a heading too, and its section is only the
+    # intro (`# Top AI Companies` followed by prose, then `## Mistral`), so
+    # starting at the first heading unconditionally made the rung read the intro
+    # and return nothing at all. Probing each section for a labelled field skips
+    # page furniture and finds the first real record.
+    #
+    # A repeated heading level is tried first: that is what makes a listing, and
+    # it stops an intro line such as `Updated: 2024` from selecting the page-title
+    # section and then collecting the first match for each field across *several*
+    # records. A single-record page falls back to the first label-bearing section.
+    def _first_record_heading(require_repeated: bool):
+        for pos, (start, level, title, raw_line) in enumerate(heads):
+            if require_repeated and level_count.get(level, 0) < 2:
+                continue
+            probe_end = heads[pos + 1][0] if pos + 1 < len(heads) else len(lines)
+            if _opens_a_record(lines[start + 1:probe_end]):
+                return pos, start, level, title, raw_line
+        return None
+
+    chosen = _first_record_heading(True) or _first_record_heading(False)
+    if chosen is None:
+        return {}
+
+    _pos, start, level, title, raw_line = chosen
+    # Everything under the record heading, including its sub-headings, up to the
+    # next heading at the same or a higher level.
+    section_end = len(lines)
+    for i, other_level, _t, _l in heads:
+        if i > start and other_level <= level:
+            section_end = i
+            break
+
+    out: dict[str, tuple[str, str]] = {}
+    seen: set[str] = set()
+    for line in lines[start + 1:section_end]:
+        m = _label_match(line)
         if not m:
             continue
         label, value = m.group(1).strip(), _clean_value(m.group(2))
-        if not value or len(value) > 160 or is_placeholder(value):
+        if not _usable(label, value):
             continue
         for spec in by_spec:
             name = str(spec.get("name") or "")
@@ -204,15 +270,37 @@ def labelled_pairs(markdown: str, wanted: list[dict]) -> dict[str, tuple[str, st
                 seen.add(name)
                 break
 
+    # A heading is only a name on a *listing* page, where the same heading level
+    # introduces more than one entity. On a single-record page it is the page's
+    # own subject line — a job posting's is the role title, so inferring
+    # `company_name` from it wrote "Senior Machine Learning Engineer" where Roku
+    # belonged. The earlier guard counted headings but broke before the count
+    # could ever reach two, so the name was never read at all; the level count
+    # states the actual condition.
+    #
+    # Assigned after the labelled lines, so an explicit `Company: Roku` always
+    # outranks an inferred heading. Structured routes run before this rung, so a
+    # JSON-LD identity is likewise already in `seen` and cannot be overwritten.
+    if title and len(title) <= 90 and level_count.get(level, 0) >= 2:
+        for spec in by_spec:
+            name = str(spec.get("name") or "")
+            if name in seen:
+                continue
+            if name in _NAMEISH or name.endswith("_name"):
+                out[name] = (title, raw_line)
+                seen.add(name)
+
     return out
 
 
 def rung(fields: list[dict], ctx: dict) -> dict[str, dict]:
     """Rung — read labelled lines out of the page's own stored markdown.
 
-    Cheap enough to always run and safe enough to run first: it only fills a field
-    when the page prints a label that names it, and it hands back the line as the
-    quote so the gate can confirm the line came from the stored page.
+    Cheap enough to always run and safe enough to run before the model: it only
+    fills a field when the page prints a label that names it, and it hands back
+    the line as the quote so the gate can confirm the line came from the stored
+    page. Structured routes (JSON, selectors, JSON-LD) run first, so a generic
+    label match can never displace the page's own explicit declaration.
     """
     page = ctx.get("page") or {}
     markdown = page.get("markdown") or ""

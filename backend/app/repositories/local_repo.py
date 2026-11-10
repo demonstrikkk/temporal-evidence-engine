@@ -34,6 +34,16 @@ class LocalRepo:
         test refuses a method one adapter has and the other does not.
         """
 
+    def ping(self) -> None:
+        """Raise when the store cannot be used. Mirrors `PostgresRepo.ping`.
+
+        A root directory that disappeared -- tmp cleanup, an unmounted volume --
+        is this adapter's version of a dead database, and reads against it
+        returned empty lists exactly like a legitimately empty store.
+        """
+        if not self._root.is_dir():
+            raise RuntimeError(f"local store root is gone: {self._root}")
+
     def _path(self, name: str) -> Path:
         return self._root / f"{name}.jsonl"
 
@@ -255,6 +265,9 @@ class LocalRepo:
             "fallback_used": bool(page.get("fallback_used")),
             "final_content_source": str(page.get("final_content_source") or "http"),
             "degraded_reason": str(page.get("degraded_reason") or ""),
+            # When the page said its content was from, so reuse keeps it and a
+            # cell's `valid_time` is not lost between runs. See 013_temporal.sql.
+            "published_date": str(page.get("published_date") or ""),
             # `retrieved_at` was dropped here while PostgresRepo kept it, so the
             # two did not actually mirror each other: `get_pages` documents
             # itself as "newest first" and had no timestamp to order by, and the
@@ -344,7 +357,17 @@ class LocalRepo:
         did = str(uuid.uuid4())
         self._append("datasets", {"id": did, "run_id": run_id, "name": plan.get("goal", ""),
                                   "schema": plan.get("fields", []), "records": rows,
-                                  "counts": counts})
+                                  "counts": counts,
+                                  # Which vertical produced this dataset,
+                                  # stamped once so the list can be filtered
+                                  # by edition without a plan read per row.
+                                  # See 011_dataset_edition.sql.
+                                  "edition": str(plan.get("edition") or "")[:80],
+                                  # What the prompt asked about in time. Kept on
+                                  # the dataset so a reader can tell "as of
+                                  # 2024-09-29" from "last six months" without
+                                  # re-parsing the goal string.
+                                  "temporal": dict(plan.get("temporal") or {})})
         # Without this the run stayed DISCOVERING forever in local mode: reads
         # take the last line per id, and nothing ever wrote a terminal one.
         # A budget-limited run is FAILED + partial, never COMPLETED.
@@ -357,6 +380,51 @@ class LocalRepo:
         return did
 
     # -- reads (scan jsonl; dev-scale only) -----------------------------------
+    def _dataset_lines(self) -> dict[str, dict]:
+        """One merged row per dataset id, newest line authoritative.
+
+        A correction here is an appended line for the same id, so every reader
+        has to collapse those lines itself and nothing did: `/api/datasets`
+        listed a corrected dataset twice. And a line that restated only the
+        columns it changed hid the rest — a cell correction erased the
+        dataset's `temporal` window and `edition` stamp, which is how one live
+        run produced a dataset whose detail view had no window at all.
+
+        So: last line wins per column, and an empty value never erases one an
+        older line carried. A column a writer omitted is not a column cleared,
+        and in this append-only format the only real deletion is `_rewrite`.
+        """
+        out: dict[str, dict] = {}
+        for d in self._scan("datasets"):
+            did = str(d.get("id") or "")
+            if not did:
+                continue
+            merged = out.get(did)
+            if merged is None:
+                # The creation line is the only truthful source for when the
+                # dataset first existed; a later correction must not restamp it.
+                merged = out[did] = {"_created_ts": str(d.get("_ts") or "")}
+            for k, v in d.items():
+                if v not in (None, "", [], {}):
+                    merged[k] = v
+        return out
+
+    @staticmethod
+    def _dataset_line(ds: dict, *, records: list | None = None,
+                      schema: list | None = None) -> dict:
+        """Every dataset column, restated for an append.
+
+        The appended line *is* the new row, so a column left out is a column
+        dropped. Callers pass only what they changed.
+        """
+        return {"id": ds.get("id", ""), "run_id": ds.get("run_id", ""),
+                "name": ds.get("name", ""),
+                "schema": list(ds.get("schema", []) if schema is None else schema),
+                "records": ds.get("records", []) if records is None else records,
+                "counts": ds.get("counts", {}),
+                "edition": ds.get("edition", ""),
+                "temporal": ds.get("temporal") or {}}
+
     def _scan(self, name: str) -> list[dict]:
         p = self._path(name)
         if not p.exists():
@@ -415,25 +483,36 @@ class LocalRepo:
         field is simply absent rather than reported as a gap.
         """
         out = []
-        for d in self._scan("datasets")[-max(1, limit):]:
-           out.append({"id": d["id"], "run_id": d.get("run_id", ""),
-                       "name": d.get("name", ""),
-                       "schema": d.get("schema") or [],
-                       "record_count": len(d.get("records", [])),
-                       "created_at": d.get("_ts", "")})
+        merged = self._dataset_lines()
+        # Newest first, matching PostgresRepo's ORDER BY created_at DESC. The
+        # adapters have to return the same order or the dashboard reorders
+        # itself depending on which store is live.
+        rows = sorted(merged.values(), key=lambda d: str(d.get("_created_ts") or ""),
+                      reverse=True)[:max(1, int(limit))]
+        for d in rows:
+            out.append({"id": d.get("id", ""), "run_id": d.get("run_id", ""),
+                        "name": d.get("name", ""),
+                        "schema": d.get("schema") or [],
+                        "record_count": len(d.get("records", [])),
+                        "counts": d.get("counts") or {},
+                        "edition": d.get("edition", ""),
+                        "temporal": d.get("temporal") or {},
+                        "created_at": d.get("_created_ts", "")})
         return out
 
     def get_dataset(self, dataset_id: str) -> dict | None:
         # Last write wins, matching every other read here: a corrected record is
         # appended as a new line, so returning the first match would serve the
-        # stale copy forever.
-        found = None
-        for d in self._scan("datasets"):
-            if d.get("id") == dataset_id:
-                found = {"id": d["id"], "run_id": d.get("run_id", ""), "name": d.get("name", ""),
-                         "schema": d.get("schema", []), "records": d.get("records", []),
-                         "counts": d.get("counts", {}), "created_at": d.get("_ts", "")}
-        return found
+        # stale copy forever. `_dataset_lines` collapses those lines per column.
+        d = self._dataset_lines().get(dataset_id)
+        if d is None:
+            return None
+        return {"id": d["id"], "run_id": d.get("run_id", ""), "name": d.get("name", ""),
+                "schema": d.get("schema", []), "records": d.get("records", []),
+                "counts": d.get("counts", {}),
+                "edition": d.get("edition", ""),
+                "temporal": d.get("temporal") or {},
+                "created_at": d.get("_created_ts", "")}
 
     def run_readonly_sql(self, sql: str, params: tuple = ()) -> list[dict]:
         """Always refuses.
@@ -455,19 +534,22 @@ class LocalRepo:
 
     def get_dataset_row(self, dataset_id: str) -> dict | None:
         """The dataset's own columns, with no records attached. See PostgresRepo."""
-        found = None
-        for d in self._scan("datasets"):
-            if d.get("id") == dataset_id:
-                found = {"id": d["id"], "run_id": d.get("run_id", ""),
-                         "name": d.get("name", ""), "schema": d.get("schema", []),
-                         "record_count": len(d.get("records", [])),
-                         # Counts are persisted on the row by finalize; the row
-                         # variant used to drop them, so the one endpoint the
-                         # page actually reads reported "not counted" while the
-                         # full variant (and Postgres, once joined) measured.
-                         "counts": d.get("counts", {}),
-                         "created_at": d.get("_ts", "")}
-        return found
+        d = self._dataset_lines().get(dataset_id)
+        if d is None:
+            return None
+        return {"id": d["id"], "run_id": d.get("run_id", ""),
+                "name": d.get("name", ""), "schema": d.get("schema", []),
+                "record_count": len(d.get("records", [])),
+                # Counts are persisted on the row by finalize; the row variant
+                # used to drop them, so the one endpoint the page actually reads
+                # reported "not counted" while the full variant (and Postgres,
+                # once joined) measured.
+                "counts": d.get("counts", {}),
+                # Same for the edition stamp: the list filtered by it while the
+                # detail view silently reported "no edition".
+                "edition": d.get("edition", ""),
+                "temporal": d.get("temporal") or {},
+                "created_at": d.get("_created_ts", "")}
 
     def get_dataset_schema(self, dataset_id: str) -> list | None:
         """Just the declared schema — no record copy. See PostgresRepo."""
@@ -510,6 +592,43 @@ class LocalRepo:
                 }
         return out
 
+    def search_records(self, dataset_id: str, q: str, limit: int = 100,
+                       offset: int = 0) -> dict:
+        """Records whose **stored page text** contains the query.
+
+        `get_records` searches the record's own fields. A judgment's fields
+        are a title, a citation and a summary; the finding that made a case
+        important is in the body, in the pages the evidence came from. So
+        the search has to reach the stored page text.
+
+        The page id is inside each cell's own `source`, so a hit means *this
+        record's own evidence* contains the text -- not that some other
+        record in the dataset happens to share a page.
+        """
+        ql = (q or "").strip().lower()
+        if not ql:
+            return {"dataset_id": dataset_id, "total": 0, "records": [],
+                    "matched_in": "none"}
+        pages = {str(p.get("id")): str(p.get("markdown") or "").lower()
+                 for p in self._scan("pages")}
+        hits: list[dict] = []
+        for row in self.get_records(dataset_id, "", 5000, 0).get("records", []):
+            cited = set()
+            for cell in (row.get("fields") or {}).values():
+                if not isinstance(cell, dict):
+                    continue
+                source = cell.get("source") or {}
+                page_id = str(source.get("page_id") or "")
+                if page_id:
+                    cited.add(page_id)
+            for page_id in cited:
+                if ql in pages.get(page_id, ""):
+                    hits.append(row)
+                    break
+        window = hits[offset:offset + max(1, min(int(limit), 5000))]
+        return {"dataset_id": dataset_id, "total": len(hits),
+                "records": window, "matched_in": "stored page text"}
+
     def get_records(self, dataset_id: str, q: str = "", limit: int = 100, offset: int = 0) -> dict:
         ds = self.get_dataset(dataset_id)
         if ds is None:
@@ -547,9 +666,7 @@ class LocalRepo:
         fields[field] = cell
         row["fields"] = fields
         records[idx] = row
-        self._append("datasets", {"id": dataset_id, "run_id": ds.get("run_id", ""),
-                                  "name": ds.get("name", ""), "schema": ds.get("schema", []),
-                                  "records": records, "counts": ds.get("counts", {})})
+        self._append("datasets", self._dataset_line(ds, records=records))
         return True
 
     def update_dataset_schema(self, dataset_id: str, schema: list) -> bool:
@@ -562,10 +679,7 @@ class LocalRepo:
         ds = self.get_dataset(dataset_id)
         if ds is None:
             return False
-        self._append("datasets", {"id": dataset_id, "run_id": ds.get("run_id", ""),
-                                  "name": ds.get("name", ""), "schema": list(schema or []),
-                                  "records": ds.get("records", []),
-                                  "counts": ds.get("counts", {})})
+        self._append("datasets", self._dataset_line(ds, schema=schema))
         return True
 
     # -- gaps -----------------------------------------------------------------

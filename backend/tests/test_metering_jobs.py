@@ -64,6 +64,25 @@ def test_meter_enforces_and_clamps():
     assert summary["spent"] == 10 and summary["budget"] == 10
 
 
+def test_pages_are_clamped_against_every_query_the_run_will_issue():
+    """Reserving one query while discovery issued five allocated pages the
+    budget did not have; the extra pages were fetched but could not be billed."""
+    meter = metering_svc.Meter("j2", 10)
+    assert meter.clamp_pages(12, queries=5) == 1  # (10 - 5) // 3
+    assert meter.clamp_pages(12, queries=1) == 3
+    # Unlimited ignores both the page and the query bound.
+    assert metering_svc.Meter("j3").clamp_pages(12, queries=5) == 12
+
+
+def test_query_clamp_refuses_to_plan_more_searches_than_the_budget_buys():
+    meter = metering_svc.Meter("j4", 3)
+    assert meter.clamp_queries(8) == 3
+    assert meter.clamp_queries(2) == 2
+    assert metering_svc.Meter("j5").clamp_queries(8) == 8  # unlimited
+    meter.spend("discover_query", 3)
+    assert meter.clamp_queries(8) == 0
+
+
 # -- local repo persistence ----------------------------------------------------------------------
 def test_local_repo_ledger_and_fingerprints(tmp_path):
     from app.repositories.local_repo import LocalRepo
@@ -175,7 +194,18 @@ def test_runner_bills_actuals_unlimited():
     assert len(clamp_notes) == 0  # unlimited default: no clamp
     stages = {c["stage"] for c in charges}
     assert stages == {"discover_query", "fetch_page", "extract_page", "judge_call"}
-    assert sum(c["credits"] for c in charges) == 1 + 4 + 8 + 0  # 1q + 4 pages + 4x2 + 0 conflicts
+    by_stage: dict[str, int] = {}
+    for c in charges:
+        by_stage[c["stage"]] = by_stage.get(c["stage"], 0) + c["credits"]
+    assert by_stage["fetch_page"] == 4
+    assert by_stage["extract_page"] == 8
+    assert by_stage["judge_call"] == 0
+    # Two searches were really issued: the supervisor query, then the
+    # host-diversity top-up that excludes the four seeded hosts. The old
+    # assertion charged the one-query projection instead, so it could not tell
+    # a short-circuited discovery from a full one.
+    assert by_stage["discover_query"] == 2
+    assert sum(c["credits"] for c in charges) == 2 + 4 + 8 + 0
 
 
 def test_runner_budget_clamp_and_fail_fast():
@@ -195,6 +225,23 @@ def test_runner_budget_clamp_and_fail_fast():
     poor["credit_budget"] = 1  # cannot afford a single page
     result2 = run(runner_svc.execute_run("r2", poor, ctx2, emit2))
     assert result2["status"] == "FAILED" and "budget" in result2["error"]
+
+
+def test_a_bounded_run_reserves_every_query_it_will_issue():
+    """The page clamp used to assume one search. A four-query plan against a
+    ten-credit budget then allocated three pages (ten credits of pages) plus
+    four searches, so the run spent more than it was allowed."""
+    events: list = []
+    charges: list = []
+    ctx, emit = _ctx(events, charges)
+    plan = _plan(search_queries=["Acme", "Acme AI", "Acme staff", "Acme jobs"])
+    plan["credit_budget"] = 10
+    result = run(runner_svc.execute_run("r3", plan, ctx, emit))
+    assert result["status"] == "COMPLETED"
+    assert sum(c["credits"] for c in charges) <= 10
+    notes = [e for e in events if "budget clamp" in e.get("message", "")]
+    assert notes and "queries" in notes[0]["message"], (
+        "the clamp note must say how many searches it reserved")
 
 
 # -- API: jobs + map ----------------------------------------------------------------------------

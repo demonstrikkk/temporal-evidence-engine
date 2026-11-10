@@ -328,11 +328,71 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/editions:
+    get:
+      summary: List Installed Editions
+      description: |-
+        The domain editions this instance can see.
+
+        An edition is a vertical's knowledge, read as data. The core could already
+        list them (`app.domain.api.list_editions`) but nothing exposed that over
+        HTTP, so "which datasets are the legal ones?" had no endpoint to ask -- the
+        answer was a name in a flat list, or an id the reader had to already know.
+
+        A broken edition is reported as `status: "error"` with the reason, never
+        omitted: an edition that failed to load is a fact about this instance, and
+        hiding it would make the list look complete when it is not.
+      operationId: list_installed_editions_api_editions_get
+      parameters:
+      - name: x-api-key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Api-Key
+      - name: X-Request-ID
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Request-Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response List Installed Editions Api Editions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/datasets:
     get:
       summary: List Datasets
+      description: |-
+        Every dataset, optionally narrowed to the ones an edition produced.
+
+        `edition` is a filter, not a lookup: the dataset list stays the one list of
+        everything stored, and asking for `edition=datagoblin_legal` returns the
+        legal corpus without the reader having to know its id.
       operationId: list_datasets_api_datasets_get
       parameters:
+      - name: edition
+        in: query
+        required: false
+        schema:
+          type: string
+          default: ''
+          title: Edition
       - name: x-api-key
         in: header
         required: false
@@ -495,6 +555,12 @@ paths:
         returns the record ids that match each rule. The rules come from the plan
         the edition stamped at compile time, so a dataset imported from a corpus
         keeps the same views a compiled run would have.
+
+        Cached, like the other derived reads, because the measurement is brutal:
+        every statement against a remote pooler costs ~170ms, so reading a
+        dataset's rows in pages plus resolving its plan is several round trips
+        before a single number comes back. The answer only changes when a cell is
+        written, and every write path drops the cache.
       operationId: get_dataset_buckets_api_datasets__did__buckets_get
       parameters:
       - name: did
@@ -537,6 +603,17 @@ paths:
   /api/datasets/{did}/records:
     get:
       summary: Get Records
+      description: |-
+        The dataset's records, optionally filtered by a query.
+
+        `fulltext=true` searches the **stored page text** rather than the
+        record's own fields. A judgment's fields are a title, a citation and a
+        summary; the passage that made the case worth reading is in the body, in
+        the page the evidence came from. Without this, a dataset of judgments
+        could not be searched for the words that matter in them.
+
+        Both searches are the dataset's own records: the full-text one matches a
+        record when the text of a page *that record cites* contains the query.
       operationId: get_records_api_datasets__did__records_get
       parameters:
       - name: did
@@ -569,6 +646,13 @@ paths:
           minimum: 0
           default: 0
           title: Offset
+      - name: fulltext
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: false
+          title: Fulltext
       - name: x-api-key
         in: header
         required: false
@@ -2338,6 +2422,14 @@ paths:
         reconnaissance, and an unauthenticated `GET /api/health` is the cheapest
         possible probe for them. So the detail is included only when a valid key is
         presented, and an unauthenticated caller gets a bare liveness answer.
+
+        For an authorised caller the persistence block carries `reachable`, the
+        answer to one bounded query, and `status` becomes `degraded` when it fails —
+        the adapter *name* is configuration and can be right while the database is
+        gone. The `llm` block names the rungs the next model call will try
+        (`first_rung`, `rungs`) and whether fallbacks are allowed at all, which is
+        how `OPENCODE_STRICT` decides whether Groq can serve. Both are read from
+        configuration; neither spends a call.
       operationId: health_api_health_get
       parameters:
       - name: x-api-key

@@ -129,6 +129,24 @@ def test_a_boolean_with_no_declared_terms_is_not_supported(tmp_path) -> None:
     assert cell["verification_status"] == "unverified"
 
 
+def test_an_imported_cell_carries_the_documents_own_year(tmp_path) -> None:
+    """A corpus document dates itself; its cells must keep that date.
+
+    Without this every imported cell was undated, so a temporal request over the
+    corpus had nothing to compare against even where the document's own metadata
+    plainly said the year.
+    """
+    repo = LocalRepo(str(tmp_path / "store"))
+    out = import_corpus(repo, _corpus())
+    records = repo.get_records(out["dataset_id"], "", 100, 0)["records"]
+
+    for record in records:
+        year = record["fields"]["year"]["value"]
+        assert record["fields"]["summary"]["valid_time"] == str(year)
+        page = repo.get_page(record["fields"]["summary"]["source"]["page_id"])
+        assert page["published_date"] == str(year)
+
+
 def test_import_keeps_a_value_the_quote_does_not_support_unverified(tmp_path) -> None:
     payload = _corpus()
     payload["documents"][0]["fields"]["tier"] = {

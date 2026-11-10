@@ -1,0 +1,65 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "client": {
+    "enforce_auth_on_inference": true,
+    "allow_direct_keys": false,
+    "disable_content_logging": true
+  },
+  "providers": {
+    "groq": {
+      "keys": [
+        {
+          "name": "groq-primary",
+          "value": "env.GROQ_API_KEY",
+          "models": ["*"],
+          "weight": 1.0
+        }
+      ]
+    },
+    "ollama": {
+      "keys": [
+        {
+          "name": "ollama-local",
+          "value": "ollama-local",
+          "models": ["*"],
+          "weight": 1.0,
+          "ollama_key_config": {
+            "url": "env.OLLAMA_BASE_URL"
+          }
+        }
+      ]
+    }
+  },
+  "governance": {
+    "virtual_keys": [
+      {
+        "id": "ps05-dev",
+        "name": "ps05-dev",
+        "description": "Local development key for the Temporal Evidence Engine. Not a provider credential; it grants nothing outside a gateway bound to 127.0.0.1.",
+        "value": "sk-bf-tev-local-dev",
+        "is_active": true,
+        "allow_all_providers": true,
+        "provider_configs": [
+          { "provider": "groq", "weight": 1.0,
+            "allowed_models": ["*"], "key_ids": ["*"] },
+          { "provider": "ollama", "weight": 1.0,
+            "allowed_models": ["*"], "key_ids": ["*"] }
+        ]
+      }
+    ],
+    "routing_rules": [
+      {
+        "id": "ps05-default-with-fallback",
+        "name": "default-with-ollama-fallback",
+        "description": "Try the hosted provider first; when it refuses or is exhausted, answer from the local Ollama model so a run degrades instead of failing.",
+        "enabled": true,
+        "cel_expression": "true",
+        "priority": 0,
+        "targets": [
+          { "provider": "groq", "weight": 1.0 }
+        ],
+        "fallbacks": ["ollama/llama3.2:1b"]
+      }
+    ]
+  }
+}

@@ -46,6 +46,7 @@ from app.services import coverage as coverage_svc
 from app.services import extractor as extractor_svc
 from app.services import gaps as gaps_svc
 from app.services import planner as planner_svc
+from app.services import pubdate as pubdate_svc
 from app.services import rejudge as rejudge_svc
 from app.services import reducer as reducer_svc
 from app.services import validator as validator_svc
@@ -369,6 +370,10 @@ async def run(store, dataset_id: str, field: str, *, phase: int, llm: Any,
             return []
         results = _rank_results(list(results or []), entity, site_by_rid.get(rid, ""))
         keep: list[str] = []
+        # The engine's publication date for this result, when it exposed one.
+        # The page's own markup is the fallback; see `pubdate`.
+        dated = {str(r.get("url", "")): str(r.get("published_date") or "")
+                 for r in (results or []) if isinstance(r, dict)}
         for r in results or []:
             if plausible(str(r.get("url", "")), entity, str(r.get("title", ""))):
                 keep.append(str(r["url"]))
@@ -379,6 +384,8 @@ async def run(store, dataset_id: str, field: str, *, phase: int, llm: Any,
             except Exception:  # noqa: BLE001 (a dead URL is not a phase failure)
                 continue
             if page and (page.get("markdown") or page.get("raw_html") or page.get("html")):
+                page = {**page, "published_date": (page.get("published_date")
+                                                  or dated.get(url, ""))}
                 pages.append((rid, page))
         return pages
 
@@ -440,6 +447,13 @@ async def run(store, dataset_id: str, field: str, *, phase: int, llm: Any,
         except Exception:  # noqa: BLE001
             continue
         working["_evidence_text"] = text
+        # When the engine dated the result, that date is already on `working`.
+        # Otherwise the page's own markup may still state it. Either way the
+        # date is carried onto the stored page and, through the extractor, onto
+        # every cell this pass writes, so a gap filled from a 2019 article does
+        # not arrive looking current.
+        working["published_date"] = (
+            working.get("published_date") or pubdate_svc.from_page(working))
         if persist_page is not None:
             try:
                 pid = await persist_page({
@@ -452,6 +466,7 @@ async def run(store, dataset_id: str, field: str, *, phase: int, llm: Any,
                     "raw_html": working.get("raw_html", "") or "",
                     "snapshot_chars": len(text),
                     "reducer_version": reducer_svc.REDUCER_VERSION,
+                    "published_date": working.get("published_date", ""),
                 }) or ""
             except Exception:  # noqa: BLE001
                 pid = ""
@@ -505,7 +520,12 @@ async def run(store, dataset_id: str, field: str, *, phase: int, llm: Any,
                 extract_specs, raw, raw.get("source_text", "") or raw.get("_evidence_text", ""),
                 raw.get("source_url", ""), raw.get("source_title", ""),
                 references=raw.get("references", ""),
-                page_id=raw.get("page_id", ""), budget=budget)
+                page_id=raw.get("page_id", ""), budget=budget,
+                # Phase 2 writes cells exactly as the run does, including the
+                # date and the window check: a value found by gapfill must not
+                # be the one value in a dataset that cannot say when it was true.
+                valid_time=raw.get("published_date", ""),
+                temporal=plan.get("temporal") or {})
             existing = record.get("fields", {})
             for name, cell in cells.items():
                 if name != field:

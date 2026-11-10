@@ -64,9 +64,15 @@ from app.services import sqlq as sqlq_svc
 
 set_level(settings.LOG_LEVEL)
 
-app = FastAPI(title="DATAGOBLIN API", version="0.1.0")
+app = FastAPI(title="Temporal Evidence Engine API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list(),
                    allow_methods=["GET", "POST"], allow_headers=["*"])
+
+#: The product surface. The dataset routes below remain mounted (they are tested
+#: upstream substrate) but the verifier is what this application is for.
+from app.api.verify import router as verify_router  # noqa: E402
+
+app.include_router(verify_router)
 
 PLANS: dict[str, dict] = {}
 RUNS: dict[str, dict] = {}
@@ -381,7 +387,11 @@ async def start_run(body: dict, cid: str = Depends(correlation_id)) -> dict:
                 "records_fully_verified", "records_needing_review",
                 "fields_verified", "fields_unverified",
                 "fields_judgment_unavailable", "fields_conflicting",
-                "fields_rate_limited")}
+                "fields_rate_limited",
+                # Temporal accounting from `provenance.summarize`. Advisory,
+                # and separate from verification on purpose.
+                "cells_dated", "temporal_within", "temporal_before",
+                "temporal_after", "temporal_uncertain", "temporal_unknown")}
             # Every terminal event changes what the dashboard reports, so the cached
         # aggregate is dropped here rather than left to expire. Recomputing it is
         # 26s of reads against a remote database, and a stale summary on the page
@@ -765,16 +775,66 @@ async def stream(run_id: str, request: Request, key: str | None = Query(default=
 
 
 # -- datasets --------------------------------------------------------------
+@app.get("/api/editions", dependencies=[Depends(require_api_key)])
+async def list_installed_editions(cid: str = Depends(correlation_id)) -> dict:
+    """The domain editions this instance can see.
+
+    An edition is a vertical's knowledge, read as data. The core could already
+    list them (`app.domain.api.list_editions`) but nothing exposed that over
+    HTTP, so "which datasets are the legal ones?" had no endpoint to ask -- the
+    answer was a name in a flat list, or an id the reader had to already know.
+
+    A broken edition is reported as `status: "error"` with the reason, never
+    omitted: an edition that failed to load is a fact about this instance, and
+    hiding it would make the list look complete when it is not.
+    """
+    from app.domain import api as domain_api
+    items = []
+    for edition in domain_api.list_editions():
+        # `get` returns the Edition -- the profile plus where it came from --
+        # not the profile itself. Taking `.entity` off it was an AttributeError
+        # that turned the whole list into a 500, which is a bad way for a
+        # discovery endpoint to report a broken edition: the broken edition
+        # should be the item with `status: "error"`, not the reason nothing
+        # lists.
+        found = domain_api.get(edition["name"])
+        profile = found.profile if found is not None else None
+        item = dict(edition)
+        item["entity"] = (profile.entity if profile is not None else "") or ""
+        item["fields"] = ([f.name for f in profile.fields]
+                           if profile is not None else [])
+        item["buckets"] = ([b.name for b in profile.buckets]
+                            if profile is not None else [])
+        item["is_builtin"] = edition["name"] == "generic"
+        items.append(item)
+    return {"data": items, "error": None, "meta": {"correlation_id": cid}}
+
+
 @app.get("/api/datasets", dependencies=[Depends(require_api_key)])
-async def list_datasets(cid: str = Depends(correlation_id)) -> dict:
+async def list_datasets(edition: str = "", cid: str = Depends(correlation_id)) -> dict:
+    """Every dataset, optionally narrowed to the ones an edition produced.
+
+    `edition` is a filter, not a lookup: the dataset list stays the one list of
+    everything stored, and asking for `edition=datagoblin_legal` returns the
+    legal corpus without the reader having to know its id.
+    """
+    wanted = str(edition or "").strip().lower()
     items = []
     for d in await asyncio.to_thread(repo().list_datasets):
+        # The edition is carried on the dataset row, stamped when the run
+        # finalized, so filtering costs no extra round trip. Reading it from
+        # the plan per dataset meant one query per dataset against a remote
+        # pooler, at ~170ms a statement.
+        if wanted and str(d.get("edition") or "").lower() != wanted:
+            continue
         items.append(DatasetView(id=d.get("id", ""), run_id=d.get("run_id", ""),
-                                 name=d.get("name", ""),
-                                 schema=d.get("schema", d.get("schema_json", [])),
-                                 record_count=d.get("record_count", 0),
-                                 counts=d.get("counts", {}),
-                                 created_at=d.get("created_at", "")).model_dump(by_alias=True))
+                                  name=d.get("name", ""),
+                                  schema=d.get("schema", d.get("schema_json", [])),
+                                  record_count=d.get("record_count", 0),
+                                  counts=d.get("counts", {}),
+                                  edition=str(d.get("edition") or ""),
+                                  temporal=d.get("temporal") or d.get("temporal_json") or {},
+                                  created_at=d.get("created_at", "")).model_dump(by_alias=True))
     return {"data": items, "error": None, "meta": {"correlation_id": cid}}
 
 
@@ -801,6 +861,8 @@ async def get_dataset(did: str, include_records: bool = False,
                        schema=ds.get("schema", ds.get("schema_json", [])),
                        record_count=ds.get("record_count", 0),
                        counts=ds.get("counts", {}),
+                       edition=str(ds.get("edition") or ""),
+                       temporal=ds.get("temporal") or ds.get("temporal_json") or {},
                        created_at=ds.get("created_at", "")).model_dump(by_alias=True)
     if include_records:
         full = await asyncio.to_thread(repo().get_dataset, did)
@@ -944,13 +1006,29 @@ async def delete_dataset(did: str, body: dict,
 @app.get("/api/datasets/{did}/records", dependencies=[Depends(require_api_key)])
 async def get_records(did: str, q: str = "", limit: int = Query(default=100, ge=1, le=500),
                       offset: int = Query(default=0, ge=0),
+                      fulltext: bool = False,
                       cid: str = Depends(correlation_id)) -> dict:
+    """The dataset's records, optionally filtered by a query.
+
+    `fulltext=true` searches the **stored page text** rather than the
+    record's own fields. A judgment's fields are a title, a citation and a
+    summary; the passage that made the case worth reading is in the body, in
+    the page the evidence came from. Without this, a dataset of judgments
+    could not be searched for the words that matter in them.
+
+    Both searches are the dataset's own records: the full-text one matches a
+    record when the text of a page *that record cites* contains the query.
+    """
     # Existence first: an empty result and a missing dataset are different
     # answers, and both used to arrive as either 200-empty or 404 depending on
     # which repository quirk fired first.
     if await asyncio.to_thread(repo().get_dataset_schema, did) is None:
         raise not_found("dataset", did)
-    out = await asyncio.to_thread(repo().get_records, did, q[:200], limit, offset)
+    if fulltext and q:
+        out = await asyncio.to_thread(repo().search_records, did, q[:200],
+                                      limit, offset)
+    else:
+        out = await asyncio.to_thread(repo().get_records, did, q[:200], limit, offset)
     return {"data": out or {"dataset_id": did, "total": 0, "records": []},
             "error": None, "meta": {"correlation_id": cid}}
 
@@ -2092,6 +2170,14 @@ async def health(x_api_key: str | None = Header(default=None)) -> dict:
     reconnaissance, and an unauthenticated `GET /api/health` is the cheapest
     possible probe for them. So the detail is included only when a valid key is
     presented, and an unauthenticated caller gets a bare liveness answer.
+
+    For an authorised caller the persistence block carries `reachable`, the
+    answer to one bounded query, and `status` becomes `degraded` when it fails —
+    the adapter *name* is configuration and can be right while the database is
+    gone. The `llm` block names the rungs the next model call will try
+    (`first_rung`, `rungs`) and whether fallbacks are allowed at all, which is
+    how `OPENCODE_STRICT` decides whether Groq can serve. Both are read from
+    configuration; neither spends a call.
     """
     from app.providers.llm import zen as _zen
 
@@ -2108,13 +2194,76 @@ async def health(x_api_key: str | None = Header(default=None)) -> dict:
         # be inferred from absent keys and fall back silently, so a real
         # database could be bypassed with nothing reporting it.
         data["persistence"] = dict(factory_repo.ACTIVE)
+        # ...and whether that store answers. The adapter name is configuration;
+        # the pooler could have stopped resolving DNS while the name still read
+        # "postgres". Bounded so a black-holed database cannot hang the health
+        # check that is supposed to notice it.
+        probe = getattr(REPO, "ping", None) if REPO is not None else None
+        if callable(probe):
+            try:
+                await asyncio.wait_for(asyncio.to_thread(probe), timeout=5)
+            except Exception as e:  # noqa: BLE001 (an unreachable store is the answer)
+                data["persistence"]["reachable"] = False
+                data["persistence"]["error"] = str(
+                    getattr(e, "message", None) or e)[:160]
+                # Liveness stays 200: this process is alive, and a container
+                # health check that restarts on a database outage turns one
+                # failure into a loop. The payload carries the truth instead.
+                data["status"] = "degraded"
+            else:
+                data["persistence"]["reachable"] = True
+        else:
+            data["persistence"]["reachable"] = None
         # Judge throttling, made observable. A run whose fields all came back
         # unverified could be a throttled judge, and that is an operational fact
         # worth seeing without reading logs.
         data["jev"] = dict(_zen.JEV_HEALTH)
+        data["llm"] = _llm_chain_state()
     else:
         data["detail"] = "authenticated"
     return {"data": data, "error": None, "meta": {}}
+
+
+def _llm_chain_state() -> dict:
+    """Which provider the next model call will *try*, without making one.
+
+    Configuration only: `opencode.configured()` is a boolean, not a probe. This
+    is what makes "is Groq actually being used?" answerable without spending a
+    call. `first_rung` deliberately does not claim success -- a configured
+    OpenCode address can be a dead port -- so it is paired with
+    `fallback_allowed`, which is the fact that decides whether anything else
+    gets a turn. Naming the first rung "serving" would repeat the bug this
+    endpoint just stopped reporting: configuration presented as reachability.
+    """
+    from app.providers.llm import opencode as opencode_svc
+
+    configured = opencode_svc.configured()
+    rungs = ["opencode"] if configured else []
+    if not settings.OPENCODE_STRICT:
+        if settings.GROQ_API_KEY:
+            rungs.append("groq")
+        if settings.GEMINI_API_KEY and settings.GEMINI_ENABLED:
+            rungs.append("gemini")
+    gemini_in_chain = bool(settings.GEMINI_API_KEY) and settings.GEMINI_ENABLED \
+        and not settings.OPENCODE_STRICT
+    return {
+        "strict": bool(settings.OPENCODE_STRICT),
+        "first_rung": rungs[0] if rungs else "none",
+        "rungs": rungs,
+        "fallback_allowed": not settings.OPENCODE_STRICT,
+        "opencode": {"enabled": bool(settings.OPENCODE_ENABLED),
+                     "configured": configured,
+                     "base_url": settings.OPENCODE_BASE_URL},
+        "groq": {"configured": bool(settings.GROQ_API_KEY),
+                 "model": settings.GROQ_FALLBACK_MODEL,
+                 "tpm_limit": settings.GROQ_TPM_LIMIT,
+                 "in_chain": bool(settings.GROQ_API_KEY)
+                 and not settings.OPENCODE_STRICT},
+        "gemini": {"configured": bool(settings.GEMINI_API_KEY),
+                   "enabled": bool(settings.GEMINI_ENABLED),
+                   "in_chain": gemini_in_chain},
+    }
+
 
 
 @app.get("/api/models/free", dependencies=[Depends(require_api_key)])

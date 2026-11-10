@@ -153,42 +153,46 @@ def test_max_chars_still_truncates_the_wrapper() -> None:
 # ------------------------------------------- the shortfall the extractor logs
 
 
-def test_shortfall_separates_a_real_loss_from_expected_filler() -> None:
-    """What the telemetry has to be able to say.
+def test_overlapping_chunks_are_not_reported_as_an_undercount() -> None:
+    """Live regression: a 20,521-character page was sent as four overlapping
+    chunks summing to 22,321 characters. The audit compared the SUM to the page
+    and warned "window undercounted" on every large page, because overlap makes
+    the sum larger than the text by construction. Coverage is where the last
+    chunk ends."""
+    from app.services import extractor as E
 
-    `clean_truncated` is real data loss — it is the part carrying tables — and it
-    is the signal that the ceiling should be raised. `dom_truncated` is the
-    low-priority filler being cut, which is by construction fine.
-
-    The accounting below mirrors the extractor so a change to one is caught.
-    """
-    clean_md_chars, dom_chars, sent = len(CLEAN_MD), 5_000, 24_000
-    total = clean_md_chars + dom_chars + 1_000
-    clean_in_window = min(clean_md_chars, sent)
-    assert {
-        "total_chars": total,
-        "sent_chars": sent,
-        "dropped_chars": max(0, total - sent),
-        "clean_truncated": max(0, clean_md_chars - clean_in_window),
-        "dom_truncated": max(0, dom_chars - max(0, sent - clean_in_window)),
-    } == {
-        "total_chars": len(CLEAN_MD) + 6_000,
-        "sent_chars": 24_000,
-        "dropped_chars": 0,
-        "clean_truncated": 0,
-        "dom_truncated": 0,
-    }
+    clean = ("para " * 4000)  # 20k chars, enough for several chunks
+    chunks, shortfall = E.content_shortfall(clean, {"total_chars": len(clean),
+                                                    "clean_md_chars": len(clean),
+                                                    "dom_chars": 0}, 12_000)
+    assert len(chunks) > 1
+    assert shortfall["sent_chars"] > shortfall["total_chars"] or len(chunks) > 1
+    assert shortfall["dropped_chars"] == 0
+    assert shortfall["clean_truncated"] == 0
+    assert shortfall["covered_chars"] == len(clean)
 
 
 def test_clean_markdown_truncation_is_detectable() -> None:
-    """A page whose clean text alone exceeds the window must be visible as such."""
-    clean_md_chars, sent = 40_000, 24_000
-    clean_in_window = min(clean_md_chars, sent)
-    assert max(0, clean_md_chars - clean_in_window) == 16_000
+    """A page whose clean text alone exceeds the chunk budget must be visible."""
+    from app.services import extractor as E
+
+    clean = "x" * 60_000
+    _chunks, shortfall = E.content_shortfall(
+        clean, {"total_chars": len(clean), "clean_md_chars": len(clean),
+                "dom_chars": 0}, 12_000)
+    assert shortfall["clean_truncated"] > 0
+    assert shortfall["dropped_chars"] > 0
 
 
 def test_dom_only_truncation_is_not_reported_as_data_loss() -> None:
-    clean_md_chars, dom_chars, sent = 2_000, 90_000, 24_000
-    clean_in_window = min(clean_md_chars, sent)
-    assert max(0, clean_md_chars - clean_in_window) == 0
-    assert max(0, dom_chars - max(0, sent - clean_in_window)) == 68_000
+    """Clean markdown is concatenated first, so a huge DOM tail that gets cut is
+    filler loss, not data loss."""
+    from app.services import extractor as E
+
+    clean_md, dom = 2_000, 90_000
+    clean = "m" * clean_md + "\n" + "d" * dom
+    _chunks, shortfall = E.content_shortfall(
+        clean, {"total_chars": len(clean), "clean_md_chars": clean_md,
+                "dom_chars": dom}, 12_000)
+    assert shortfall["clean_truncated"] == 0
+    assert shortfall["dom_truncated"] > 0

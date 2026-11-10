@@ -1,18 +1,18 @@
-import { Component, Suspense, lazy } from 'react';
-import { BrowserRouter, Route, Routes } from 'react-router-dom';
-import Shell from './components/Shell.jsx';
-import { InspectorProvider } from './lib/inspector.jsx';
+/**
+ * The product surface: the verifier, and nothing else.
+ *
+ * The seeded dataset pages still exist in `src/pages`, but they are not reachable
+ * from here. A router is a statement of what the product is; leaving the old
+ * dashboard mounted would make this a demo suite with a verifier attached.
+ */
+import { Component } from 'react';
+import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';
 import { ErrorNote } from './components/ui.jsx';
-
-const Collect = lazy(() => import('./pages/Collect.jsx'));
-const Landing = lazy(() => import('./pages/Landing.jsx'));
-const Dashboard = lazy(() => import('./pages/Dashboard.jsx'));
-const Runs = lazy(() => import('./pages/Runs.jsx'));
-const RunPage = lazy(() => import('./pages/RunPage.jsx'));
-const Library = lazy(() => import('./pages/Library.jsx'));
-const Sources = lazy(() => import('./pages/Sources.jsx'));
-const DatasetPage = lazy(() => import('./pages/DatasetPage.jsx'));
-const Intel = lazy(() => import('./pages/Intel.jsx'));
+import VerifyShell from './verify/VerifyShell.jsx';
+import NewCheck from './verify/NewCheck.jsx';
+import RunList from './verify/RunList.jsx';
+import RunView from './verify/RunView.jsx';
+import Watchlist from './verify/Watchlist.jsx';
 
 class Boundary extends Component {
   constructor(props) {
@@ -32,16 +32,20 @@ class Boundary extends Component {
   render() {
     if (this.state.error) {
       return (
-        <div className="grid h-full place-items-center p-6">
+        <div className="grid min-h-screen place-items-center p-6">
           <div className="w-full max-w-md space-y-3">
-            <h1 className="h-display text-[22px] text-ink">Something broke</h1>
+            <h1 className="h-display text-[22px] text-ink">A view failed to render</h1>
             <p className="text-[13px] leading-relaxed text-muted">
-              A view failed to render. The run itself is unaffected — it keeps executing on the
-              server. Reloading usually clears it.
+              The run itself is unaffected — it keeps executing on the server. Reloading usually
+              clears this.
             </p>
             <ErrorNote error={this.state.error} />
             <div className="flex gap-2">
-              <button type="button" className="btn-primary" onClick={() => this.setState({ error: null })}>
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => this.setState({ error: null })}
+              >
                 Try again
               </button>
               <button type="button" className="btn-outline" onClick={() => window.location.reload()}>
@@ -56,27 +60,17 @@ class Boundary extends Component {
   }
 }
 
-function RouteFallback() {
-  return (
-    <div className="space-y-4" role="status" aria-busy="true" aria-label="Loading view">
-      <div className="skeleton h-7 w-52" />
-      <div className="skeleton h-24 w-full rounded-lg" />
-      <div className="skeleton h-56 w-full rounded-lg" />
-    </div>
-  );
-}
-
 function NotFound() {
   return (
     <div className="grid place-items-center py-24 text-center animate-fade-up">
       <p className="font-display text-[64px] leading-none text-rule-2">404</p>
       <h1 className="mt-3 h-display text-[20px] text-ink">No such view</h1>
       <p className="mt-1.5 max-w-sm text-[12.5px] text-muted">
-        That address does not match anything in the workspace.
+        That address does not match anything in the verifier.
       </p>
-      <a href="/investigate" className="btn-primary mt-5">
-        Back to Collect
-      </a>
+      <Link to="/" className="btn-primary mt-5">
+        Start a check
+      </Link>
     </div>
   );
 }
@@ -84,29 +78,17 @@ function NotFound() {
 export default function App() {
   return (
     <BrowserRouter>
-      <InspectorProvider>
-        <Boundary>
-          <Suspense fallback={<RouteFallback />}>
-            <Routes>
-              {/* The landing surface is the front door: it sits outside the
-                  operator shell as a full-bleed page, and its Enter button
-                  leads into the workspace at /investigate. */}
-              <Route index element={<Landing />} />
-              <Route element={<Shell />}>
-                <Route path="investigate" element={<Collect />} />
-                <Route path="dashboard" element={<Dashboard />} />
-                <Route path="runs" element={<Runs />} />
-                <Route path="runs/:id" element={<RunPage />} />
-              <Route path="library" element={<Library />} />
-              <Route path="library/:id" element={<DatasetPage />} />
-              <Route path="sources" element={<Sources />} />
-                <Route path="intel" element={<Intel />} />
-                <Route path="*" element={<NotFound />} />
-              </Route>
-            </Routes>
-          </Suspense>
-        </Boundary>
-      </InspectorProvider>
+      <Boundary>
+        <Routes>
+          <Route element={<VerifyShell />}>
+            <Route index element={<NewCheck />} />
+            <Route path="runs" element={<RunList />} />
+            <Route path="runs/:runId" element={<RunView />} />
+            <Route path="watchlist" element={<Watchlist />} />
+            <Route path="*" element={<NotFound />} />
+          </Route>
+        </Routes>
+      </Boundary>
     </BrowserRouter>
   );
 }

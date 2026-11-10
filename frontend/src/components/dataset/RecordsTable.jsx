@@ -152,6 +152,29 @@ function ExpandedRow({ record, columns, ordinal, onInspect, onCell }) {
                         {canProve(src) ? (
                           <span className="text-ok">re-locates in the stored page</span>
                         ) : null}
+                        {/*
+                          The page's own date, never the fetch date. A cell can
+                          be perfectly proven and still be from the wrong year;
+                          saying both, separately, is what keeps "verified" from
+                          being read as "current".
+                        */}
+                        {pf.validTime ? (
+                          <span
+                            className={
+                              pf.temporalCheck?.status &&
+                              !['within', 'unknown'].includes(pf.temporalCheck.status)
+                                ? 'text-warn'
+                                : 'text-muted'
+                            }
+                            title={
+                              pf.temporalCheck?.status
+                                ? `The source is dated ${pf.validTime}; against the requested time it is ${pf.temporalCheck.status.replace('_', ' ')}. This does not change whether the quote verifies.`
+                                : `The source is dated ${pf.validTime}.`
+                            }
+                          >
+                            dated {String(pf.validTime).slice(0, 10)}
+                          </span>
+                        ) : null}
                       </dd>
                     </div>
                   );
@@ -210,6 +233,9 @@ export default function RecordsTable({
   const [page, setPage] = useState(0);
   const [q, setQ] = useState('');
   const [debounced, setDebounced] = useState('');
+  // A record's fields are a title and a summary; the passage that matters is
+  // in the page the cell cites. This asks the API to search that text instead.
+  const [fulltext, setFulltext] = useState(false);
   const [statusFilter, setStatusFilter] = useState('all');
   // Which row is open inline, keyed by its index within the current page. `null`
   // means none, and it is deliberately not a set: opening a second row closes
@@ -228,8 +254,12 @@ export default function RecordsTable({
 
   const { data, status, error, refetch, isStale } = useResource(
     (o) =>
-      api.records(datasetId, { limit: pageSize, offset: page * pageSize, q: debounced }, o),
-    [datasetId, page, debounced, pageSize]
+      api.records(
+        datasetId,
+        { limit: pageSize, offset: page * pageSize, q: debounced, fulltext },
+        o
+      ),
+    [datasetId, page, debounced, pageSize, fulltext]
   );
 
   const rows = useMemo(() => data?.records || [], [data]);
@@ -307,10 +337,23 @@ export default function RecordsTable({
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="Search records…"
+            placeholder={fulltext ? 'Search inside the stored pages…' : 'Search records…'}
             aria-label="Search records"
-            className="input-sm input w-44"
+            className="input-sm input w-52"
           />
+          <label className="flex items-center gap-1.5 whitespace-nowrap text-[11px] text-muted">
+            <input
+              type="checkbox"
+              checked={fulltext}
+              onChange={(e) => {
+                setFulltext(e.target.checked);
+                setPage(0);
+                setOpenRow(null);
+              }}
+              className="accent-accent"
+            />
+            full text
+          </label>
           <button type="button" onClick={refetch} className="btn-outline btn-xs">
             Refresh
           </button>
@@ -339,7 +382,7 @@ export default function RecordsTable({
               rows.length
                 ? 'No records match this filter'
                 : debounced
-                ? `No record contains "${truncate(debounced, 40)}"`
+                ? `No record ${fulltext ? 'cites a page containing' : 'contains'} "${truncate(debounced, 40)}"`
                 : 'No records stored'
             }
             hint={

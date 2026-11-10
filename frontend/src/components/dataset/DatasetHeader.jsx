@@ -4,6 +4,31 @@ import { num, when } from '../../lib/format.js';
 import DeleteDatasetButton from './DeleteDatasetButton.jsx';
 
 /**
+ * What the request asked about in time, in one short phrase.
+ *
+ * `unknown`/`none` render nothing: a dataset collected from a prompt with no
+ * time constraint should not claim one. A window is shown as its real bounds
+ * rather than as "last 6 months", because the phrase that produced it may be
+ * read months after the run.
+ */
+function temporalLabel(temporal) {
+  const t = temporal || {};
+  if (t.kind === 'current') {
+    return { short: `as of ${t.as_of || 'today'}`, full: `as of ${t.as_of || 'today'}` };
+  }
+  if (t.kind === 'point' && t.as_of) {
+    return { short: `as of ${t.as_of}`, full: `as of ${t.as_of}` };
+  }
+  if (t.kind === 'window' && t.start && t.end) {
+    return {
+      short: `${t.start} → ${t.end}`,
+      full: `the window ${t.start} to ${t.end}`,
+    };
+  }
+  return null;
+}
+
+/**
  * Dataset identity — one block, then the measurements.
  *
  * The old header stacked a label, a title, an id, a creation time, a run link,
@@ -19,9 +44,11 @@ import DeleteDatasetButton from './DeleteDatasetButton.jsx';
  * genuinely useful and genuinely not the first thing anyone wants.
  */
 
-export default function DatasetHeader({ identity, model, onInspectRaw, onDeleted, className = '' }) {
+export default function DatasetHeader({ identity, model, temporal, onInspectRaw, onDeleted, className = '' }) {
   const { id, name, runId, createdAt, recordCount, fieldCount } = identity;
   const title = name || (id ? `Dataset ${String(id).slice(0, 8)}` : 'Dataset');
+  const when_ = temporalLabel(temporal);
+  const temp = (model?.counters?.temporal) || {};
 
   return (
     <header className={className}>
@@ -58,7 +85,39 @@ export default function DatasetHeader({ identity, model, onInspectRaw, onDeleted
                 <span>collected {when(createdAt)}</span>
               </>
             ) : null}
+            {when_ ? (
+              <>
+                <span aria-hidden="true">·</span>
+                {/*
+                  The time the request asked about, not when we collected. A
+                  reader must not mistake "as of 2024-09-29" for the fetch date,
+                  which is why the label says "asked for".
+                */}
+                <span
+                  className="text-info"
+                  title={`The request asked for values ${when_.full}. Dates on individual cells are the pages' own publication dates.`}
+                >
+                  asked for {when_.short}
+                </span>
+              </>
+            ) : null}
           </p>
+
+          {/* A verified quote and a wrong date are both possible at once. The
+              window is claimed on the line above, so the count that disagrees
+              with it belongs here rather than buried in a per-cell tooltip. */}
+          {temp.counted && temp.offWindow ? (
+            <p className="mt-1 text-[10.5px] text-warn">
+              {num(temp.offWindow)} dated value{temp.offWindow === 1 ? '' : 's'} fall
+              outside the requested window
+              {temp.before && temp.after
+                ? ` (${num(temp.before)} before, ${num(temp.after)} after)`
+                : temp.before
+                ? ' (before it)'
+                : ' (after it)'}
+              . The quotes can still verify; the source date is what disagrees.
+            </p>
+          ) : null}
 
           {/* When the profile was read from a prefix rather than the whole
               dataset, anything drawn from it says so. A shape computed from

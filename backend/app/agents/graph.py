@@ -133,6 +133,14 @@ _EDITORIAL_SLUGS = (
 #: of them.
 _ENTITY_BONUS = 3.0
 _FIELD_BONUS = 1.0
+#: The search engine's own relevance, bounded below one field hit so a confident
+#: engine score can never outrank a candidate that names the entity. Before this
+#: the score was discarded and the two were ranked on URL+title alone.
+_PROVIDER_SCORE_WEIGHT = 0.75
+#: A publication date is a weak quality signal (a dated document is rarely a link
+#: farm) and the only date the search API exposes. Presence, not recency:
+#: recency needs the user's time window, which the planner does not carry yet.
+_DATED_PAGE_BONUS = 0.25
 _GENERIC_STOP = frozenset({
     "the", "a", "an", "of", "in", "for", "and", "or", "to", "on", "at", "by",
     "with", "from", "as", "is", "are", "top", "best", "list", "find", "all",
@@ -322,7 +330,22 @@ def _plan_relevance(candidate: dict, state: dict, prior: dict | None = None) -> 
         score -= 2.5
     if prior:
         score += _host_prior_bonus(candidate, prior)
+    # Bounded provider prior. `score` is clamped to [0, 1] by the adapter, so a
+    # perfect engine score adds less than one field hit: it breaks ties among
+    # otherwise equal candidates instead of promoting a popular listicle over
+    # the page the plan actually asked for.
+    score += _PROVIDER_SCORE_WEIGHT * _provider_score(candidate.get("score"))
+    if str(candidate.get("published_date") or "").strip():
+        score += _DATED_PAGE_BONUS
     return score
+
+
+def _provider_score(value: Any) -> float:
+    """Tavily's relevance in [0, 1]; missing or malformed -> 0."""
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 async def screen_node(state: dict, deps: Any) -> dict:
@@ -412,6 +435,10 @@ async def screen_node(state: dict, deps: Any) -> dict:
             accepted.append({"url": url, "title": str(r.get("title", ""))[:300],
                              "snippet": str(r.get("snippet", ""))[:2000],
                              "route": deps.triage_fn(url),
+                             # Carried from the search result so the extracted
+                             # cell can say *when* its fact was true, not only
+                             # when we fetched it.
+                             "published_date": str(r.get("published_date") or "")[:100],
                              "screen_confidence": (screen or {}).get("confidence", 0.0)})
     prior_hosts = list(state.get("blocked_domains", []) or [])
     hosts = list(prior_hosts)

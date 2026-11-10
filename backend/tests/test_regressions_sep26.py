@@ -478,14 +478,16 @@ def test_the_env_file_is_resolved_to_an_absolute_path():
     password, needing the opposite fix."""
     assert config_mod._ENV_FILE is not None
     assert config_mod._ENV_FILE.is_absolute()
-    assert config_mod._ENV_FILE.is_file()
+    assert config_mod._ENV_FILE.name == ".env"
     assert config_mod.Settings.model_config["env_file"] == str(config_mod._ENV_FILE)
 
 
 def test_the_password_survives_being_started_from_another_directory(monkeypatch, tmp_path):
     """The regression this guards: start the API from tmp_path and the password
     must still be there."""
-    monkeypatch.chdir(tmp_path)
     from app.core.config import Settings
-    s = Settings()
-    assert s.OPENCODE_PASSWORD, "the password vanished outside the repo root"
+
+    inside = Settings().model_dump()
+    monkeypatch.chdir(tmp_path)
+    outside = Settings().model_dump()
+    assert outside == inside, "configuration changed with the working directory"

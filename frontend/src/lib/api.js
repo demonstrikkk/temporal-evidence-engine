@@ -445,6 +445,29 @@ export const api = {
   map: (body, o) => request('/map', { ...o, method: 'POST', body, timeout: o?.timeout ?? 180_000 }),
   freeModels: (o) => request('/models/free', { ...o, timeout: o?.timeout ?? 30_000 }),
   ask: (body, o) => request('/intel/ask', { ...o, method: 'POST', body, timeout: o?.timeout ?? 300_000 }),
+
+  /* --- temporal evidence engine ----------------------------------------
+   *
+   * These routes return plain objects, not the dataset envelope. `request`
+   * already handles both (`payload.data ?? payload`), so the distinction never
+   * reaches a component.
+   *
+   * Creating a run is fast on purpose: the server queues it and returns an id,
+   * because a real verification takes tens of seconds and a synchronous POST
+   * would read as a hang. Progress comes from the events stream below.
+   */
+  verify: {
+    health: (o) => request('/verify/health', { ...o, timeout: o?.timeout ?? 10_000 }),
+    createRun: (body, o) => request('/verify/runs', { ...o, method: 'POST', body }),
+    runs: (o) => request('/verify/runs', o),
+    run: (id, o) => request(`/verify/runs/${encodeURIComponent(id)}`, o),
+    claim: (runId, claimId, o) =>
+      request(`/verify/runs/${encodeURIComponent(runId)}/claims/${encodeURIComponent(claimId)}`, o),
+    events: (id, after = 0, o) =>
+      request(`/verify/runs/${encodeURIComponent(id)}/events?after=${Number(after) || 0}`, o),
+    report: (id, o) => request(`/verify/runs/${encodeURIComponent(id)}/report`, o),
+    watchlist: (o) => request('/verify/watchlist', o),
+  },
 };
 
 /** Filename for an export, derived from the format the server actually used. */

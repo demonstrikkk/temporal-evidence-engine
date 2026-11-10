@@ -1,207 +1,140 @@
-# DataGoblin — working agreement
+# Temporal Evidence Engine — working agreement
 
-Read this before changing anything. It exists because the answers were in five
-places that disagreed with each other.
+Read this before changing anything. It is shorter than it looks, and every rule
+here exists because it was already broken once.
 
 ## What this is
 
-A question in plain English goes in; a dataset comes out where every value
-carries a quote that can be located in the exact stored text the quote came from,
-or the cell is not trusted. FastAPI backend (`backend/`), React/Vite console
-(`frontend/`), Postgres or JSONL behind one switch.
+An AI-generated answer goes in with the time it was generated. Out comes a
+claim-level verification: atomic claims, live research, exact quotes from
+stored source revisions, **event dates separate from publication dates**, and a
+deterministic verdict per claim — `supported`, `changed`, `contradicted` or
+`unverifiable` — with a reason code and an evidence trail.
+
+This repository was seeded from [DataGoblin](../datagoblin) (MIT). The evidence
+substrate is reused; the product is not. See `UPSTREAM.md`.
 
 ## The quality gate
 
-Run this before committing. It is the whole gate.
-
-```bash
-# backend -- the full suite, no network, no database, no provider credits
+```powershell
+# backend, hermetic (no network, no DB, no provider credits)
 backend\.venv\Scripts\python.exe -m pytest backend\tests -q
 
 # frontend
-cd frontend && npm test && npm run build && cd ..
+cd frontend; npm test; npm run build; cd ..
 ```
 
-If the change touched a route or a response shape, regenerate the contract
-before the suite so `test_run_reporting` compares against the new one:
+Markers are unchanged: `hermetic` (default), `postgres`, `live`, `slow`.
+`--strict-markers` is on. Postgres tests read `DATABASE_URL` from the process
+environment, never from `.env`.
 
-```bash
-backend\.venv\Scripts\python.exe backend\scripts\gen_contract.py --write
-```
+Do not write a test count into a document. Write the command; the number is
+whatever it printed.
 
-### Markers
+## The six invariants
 
-`backend/pyproject.toml` registers four. `--strict-markers` is on, so an
-unregistered one is an error.
+### 1. One function may grant `verified`
 
-| marker | meaning |
-|---|---|
-| `hermetic` | offline, no DB, no provider. The default for everything here. |
-| `postgres` | needs `DATABASE_URL` **exported in the process environment** |
-| `live` | real network or a real provider; costs money |
-| `slow` | over about a second |
+`app/services/validator.py::settle` is the only place a cell may leave
+`verified`, and a cell needs two things: a support verdict **and** a locator
+that resolves against the exact text the store holds.
+`test_promotion_chokepoint.py` parses every module under `app/` and fails on a
+literal `"verified"` written into a `verification_status` anywhere else.
 
-```bash
-pytest backend/tests -q -m "not postgres"   # skip the live-database file
-```
+The verifier calls `settle` through `app/verify/settlement.py`. It never writes
+`verification_status` itself, and it never invents a seventh status.
 
-`postgres` tests read `DATABASE_URL` from the environment, **not** from `.env`:
-`conftest._no_env_file` rebuilds the settings singleton from
-`Settings(_env_file=None)` so the developer's real `.env` cannot leak into a test
-run. Export it before invoking pytest, or those tests will skip.
+A failed support is **not** a contradiction. A contradiction needs its own
+synthetic cell, carrying the replacement value (or explicit negation), settled
+against its own locatable quote.
 
-## Test counts
+### 2. Four timestamps, never merged
 
-Do not write a test count into a document. Four of them were, they disagreed with
-each other (143 / 389 / 1313 / 1620), and every one of them was wrong by the time
-it was read. The suite's size is the output of the command, not a fact to be
-maintained. Write the command; the number comes from running it.
+| field | means | lives on |
+|---|---|---|
+| `answer_generated_at` | when the answer was produced | `answers.generated_at` |
+| `publication_date` | when the source was published/updated | `source_revisions.published_date` |
+| `event_date` | when the underlying fact changed | `evidence_spans.event_date` |
+| `retrieved_at` | when we fetched it | `source_revisions.retrieved_at` |
 
-## The things that are actually load-bearing
+Unknown `event_date` is `missing`. It never falls back to
+`publication_date`, and a newer publication date alone can never produce
+`changed`. `test_no_publication_as_event.py` enforces this statically.
 
-### One function may grant `verified`
+### 3. The model proposes; code decides
 
-`validator.settle` is the only place a cell may leave `verified`. A cell needs
-two things: a support verdict, **and** a locator that resolves against the
-stored text. `test_promotion_chokepoint.py` parses every module under `app/` and
-fails on a literal `"verified"` written into a `verification_status` anywhere
-outside `validator.py`, in both syntactic shapes. If you need to promote, route
-through `settle` or `adopt`.
+`relationship.py` proposes `supports | contradicts | mentions_only | silent`.
+`settlement.py` decides whether that proposal counts. `decision.py` assigns the
+status from stored rows. No model output is copied into `claims.status` — ever.
 
-A decision is not evidence. A click, a merge verdict and a triage answer resolve a
-*conflict*; they do not make a quote locatable.
+### 4. Every model call goes through Bifrost
 
-### A `page_id` addresses one text, forever
+`app/bifrost/client.py` is the only model interface. No module under
+`app/verify/`, `app/research/` or `app/api/` may import a provider SDK.
+`test_no_direct_providers.py` enforces it. Provider keys live in Bifrost config,
+not in this backend.
 
-`pages` is append-only per content change (`009_page_revisions.sql`). Identical
-`content_hash` reuses the id; different content gets a new id and the next
-`revision`. Never update a `pages` row in place — that is what let recorded
-offsets drift silently.
+Every call records: request id, provider actually used, model, input/output
+tokens, cost, latency, fallback attempts, status. A model failure never
+produces a verdict.
 
-### Store before you extract
+### 5. Tavily discovers; it never decides
 
-A quote has to be able to cite a row that exists. If you add a path that extracts,
-persist the page first and put the returned id on the page dict — `gapfill` built
-the id map for years and never read it.
+Search returns candidates. Extract returns content that is stored as an
+append-only `source_revisions` row. A search snippet is never evidence.
+`failed_results` is inspected even on HTTP 200. A failed extraction is
+`source.failed`, never a silent skip.
 
-Persist the **reduced** text (`reducer.page_evidence_text(page)`), not the raw
-fetch. Every offset indexes into that.
+### 6. Store before you extract
 
-### No silent failure
+A quote must cite a row that exists. Source revisions are append-only per
+content hash: same hash reuses the row, different content gets a new row. Never
+update stored text in place — that is how recorded offsets drift.
 
-Every fetch attempt gets an outcome: `render_attempted`, `render_status`,
-`render_error_code` from the closed taxonomy, `fallback_used`,
-`final_content_source`. A render that failed and was served over HTTP is
-`degraded`, not `ok`, and it says so on the event stream as well as in the row.
-Never discard an exception to make a path look clean — `crawler._one` used to drop
-`last_err` and that is how 55% of a page's content vanished without a trace.
-
-### The gate before the spend
-
-Robots is checked before a judge call is spent, not only at fetch time. Keep it
-that way; a dead source should cost a lookup, not a model call.
-
-### Nothing reaches the network unvalidated
-
-`guard_url` for the HTTP path, the `on_page_context_created` egress hook for
-Chromium (`test_egress_boundaries.py`). `robots_allowed` validates its own target
-because it runs ahead of the fetch-time guard on raw search results.
+Offsets index into `source_revisions.content`, the **full** stored text.
+Chunking for the model is a window with `(chunk_start, chunk_end)`; rebase
+before insert. Never index into a reduced or truncated string.
 
 ## Migrations
 
-`backend/migrations/*.sql`, applied in filename order by
-`backend/scripts/db_migrate.py`. Idempotent, additive, re-runnable. Every new
-column needs a default. If you write a column, something must read it — a column
-nobody reads is the same anti-pattern as a dead function.
+`backend/migrations/NNN_*.sql`, applied in filename order by
+`backend/scripts/db_migrate.py`, idempotent, additive, re-runnable, every new
+column with a default. PS05 tables live in schema `tev` so they cannot collide
+with the DataGoblin tables in the same database. Applied on startup when
+`PERSISTENCE=postgres`.
 
-## Domain editions
+If you write a column, something must read it.
 
-A vertical (legal, finance, ...) lives in `editions/<name>/edition.json` and is
-read by the core as data. `editions/README.md` is the contract.
+## Caching is a guarantee, not an optimisation
 
-The rule is one-directional:
+`model_calls` is keyed by `(prompt_hash, model, stage)`; `research_cache` by
+`hash(tool, query/url, options)`. `CACHE_MODE`:
 
-```
-core  --->  app.domain  <---  editions/*
-```
+| mode | behaviour |
+|---|---|
+| `read-write` | cache miss calls the network, response is stored |
+| `read-only` | cache miss is an error; demo/snapshot runs |
+| `off` | never read, never write |
 
-Core may import `app.domain`; `app.domain` never imports an edition (it reads a
-manifest or an entry point); an edition that ships Python may import only
-`app.domain.api`. `test_edition_isolation.py` parses both trees and fails on a
-violation, in the same spirit as `test_name_binding.py`.
+A replayed result is labelled `snapshot` with its original timestamp. It is
+never presented as live. This is what makes the evaluation re-runnable and the
+demo survivable.
 
-- `api_version` is checked before anything else. A manifest for another major is
-  refused with a named reason and does not load; the core keeps working.
-- A broken edition is reported by `app.domain.api.list_editions()` as
-  `status: "error"`; it must never stop the API from starting.
-- The merge is additive and idempotent (`app.domain.apply`): it runs before the
-  planner's caps and probes, never overwrites a user/planner value, and stamps
-  `edition` / `edition_version` on the plan.
-- `WorkflowPlan` declares `edition` and `edition_version` because pydantic drops
-  keys it does not know. A stamp on the dict that is not on the model is gone by
-  the next round trip.
+## No silent failure
 
-Gate: the core suite must pass with no edition installed. Then, per edition:
+Every run stage emits a durable event with a sequence number. A failed source, a
+failed model call, a partial run and an abstention are all reported. `run.partial`
+is a real outcome, not a euphemism.
 
-```bash
-$env:EDITIONS_PATH="editions"; backend\.venv\Scripts\python.exe -m pytest editions\<name>\tests -q
-```
+## Drift control
 
-### The legal corpus
-
-The legal edition ships a curated corpus rather than crawling at request time.
-The build is offline after the first fetch and writes `corpus/documents.json`,
-`corpus/index.json` and `corpus/report.md`:
-
-```powershell
-backend\.venv\Scripts\python.exe editions\datagoblin_legal\ingest\build.py --write
-```
-
-Every field quote is a slice of the stored text: a metadata header from
-`sources.json` followed by the source body. `corpus/.cache/` is ignored; it holds
-source bytes, not evidence. Rebuild with `--refresh` only when you mean to accept
-changed source text.
-
-Import the corpus through the generic importer, never through `/api/runs` (a run
-is capped at twelve seeds):
-
-```powershell
-backend\.venv\Scripts\python.exe backend\scripts\import_corpus.py `
-  --corpus editions\datagoblin_legal\corpus\documents.json
-```
-
-The importer validates every quote and value first, stores each document with
-`upsert_page`, settles every cell through `validator.settle`, and finalizes the
-run and dataset together.
-
-Two rules keep the core free of this edition's vocabulary, and both are
-enforced by tests:
-
-- The words that support a boolean value are declared by the edition and travel
-  with the corpus file (`support_terms` on the field). The core only checks
-  that a declared term is in the quote. A boolean with no declared terms is
-  not supported.
-- The tier a document sits in is derived from the manifest's own metadata by
-  the edition's `tiering` policy, and stored in the document's header so the
-  value is a slice of the text. A bucket rule then reads `tier`, not a place
-  name. `test_edition_isolation.py` fails if a string literal in `app/` carries
-  one vertical's words.
+- `PRODUCT.md` is the product contract. If a feature is not in it, it is scope
+  creep, not ambition.
+- `DECISIONS.md` records every rule change with a date. Any change to the
+  decision table bumps `RULE_VERSION`.
+- The Cut List in `docs/BUILD-PLAN.md` is applied top-down, never bottom-up.
 
 ## Before you claim something works
 
 Say what you ran and what it printed. "The tests pass" is a claim about a
 command; quote the number. A live run is only claimed if a live run happened.
-
-`test_name_binding.py` and `test_event_contract.py` are static guards over the
-whole source tree: unbound names, and events declared vs emitted. They exist
-because both bugs shipped and were invisible in review.
-
-## Known, deliberately not done
-
-- `locate_quote` runs at write time only. Nothing re-checks a stored citation.
-- The status vocabulary disagrees with itself in three places: `schemas/plan.py`
-  declares five values, `contracts/provenance.schema.json` three, stored data has
-  had six. `settle` refuses to write a seventh; that contains it, not fixes it.
-- `_check_hops` is detection after the fact. Closing the DNS-rebinding window
-  needs pinning — resolve, dial the resolved address, re-check each hop.
-- No CI. `.github/` does not exist. The gate above is manual.

@@ -35,6 +35,7 @@ from typing import Any
 
 from app.core.logging import log
 from app.services import validator as validator_svc
+from app.services import pubdate as pubdate_svc
 from app.services import yieldmap as yieldmap_svc
 from app.services.deduper import _sig
 from app.services import reducer as reducer_svc
@@ -274,6 +275,11 @@ async def run(store, dataset_id: str, sources: list[str] | None = None, *,
         except Exception:  # noqa: BLE001
             return url, []
         working = {**page, "_evidence_text": text}
+        # The date the page says its own content was published, when it says
+        # anything. It is persisted and travels with the record, so a refreshed
+        # cell carries the same `valid_time` a run-time cell would.
+        working["published_date"] = (
+            working.get("published_date") or pubdate_svc.from_page(working))
         # Store the *reduced* text, not the raw fetch.
         #
         # Refresh replaces values, and every offset in a replaced cell indexes
@@ -297,6 +303,7 @@ async def run(store, dataset_id: str, sources: list[str] | None = None, *,
                     "raw_html": page.get("rendered_html", "") or page.get("html", ""),
                     "snapshot_chars": len(text),
                     "reducer_version": reducer_svc.REDUCER_VERSION,
+                    "published_date": working.get("published_date", ""),
                 }) or ""
             except Exception:  # noqa: BLE001
                 page_id = ""
@@ -340,7 +347,9 @@ async def run(store, dataset_id: str, sources: list[str] | None = None, *,
                 specs, raw, raw.get("source_text", "") or raw.get("_evidence_text", ""),
                 raw.get("source_url", "") or url, raw.get("source_title", ""),
                 references=raw.get("references", ""),
-                page_id=raw.get("page_id", ""), budget=budget)
+                page_id=raw.get("page_id", ""), budget=budget,
+                valid_time=raw.get("published_date", ""),
+                temporal=plan.get("temporal") or {})
 
             existing = record.get("fields", {})
             for name, cell in cells.items():

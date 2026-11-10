@@ -294,6 +294,53 @@ def test_a_fetched_page_that_carries_only_html_is_not_extracted_empty(monkeypatc
     assert out["report"]["written"] == 1, out["report"]
 
 
+def test_a_gapfilled_cell_carries_the_pages_own_publication_date(monkeypatch):
+    """A value written by phase 2 is indistinguishable from a run-time cell.
+
+    That claim was not true of the date: gapfill never read one, so a field
+    filled from a 2021 article arrived with no `valid_time` at all and looked as
+    current as every cell beside it. The date is read from the page's own markup
+    (see `pubdate`), stored on the page row, and carried onto the cell.
+    """
+    from app.services import extractor as E
+
+    stored: dict = {}
+    captured: dict = {}
+    html = ('<html><head><meta property="article:published_time" '
+            'content="2021-06-01T00:00:00Z"></head>'
+            '<body><p>Acme Corp. Chief Executive Jane Doe.</p></body></html>')
+
+    async def _extract(plan, page, llm):
+        # Mirrors the real extractor: `published_date` travels on the record.
+        return ([{"fields": {"company_name": "Acme Corp", "ceo": "Jane Doe"},
+                  "source_url": page.get("url", ""),
+                  "source_text": "Acme Corp. Chief Executive Jane Doe.",
+                  "published_date": page.get("published_date", "")}], "fake")
+
+    async def _search(query, limit=4):
+        return [{"url": "https://acmecorp.com/about", "title": "Acme Corp"}]
+
+    async def _fetch(url, method):
+        return {"url": url, "method": method, "html": html}
+
+    async def _persist(page):
+        stored.update(page)
+        return "page-1"
+
+    monkeypatch.setattr(E, "extract_page", _extract)
+    out = _run_with_gap(
+        {"state": "open", "category": "depth_gap", "phase": G.PHASE_STORED,
+         "attempts": 1, "field": "ceo"},
+        search_fn=_search, fetch_fn=_fetch, apply=True,
+        persist_page=_persist, store_out=captured)
+    assert out["report"]["written"] == 1, out["report"]
+    assert stored["published_date"] == "2021-06-01", stored
+    cell = captured["store"].written[0][2]
+    assert cell["valid_time"] == "2021-06-01", cell
+    # This dataset requested no window, so there is nothing to judge it against.
+    assert not cell.get("temporal_check")
+
+
 # --- the attempt's reported outcome ------------------------------------------
 
 def test_a_search_that_found_nothing_records_a_finding():
@@ -403,7 +450,8 @@ def _run_phase1(store):
 # --- helpers -----------------------------------------------------------------
 
 def _run_with_gap(gap, phase=G.PHASE_SEARCH, search_fn=None, dedupe_keys=None,
-                 expect_ok=False, fetch_fn=None, apply=False, records=None):
+                 expect_ok=False, fetch_fn=None, apply=False, records=None,
+                 persist_page=None, store_out=None):
     """Drive `gapfill.run` against a store complete enough for the real path.
 
     The plan is reached through the real `plan_for_dataset`, by giving the store
@@ -449,6 +497,10 @@ def _run_with_gap(gap, phase=G.PHASE_SEARCH, search_fn=None, dedupe_keys=None,
     async def _default_search(query, limit=4):
         return []
 
+    store = _Store()
+    if store_out is not None:
+        store_out["store"] = store
     return asyncio.run(F.run(
-        _Store(), "d1", "ceo", phase=phase, llm=None,
-        search_fn=search_fn or _default_search, fetch_fn=fetch_fn, apply=apply))
+        store, "d1", "ceo", phase=phase, llm=None,
+        search_fn=search_fn or _default_search, fetch_fn=fetch_fn, apply=apply,
+        persist_page=persist_page))

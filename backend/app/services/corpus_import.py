@@ -41,6 +41,27 @@ def _now() -> str:
     return datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()
 
 
+def _document_date(document: dict) -> str:
+    """The date a document's own metadata states, or "".
+
+    Curated corpora carry a year (or a fuller date) beside each document. It is
+    the source's statement about when its content was true, so it becomes the
+    cell's `valid_time`: without it every corpus cell is undated, and a temporal
+    question over the corpus has nothing to compare against. A bare year is kept
+    as a year, because `valid_interval` needs the coarser precision.
+    """
+    for key in ("published_date", "date", "year"):
+        raw = document.get(key)
+        if isinstance(raw, (str, int)) and str(raw).strip():
+            return str(raw).strip()
+    field = (document.get("fields") or {}).get("year")
+    if isinstance(field, dict):
+        value = field.get("value")
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
 def load_corpus(path: str | Path) -> dict:
     """Read and shape-check a corpus file. Raises E_VALIDATION, never KeyError."""
     raw = Path(path).read_text(encoding="utf-8")
@@ -216,6 +237,7 @@ def import_corpus(repo: object, payload: dict, *,
         url = str(document.get("source_url") or document.get("fetch_url") or
                   f"corpus://{document['doc_id']}")
         retrieved_at = str(document.get("retrieved_at") or _now())
+        doc_date = _document_date(document)
         chash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         page_id = repo.upsert_page(run_id, {
             "url": url,
@@ -229,6 +251,7 @@ def import_corpus(repo: object, payload: dict, *,
             "reducer_version": CORPUS_REDUCER,
             "final_content_source": "corpus",
             "retrieved_at": retrieved_at,
+            "published_date": doc_date,
         })
 
         cells: dict[str, dict] = {}
@@ -242,6 +265,10 @@ def import_corpus(repo: object, payload: dict, *,
             cell = settle({
                 "value": value,
                 "verification_status": status,
+                # When the document says its own content was published or
+                # enacted. Advisory, like every `valid_time`: it never moves a
+                # cell out of `verified`.
+                "valid_time": doc_date,
                 "source": {
                     "url": url,
                     "title": str(document.get("title") or ""),

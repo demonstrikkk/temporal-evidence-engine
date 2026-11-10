@@ -29,6 +29,8 @@ import re
 
 from rapidfuzz import fuzz
 
+from app.services import temporal
+
 
 def _strip_parenthetical(value: str) -> str:
     """Drop a trailing parenthetical, keeping what remains.
@@ -365,13 +367,47 @@ def _similar(a: _Sig, b: _Sig, threshold: float) -> float:
     return best
 
 
+def plan_field_types(plan: dict) -> dict[str, str]:
+    """The plan's declared type per field, shaped for `dedupe_records`.
+
+    A caller that forgets this gets string comparison back, which is how two
+    spellings of one date became a conflict. One named function rather than an
+    inline comprehension at the call site keeps that reachable from a test.
+    """
+    return {str(f.get("name")): str(f.get("type") or "")
+            for f in (plan or {}).get("fields", []) or []
+            if isinstance(f, dict) and f.get("name")}
+
+
+def _same_value(a: object, b: object, field_type: str = "") -> bool:
+    """Whether two spellings are the same field value.
+
+    Only `date` gets special handling: one day has many written forms, and the
+    ladders + model routinely produce two of them for the same text. Comparing
+    the strings made that a conflict, which is the one state that withholds
+    verification. Every other type keeps exact comparison.
+    """
+    if str(field_type or "").strip().lower() != "date":
+        return a == b
+    da = temporal.parse_date(a)
+    db = temporal.parse_date(b)
+    return bool(da and db and da == db)
+
+
 def dedupe_records(rows: list[dict], keys: list[str],
-                   threshold: float = 88.0) -> tuple[list[dict], int]:
+                   threshold: float = 88.0,
+                   field_types: dict[str, str] | None = None) -> tuple[list[dict], int]:
     """Rows: {fields: {name: provenance-field}}. Returns (canonical, merged_count).
 
     Identity rule: a row whose dedupe signature is EMPTY (all key values missing)
     carries no identity evidence and never merges — neither exact nor fuzzy.
     Two empty signatures would otherwise false-positive on every run.
+
+    `field_types` is the plan's declared type per field. It exists so a date
+    that two rungs spell differently (`September 26, 2025` from the model,
+    `2025-09-26` from a page declaration) is recognised as the same value
+    rather than recorded as a conflict. Measured live: that false conflict both
+    denied a cell its verification and marked the record for review.
 
     Returns fresh dicts; the input rows and their field dicts are not modified.
     """
@@ -384,6 +420,7 @@ def dedupe_records(rows: list[dict], keys: list[str],
 
     canon_sigs: list[_Sig] = []
     canon_rows: list[dict] = []
+    types = field_types or {}
     # Exact-signature -> index into canon_*. Turns L1 from a linear scan into a
     # hash lookup, which is the difference between O(n²) and O(n) for the common
     # case of a run whose records are mostly distinct.
@@ -432,7 +469,8 @@ def dedupe_records(rows: list[dict], keys: list[str],
                     target[k] = copy.deepcopy(v)
                 elif (isinstance(v, dict)
                       and v.get("value") not in (None, "")
-                      and cur.get("value") != v.get("value")):
+                      and not _same_value(cur.get("value"), v.get("value"),
+                                          types.get(k, ""))):
                     # Genuine conflict on merge: keep first value, mark conflicting,
                     # preserve the rival for the JUDGE step (Jev-C).
                     #

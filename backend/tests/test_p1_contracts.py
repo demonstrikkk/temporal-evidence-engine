@@ -232,6 +232,10 @@ def test_runview_counters_real(client):
         "fields_judgment_unavailable", "fields_conflicting",
         "fields_rate_limited",
         "records_fully_verified", "records_needing_review",
+        # Temporal accounting. Advisory, but declared so the API can report a
+        # run whose sources fall outside the window it asked for.
+        "cells_dated", "temporal_within", "temporal_before", "temporal_after",
+        "temporal_uncertain", "temporal_unknown",
     }
     # A budget-stopped run must be distinguishable from a clean one. Both keys
     # were computed on every terminal event and unreachable, because RunView had

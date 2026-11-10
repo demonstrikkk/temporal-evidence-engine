@@ -1,0 +1,24 @@
+Temporal Evidence Engine
+Copyright (c) 2026 Temporal Evidence Engine contributors
+
+This product includes software derived from DataGoblin
+(https://github.com/demonstrikkk/datagoblin), licensed under the MIT License,
+Copyright (c) 2026 DataGoblin contributors.
+
+The MIT License text is reproduced in LICENSE and applies to the whole
+repository. The following are original to this product and not part of
+DataGoblin:
+
+  backend/app/verify/          claim extraction, temporal decision engine,
+                               value normalisation, freshness, report
+  backend/app/research/        Tavily orchestration, source revisions,
+                               crawler fallback
+  backend/app/bifrost/         the single model gateway client
+  backend/app/api/verify.py    verification API and SSE
+  backend/migrations/014+      the `tev` schema
+  eval/                        gold set and evaluation harness
+  frontend/src/verify/         the verification workspace
+
+Model inference is performed through Bifrost (https://github.com/maximhq/bifrost)
+and web research through Tavily (https://tavily.com). Their licences and terms
+apply to their respective software and services.

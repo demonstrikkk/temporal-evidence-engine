@@ -60,6 +60,24 @@ def _jsonb(value: Any) -> Any:
     return json.dumps(value, default=str)
 
 
+def _page_ids(fields: dict) -> list[str]:
+    """The distinct pages a record's cells cite.
+
+    Written down once, in a column that can be indexed, so that "which
+    records cite a page whose text contains X" is an index lookup rather than
+    a scan of every cell of every record. See 012_record_page_ids.sql.
+    """
+    out: list[str] = []
+    for cell in (fields or {}).values():
+        if not isinstance(cell, dict):
+            continue
+        source = cell.get("source") or {}
+        page_id = str(source.get("page_id") or "")
+        if page_id and page_id not in out:
+            out.append(page_id)
+    return out
+
+
 def _plain(value: Any) -> Any:
     """Coerce a driver-native value into something JSON can carry.
 
@@ -208,6 +226,16 @@ class PostgresRepo:
         pool, self._pool = self._pool, None
         if pool is not None:
             pool.close()
+
+    def ping(self) -> None:
+        """Raise when the store cannot answer a query.
+
+        `/api/health` reported the *configured* adapter name and issued no
+        query, so a pooler that had stopped resolving DNS still read as a
+        healthy API returning 503 on every other route. One round trip is the
+        difference between "postgres is configured" and "postgres is there".
+        """
+        self._rows("ping", "SELECT 1 AS one")
 
     def _rows(self, op: str, sql: str, params: Iterable = ()) -> list[dict]:
         """Every read goes through here, so every read is JSON-safe.
@@ -436,7 +464,7 @@ class PostgresRepo:
         """
         cols = ("id,run_id,url,final_url,parent_url,depth,method,status,error,"
                 "content_hash,markdown,snapshot_chars,retrieved_at,revision,"
-                "reducer_version")
+                "reducer_version,published_date")
         if include_html:
             cols += ",raw_html"
         rows = self._rows(
@@ -507,9 +535,10 @@ class PostgresRepo:
                                   snapshot_chars,reducer_version,revision,
                                   fetch_attempts,render_attempted,render_status,
                                   render_error_code,fallback_used,
-                                  final_content_source,degraded_reason,retrieved_at)
+                                  final_content_source,degraded_reason,
+                                  published_date,retrieved_at)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                       %s::jsonb,%s,%s,%s,%s,%s,%s,now())""",
+                       %s::jsonb,%s,%s,%s,%s,%s,%s,%s,now())""",
             (pid, run_id, url, page.get("final_url", ""),
              page.get("parent_url", ""), int(page.get("depth", 0) or 0),
              page.get("method", ""), page.get("status", "ok"),
@@ -524,7 +553,8 @@ class PostgresRepo:
              str(page.get("render_error_code") or ""),
              bool(page.get("fallback_used")),
              str(page.get("final_content_source") or "http"),
-             str(page.get("degraded_reason") or ""))))
+             str(page.get("degraded_reason") or ""),
+             str(page.get("published_date") or "")[:100])))
         return pid
 
     def append_event(self, run_id: str, event: dict) -> None:
@@ -632,19 +662,27 @@ class PostgresRepo:
             cur.execute(
                 """INSERT INTO datasets (id,run_id,name,schema_json,record_count,
                                          sources_attempted,sources_successful,
-                                         sources_failed)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                         sources_failed,edition,temporal_json)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (did, run_id, str(plan.get("goal", ""))[:120],
                  _jsonb(plan.get("fields", [])), len(rows),
                  int(counts.get("attempted", 0)), int(counts.get("successful", 0)),
-                 int(counts.get("failed", 0))))
+                 int(counts.get("failed", 0)),
+                 # Which vertical produced this dataset, stamped once so the
+                 # list can be filtered by edition without a plan read per
+                 # row. See 011_dataset_edition.sql.
+                 str(plan.get("edition") or "")[:80],
+                 # The time the request asked about. See 013_temporal.sql.
+                 _jsonb(plan.get("temporal") or {})))
             if rows:
                 # One COPY for all records, not one request per record.
                 with cur.copy(
-                    "COPY dataset_records (dataset_id, row_json) FROM STDIN"
+                    "COPY dataset_records (dataset_id, row_json, page_ids) "
+                    "FROM STDIN"
                 ) as cp:
                     for r in rows:
-                        cp.write_row((did, _jsonb(r.get("fields", {}))))
+                        cp.write_row((did, _jsonb(r.get("fields", {})),
+                                      _page_ids(r.get("fields", {}))))
             cur.execute(
                 """UPDATE runs SET status=%s, current_stage=%s, progress=100,
                                    partial=%s, error=%s, completed_at=now(), stats=%s
@@ -729,13 +767,26 @@ class PostgresRepo:
         `partial` comes along for the same reason: the dataset page reads it
         from the run, and the dashboard renders a pill for it that could never
         light up because nothing supplied the field.
+
+        `counts` comes from the run's `stats` in the same statement. The list
+        endpoint read `counts` off this row, so without the join the dashboard
+        reported every dataset as "not counted" while the detail page — which
+        goes through `get_dataset_row` and `_run_counts` — measured the same
+        dataset correctly. One indexed join is cheaper than the per-row reads
+        the detail path needs.
         """
         rows = self._rows("list_datasets",
-                          """SELECT id,run_id,name,schema_json,record_count,created_at
-                             FROM datasets ORDER BY created_at DESC LIMIT %s""",
+                          """SELECT d.id,d.run_id,d.name,d.schema_json,d.record_count,
+                                    d.created_at,d.edition,d.temporal_json,r.stats
+                               FROM datasets d
+                               LEFT JOIN runs r ON r.id = d.run_id
+                              ORDER BY d.created_at DESC LIMIT %s""",
                           (max(1, min(int(limit), 100)),))
         for r in rows:
            r["schema"] = r.pop("schema_json", None) or []
+           r["temporal"] = r.pop("temporal_json", None) or {}
+           stats = r.pop("stats", None) or {}
+           r["counts"] = stats.get("counts") or {}
         return rows
 
     def _run_counts(self, run_id: str) -> dict:
@@ -763,11 +814,12 @@ class PostgresRepo:
         cost a full table read. This is the same row without that.
         """
         rows = self._rows("get_dataset_row",
-                          "SELECT id,run_id,name,schema_json,record_count,created_at"
-                          " FROM datasets WHERE id=%s", (dataset_id,))
+                          "SELECT id,run_id,name,schema_json,record_count,created_at,"
+                          " edition,temporal_json FROM datasets WHERE id=%s", (dataset_id,))
         if not rows:
             return None
         rows[0]["schema"] = rows[0].pop("schema_json", None) or []
+        rows[0]["temporal"] = rows[0].pop("temporal_json", None) or {}
         rows[0]["counts"] = self._run_counts(str(rows[0].get("run_id") or ""))
         return rows[0]
 
@@ -778,6 +830,7 @@ class PostgresRepo:
             return None
         ds = rows[0]
         ds["schema"] = ds.pop("schema_json", None) or []
+        ds["temporal"] = ds.pop("temporal_json", None) or {}
         # Was a literal `100`, so a dataset reporting 112 records exported 100
         # of them with no indication anything was missing. The ceiling is now
         # the configured export ceiling, which is where this list is consumed.
@@ -979,6 +1032,49 @@ So the counting happens where the documents already are. `jsonb_each`
                     offset: int = 0) -> dict:
         return self._records(dataset_id, q, limit, offset)
 
+    def search_records(self, dataset_id: str, q: str, limit: int = 100,
+                       offset: int = 0) -> dict:
+        """Records whose **stored page text** contains the query.
+
+        `get_records` searches the record's own fields. A judgment's fields
+        are a title, a citation and a summary; the finding that made a case
+        important is in the body, in the pages the evidence came from. So
+        the search has to reach `pages.markdown`.
+
+        The join is on the page id each cell cites, so a hit means *this
+        record's own evidence* contains the text -- not that some other
+        record in the dataset happens to share a page.
+        """
+        ql = (q or "").strip()
+        if not ql:
+            return {"dataset_id": dataset_id, "total": 0, "records": [],
+                    "matched_in": "none"}
+        limit = max(1, min(int(limit), settings.EXPORT_MAX_ROWS))
+        offset = max(0, int(offset))
+        pattern = f"%{ql}%"
+        # A record matches when the text of a page *it cites* contains the
+        # query. The page ids a record cites are written down in their own
+        # column, so this is an index lookup on the array and an index scan on
+        # the page text -- not a scan of every cell of every record, which is
+        # what the join through `jsonb_each` cost: 28 seconds a search.
+        where = ("dataset_id=%s AND page_ids && "
+                 "(SELECT array_agg(p.id::text) FROM pages p "
+                 " WHERE p.markdown ILIKE %s)")
+        params: list[Any] = [dataset_id, pattern]
+        total = self._rows("search_total",
+                           f"SELECT count(*) AS n FROM dataset_records WHERE {where}",
+                           params)
+        rows = self._rows(
+            "search",
+            f"""SELECT id,row_json FROM dataset_records WHERE {where}
+                ORDER BY id LIMIT %s OFFSET %s""",
+            [*params, limit, offset])
+        return {"dataset_id": dataset_id,
+                "total": int(total[0]["n"]) if total else 0,
+                "records": [{"record_id": str(r["id"]),
+                             "fields": r.get("row_json") or {}} for r in rows],
+                "matched_in": "stored page text"}
+
     def _records(self, dataset_id: str, q: str = "", limit: int = 100,
                  offset: int = 0) -> dict:
         """Filter and page in SQL.
@@ -1154,7 +1250,7 @@ So the counting happens where the documents already are. `jsonb_each`
         return self._rows(
             "get_pages",
             """SELECT id,url,final_url,parent_url,depth,method,status,error,
-                      content_hash,markdown,snapshot_chars,retrieved_at
+                      content_hash,markdown,snapshot_chars,published_date,retrieved_at
                  FROM pages WHERE run_id=%s ORDER BY retrieved_at DESC LIMIT %s""",
             (run_id, max(1, min(int(limit), 500))))
 
@@ -1214,7 +1310,7 @@ So the counting happens where the documents already are. `jsonb_each`
         rows = self._rows(
             "get_pages_by_ids",
             "SELECT id,run_id,url,final_url,parent_url,depth,method,status,error,"
-            "content_hash,markdown,snapshot_chars,retrieved_at"
+            "content_hash,markdown,snapshot_chars,published_date,retrieved_at"
             " FROM pages WHERE id = ANY(%s::uuid[]) ORDER BY retrieved_at DESC",
             (ids,))
         order = {p: i for i, p in enumerate(ids)}

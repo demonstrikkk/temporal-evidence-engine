@@ -48,6 +48,17 @@ class Counters(BaseModel):
     fields_rate_limited: int = Field(default=0, ge=0)
     records_fully_verified: int = Field(default=0, ge=0)
     records_needing_review: int = Field(default=0, ge=0)
+    # Temporal accounting. `cells_dated` counts cells that carry the source's
+    # own publication date; the `temporal_*` keys count how those dates sit
+    # against the requested window. They are advisory and never fold into the
+    # verification counts above: a verified quote from the wrong year is still
+    # verified, and the two facts have to stay separately readable.
+    cells_dated: int = Field(default=0, ge=0)
+    temporal_within: int = Field(default=0, ge=0)
+    temporal_before: int = Field(default=0, ge=0)
+    temporal_after: int = Field(default=0, ge=0)
+    temporal_uncertain: int = Field(default=0, ge=0)
+    temporal_unknown: int = Field(default=0, ge=0)
 
 
 class RunView(BaseModel):
@@ -74,6 +85,13 @@ class DatasetView(BaseModel):
     fields_schema: list[dict] = Field(default=[], alias="schema")
     record_count: int = Field(default=0, ge=0)
     counts: Counters = Counters()
+    #: The domain edition that produced this dataset, when one did. Empty for
+    #: a dataset a live run created with no edition in play.
+    edition: str = ""
+    #: The time the request asked about: `{kind, as_of, start, end, phrase,
+    #: source}`. Empty `{}` when the prompt named no time. Exposed so a reader
+    #: knows whether "revenue" means as-of a date or across a window.
+    temporal: dict = Field(default_factory=dict)
     created_at: str = ""
 
     model_config = {"populate_by_name": True}

@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.repositories.factory import build_repo  # noqa: E402
 from app.services import coverage as coverage_svc  # noqa: E402
 from app.services import gaps as gaps_svc  # noqa: E402
+from app.services import quality as quality_svc  # noqa: E402
 
 #: Enough for any dataset a single run produces. `get_records` pages in SQL, so
 #: this is a ceiling on the read, not a scan of the table.
@@ -59,6 +60,61 @@ def _latest_dataset(repo) -> str:
     return ""
 
 
+def _citation_report(records: list[dict], repo) -> dict:
+    """Do the stored citations still resolve against the stored pages?
+
+    This is the deterministic half of an evaluation: no model, no network, and
+    no judgement. `validator.settle` writes the located slice as the quote, so
+    on the verified path a mismatch is a real regression rather than a fuzzy
+    threshold. Cells whose page cannot be found are `no_text`, not excused:
+    an unverifiable citation is the defect this exists to surface.
+    """
+    page_ids: set[str] = set()
+    for rec in records:
+        for cell in (rec.get("fields") or {}).values():
+            pid = str(((cell or {}).get("source") or {}).get("page_id") or "")
+            if pid:
+                page_ids.add(pid)
+    texts: dict[str, str] = {}
+    if page_ids:
+        getter = getattr(repo, "get_pages_by_ids", None)
+        if callable(getter):
+            try:
+                for page in getter(sorted(page_ids)) or []:
+                    texts[str(page.get("id") or "")] = str(page.get("markdown") or "")
+            except Exception:  # noqa: BLE001 (a read failure is reported as no_text)
+                texts = {}
+    pairs = []
+    temporal: dict[str, int] = {}
+    dated = 0
+    # How the values arrived. This is the ladder's measurement: a run that reads
+    # its columns from JSON-LD or from labelled lines and never asks the model is
+    # cheaper *and* no less verified, and without this the only evidence was the
+    # per-cell tooltip. Counted only over cells that carry a value.
+    read_methods: dict[str, int] = {}
+    for rec in records:
+        for cell in (rec.get("fields") or {}).values():
+            cell = cell or {}
+            pid = str((cell.get("source") or {}).get("page_id") or "")
+            pairs.append((cell, texts.get(pid, "")))
+            if str(cell.get("valid_time") or "").strip():
+                dated += 1
+            status = str((cell.get("temporal_check") or {}).get("status") or "")
+            if status:
+                temporal[status] = temporal.get(status, 0) + 1
+            if str(cell.get("value") or "") == "":
+                continue
+            method = str(cell.get("read_method") or "").strip() or "unrecorded"
+            read_methods[method] = read_methods.get(method, 0) + 1
+    report = quality_svc.score(pairs)
+    report["pages_cited"] = len(page_ids)
+    report["pages_found"] = len(texts)
+    report["cells_dated"] = dated
+    report["temporal_statuses"] = temporal
+    report["read_methods"] = read_methods
+    return report
+
+
 def _report(repo, dataset_id: str) -> dict:
     dataset = repo.get_dataset_row(dataset_id) or {}
     schema = dataset.get("schema") or []
@@ -73,6 +129,8 @@ def _report(repo, dataset_id: str) -> dict:
         "schema": _field_names(schema),
         "fields": coverage.get("fields", []),
         "gaps": derived,
+        "citations": _citation_report(records, repo),
+        "temporal": dataset.get("temporal") or {},
         "counts": dataset.get("counts") or {},
     }
 
@@ -105,6 +163,36 @@ def _print(report: dict) -> None:
                     "blocked_by_domain_cap", "blocked_by_budget"):
             if key in traversal:
                 print(f"  {key:<22} {traversal[key]}")
+    citations = report.get("citations") or {}
+    if citations:
+        print()
+        print("citations (deterministic, no model):")
+        print(f"  valued cells           {citations.get('valued', 0)}")
+        print(f"  exact slice            {citations.get('exact', 0)}")
+        print(f"  located after normal.  {citations.get('located', 0)}")
+        print(f"  unlocatable            {citations.get('unlocatable', 0)}")
+        print(f"  offset mismatch        {citations.get('offset_mismatch', 0)}")
+        print(f"  no quote               {citations.get('no_quote', 0)}")
+        print(f"  page text missing      {citations.get('no_text', 0)}")
+        print(f"  resolution rate        {citations.get('resolution_rate', 0.0):.3f}")
+        print(f"  pages cited / found    {citations.get('pages_cited', 0)} / "
+              f"{citations.get('pages_found', 0)}")
+        print(f"  cells with valid_time  {citations.get('cells_dated', 0)}")
+        statuses = citations.get("temporal_statuses") or {}
+        if statuses:
+            print("  temporal check         " + ", ".join(
+                f"{k}={v}" for k, v in sorted(statuses.items())))
+        methods = citations.get("read_methods") or {}
+        if methods:
+            print("  read methods           " + ", ".join(
+                f"{k}={v}" for k, v in
+                sorted(methods.items(), key=lambda kv: (-kv[1], kv[0]))))
+    temporal = report.get("temporal") or {}
+    if temporal.get("kind") and temporal.get("kind") != "none":
+        print()
+        print(f"requested time: {temporal.get('kind')} "
+              f"({temporal.get('as_of') or temporal.get('start', '')} -> "
+              f"{temporal.get('end', '')})")
 
 
 def main() -> int:

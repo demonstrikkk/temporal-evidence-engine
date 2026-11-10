@@ -5,6 +5,11 @@
 .DESCRIPTION
   Exists so the password is never typed, and never pasted from a message.
 
+  Works for both server generations: `OPENCODE_SERVER_PASSWORD` is honoured by
+  the v1 server and by `opencode serve` v2 (measured 2.2.0), which otherwise
+  generates a password and prints it once. The API detects which wire answered
+  (`/api/info` JSON means v2), so there is nothing to switch here.
+
   A run failed end to end because the server had been started with the literal
   text `<copy OPENCODE_PASSWORD from .env>` — a placeholder that had been copied
   from a comment instead of replaced with the real value. The server was

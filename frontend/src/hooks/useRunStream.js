@@ -18,17 +18,47 @@ import { openStream } from '../lib/api.js';
 
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'PARTIAL']);
 
-const fingerprint = (e) => {
-  const t = e.type || '';
-  if (t === 'stage.started' || t === 'stage.progress') return `${t}:${e.stage}`;
-  if (t.startsWith('record.')) {
-    return `${t}:${e.run_id || ''}:${e.qualifier || e.value || e.reason || ''}`;
+/**
+ * Identity for replay de-duplication.
+ *
+ * The server replays from index 0 on every reconnect (there is no `id:`
+ * frame), so the same event genuinely arrives twice and must collapse. This
+ * key is built from the fields that make an event distinct rather than from a
+ * lossy summary: an earlier version keyed `record.*` on
+ * `qualifier|value|reason`, which are all empty on `record.extracted`, so a
+ * ten-page run kept the first extraction and dropped nine. Two distinct
+ * events colliding is a visible data loss; a replay has identical bytes, so
+ * including `timestamp`, `url` and `message` still dedupes it exactly.
+ */
+export const eventKey = (e) => [
+  e.type, e.timestamp, e.stage, e.url || e.domain, e.message,
+  e.qualifier, e.value, e.reason,
+].join('|');
+
+/**
+ * Coerce a frame payload into an event object.
+ *
+ * `readEventStream` parses each `data:` line and hands back an object, so that
+ * is the normal input. A JSON string is still accepted because `EventSource`
+ * delivers text and a caller wrapping it must not lose events. Re-parsing the
+ * object threw inside `apply`, the throw was swallowed, and every frame
+ * vanished: the feed sat on "Waiting for the first event…" for a whole run
+ * while the header polled progress and the source/record counters stayed 0.
+ */
+export function normaliseEvent(raw) {
+  let e = raw;
+  if (typeof raw === 'string') {
+    try {
+      e = JSON.parse(raw);
+    } catch {
+      return null;
+    }
   }
-  if (t === 'source.fetched' || t === 'source.discovered') {
-    return `${t}:${e.url || e.domain || ''}`;
-  }
-  return `${t}:${e.stage || ''}:${e.error || e.reason || ''}`;
-};
+  if (!e || typeof e !== 'object') return null;
+  const type = e.type || e.event;
+  if (!type) return null;
+  return { ...e, type };
+}
 
 const initial = {
   connection: 'idle', // idle | connecting | open | reconnecting | closed | error
@@ -42,6 +72,9 @@ const initial = {
     stages: 0,
     sourcesDiscovered: 0,
     sourcesFetched: 0,
+    // Fetch failures were not counted at all, so a run could show "20 fetched"
+    // and "no fetches failed" while five pages had failed.
+    sourcesFailed: 0,
     // Kept apart from sourcesFetched: a reused source is a source the run did
     // not request. Counting it as fetched would make a run that re-fetched
     // nothing look identical to one that did the work.
@@ -54,7 +87,7 @@ const initial = {
   },
 };
 
-function tally(counts, e) {
+export function tally(counts, e) {
   switch (e.type) {
     case 'stage.started':
       counts.stages += 1;
@@ -65,11 +98,19 @@ function tally(counts, e) {
     case 'source.fetched':
       counts.sourcesFetched += 1;
       break;
+    case 'source.failed':
+      counts.sourcesFailed += 1;
+      break;
     case 'source.reused':
       counts.sourcesReused += 1;
       break;
     case 'record.extracted':
-      counts.extracted += 1;
+      // One event per page. `data.count` is how many records that page
+      // yielded, so this is a record count rather than a page count — an
+      // off-topic page reports 0 and must not add one.
+      counts.extracted += Number.isFinite(Number(e.data?.count))
+        ? Number(e.data.count)
+        : 1;
       break;
     case 'record.verified':
       counts.verified += 1;
@@ -162,20 +203,10 @@ export default function useRunStream(runId, { enabled = true } = {}) {
     };
 
     const apply = (raw) => {
-      let e;
-      try {
-        e = JSON.parse(raw);
-      } catch {
-        return;
-      }
-      if (!e || typeof e !== 'object') return;
+      const ev = normaliseEvent(raw);
+      if (!ev) return;
 
-      // `stage` is the declared event shape; some emitters also send `data`
-      const type = e.type || e.event;
-      if (!type) return;
-      const ev = { ...e, type };
-
-      const key = fingerprint(ev);
+      const key = eventKey(ev);
       if (seenRef.current.has(key)) return;
       seenRef.current.add(key);
 
@@ -188,7 +219,7 @@ export default function useRunStream(runId, { enabled = true } = {}) {
         };
         tally(next.counts, ev);
 
-        switch (type) {
+        switch (ev.type) {
           case 'run.partial':
             // previously dropped on the floor
             next.partial = true;

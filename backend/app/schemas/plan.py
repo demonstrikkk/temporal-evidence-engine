@@ -58,6 +58,40 @@ class FieldSpec(BaseModel):
     required: bool = False
 
 
+class TemporalSpec(BaseModel):
+    """The time a request asks about, parsed from the prompt.
+
+    This is a *request* about time, not a claim about any one cell. It has to be
+    declared on the plan because pydantic drops keys it does not know: a spec
+    stamped on the dict but absent from this model would vanish on the next
+    `WorkflowPlan(**plan).model_dump()` round trip, and the run would lose the
+    window it was asked to answer for.
+
+    `kind` is deliberately small:
+
+    * `none`    the prompt named no time constraint;
+    * `current` "as of today", "current", "latest" — a point, but one whose
+                date is the run date rather than a date the user typed;
+    * `point`   "as of 2023-09-29" — a single date;
+    * `window`  "last 6 months", "between 2020 and 2023".
+
+    A bare year in a prompt ("companies founded in 2020") is *not* parsed as a
+    time constraint. It is a field filter, and treating it as an as-of date
+    would silently discard every source outside that year. Only phrases that
+    unambiguously describe the requested state of the world are read.
+    """
+    kind: Literal["none", "current", "point", "window"] = "none"
+    #: ISO date the request is anchored to, for `point` and `current`.
+    as_of: str = ""
+    #: Inclusive ISO window bounds, for `window`.
+    start: str = ""
+    end: str = ""
+    #: The prompt text that produced this, kept so a run can say why it has a
+    #: window rather than making a reader reverse-engineer the dates.
+    phrase: str = ""
+    source: str = ""
+
+
 class WorkflowPlan(BaseModel):
     goal: str
     entity: str
@@ -73,6 +107,10 @@ class WorkflowPlan(BaseModel):
     dedupe_keys: list[str] = []
     allowed_sources: list[str] = []
     max_pages: int = 12
+    #: The time the request asks about. Declared here for the same reason as the
+    #: edition stamp below: a key pydantic does not know is gone on the next
+    #: round trip, and a temporal run would forget its own window.
+    temporal: TemporalSpec = Field(default_factory=TemporalSpec)
     #: The domain edition that contributed vocabulary and source policy, and the
     #: version it declared. Declared on the model because pydantic drops keys it
     #: does not know: an edition stamped on the dict but not on the model would
@@ -130,6 +168,17 @@ class ProvenanceField(BaseModel):
     value: Any | None
     verification_status: Verification
     source: SourceRef
+    #: The date the source says its content is from (the search engine's
+    #: `published_date`, normalised), or empty when it said nothing. It is a
+    #: sibling of `source` rather than a member of it because it describes the
+    #: fact's validity, not the retrieval: a page fetched today can describe a
+    #: fact from 2021, and collapsing the two is how a stale value starts to look
+    #: fresh.
+    valid_time: str = ""
+    #: The requested window plus whether `valid_time` fell inside it. Purely
+    #: advisory: it never changes `verification_status`. A date mismatch is a
+    #: finding about relevance, not proof that the quote is not on the page.
+    temporal_check: dict = Field(default_factory=dict)
 
 
 class RunEvent(BaseModel):

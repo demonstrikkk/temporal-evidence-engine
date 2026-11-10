@@ -73,6 +73,12 @@ export function countersOf(dataset) {
   const throttled = n(c.fields_rate_limited) ?? 0;
   const conflicting = n(c.fields_conflicting) ?? 0;
   const fieldTotal = proven + unjudged + throttled + conflicting;
+  // Temporal accounting rides beside the verification counts and never inside
+  // them: a verified quote from the wrong year is still verified, so folding
+  // these in would make the provenance figure lie about what it measures.
+  const dated = n(c.cells_dated) ?? 0;
+  const before = n(c.temporal_before) ?? 0;
+  const after = n(c.temporal_after) ?? 0;
   return {
     raw: c,
     modern,
@@ -88,6 +94,19 @@ export function countersOf(dataset) {
     needingReview: modern ? n(c.records_needing_review) : null,
     legacyVerified: modern ? null : n(c.verified),
     legacyNeedsReview: modern ? null : n(c.needs_review),
+    temporal: {
+      /** Cells that carry their source's own publication date. */
+      dated,
+      within: n(c.temporal_within) ?? 0,
+      before,
+      after,
+      uncertain: n(c.temporal_uncertain) ?? 0,
+      /** No publication date. Not the same as the wrong date. */
+      unknown: n(c.temporal_unknown) ?? 0,
+      offWindow: before + after,
+      /** False for runs that predate the temporal columns, so nothing is claimed. */
+      counted: 'cells_dated' in c || 'temporal_within' in c,
+    },
   };
 }
 

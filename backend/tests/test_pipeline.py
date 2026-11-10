@@ -98,6 +98,44 @@ def test_dedupe_conflict_marks_not_merges():
     assert len(canon) == 2 and merged == 0  # high threshold: no fuzzy merge
 
 
+def test_two_spellings_of_one_date_are_not_a_conflict():
+    """Measured live: the model wrote `September 26, 2025` while a deterministic
+    rung wrote `2025-09-26` for the same quote. String comparison called that a
+    conflict, which withholds verification from a cell whose evidence agrees."""
+    rows = [_row("Nscale"), _row("Nscale")]
+    for row, value in zip(rows, ("September 26, 2025", "2025-09-26")):
+        row["fields"]["published"] = {"value": value,
+                                      "verification_status": "verified",
+                                      "source": {"url": "u", "quote": "September 26, 2025"}}
+    canon, merged = deduper_svc.dedupe_records(
+        rows, ["company_name"], field_types={"published": "date"})
+    assert len(canon) == 1 and merged == 1
+    cell = canon[0]["fields"]["published"]
+    assert cell["verification_status"] != "conflicting"
+    assert cell["value"] == "September 26, 2025"  # first value wins, unchanged
+
+
+def test_the_runner_hands_the_deduper_the_plans_field_types():
+    """The mapping is the only thing that turns a declared `date` into date
+    comparison; an inline comprehension nobody tests is how it silently stops
+    being passed."""
+    assert deduper_svc.plan_field_types(
+        {"fields": [{"name": "published", "type": "date"},
+                    {"name": "amount"}]}) == {"published": "date", "amount": ""}
+    assert deduper_svc.plan_field_types({}) == {}
+    assert deduper_svc.plan_field_types({"fields": [None, {"type": "date"}]}) == {}
+
+
+def test_a_non_date_field_with_different_values_still_conflicts():
+    rows = [_row("Nscale"), _row("Nscale")]
+    for row, value in zip(rows, ("September 26, 2025", "2025-09-26")):
+        row["fields"]["published"] = {"value": value,
+                                      "verification_status": "verified",
+                                      "source": {"url": "u", "quote": "q"}}
+    canon, _ = deduper_svc.dedupe_records(rows, ["company_name"])
+    assert canon[0]["fields"]["published"]["verification_status"] == "conflicting"
+
+
 # -- normalizer ----------------------------------------------------------------
 def test_normalize_currency_variants():
     for raw, amount in [("$12.5 million", 12500000), ("$12.5M", 12500000),

@@ -179,6 +179,34 @@ def test_single_path_extract_and_metadata():
     assert recs[0]["references"] == "" and recs[0]["coverage"] == "partial"
 
 
+def test_a_model_record_carries_the_pages_publication_date():
+    """Measured live: the LLM path stamped `source_text`, `page_id` and the
+    rest, but not the page's own date. A dated article then produced cells with
+    `valid_time: ""` and `temporal: unknown` while its text plainly said
+    "September 26, 2025". Every record shape has to carry the date, or the
+    temporal check has nothing to check on the path most records take."""
+    calls: list = []
+    llm = _llm_factory([{"records": [
+        {"fields": {"company_name": "Acme AI"},
+         "evidence": [{"field": "company_name", "quote": "Acme AI",
+                       "source_url": "https://x.example/a"}]}],
+        "coverage": "partial"}], calls)
+    page = {"url": "https://x.example/a", "title": "T", "markdown": PLAIN_MD,
+            "published_date": "Fri, 26 Sep 2025 00:00:00 GMT"}
+    recs, _ = run(extractor_svc.extract_page(
+        {"fields": FIELDS, "goal": "AI startups London"}, page, llm))
+
+    assert recs[0]["published_date"] == "Fri, 26 Sep 2025 00:00:00 GMT"
+    wrapped = run(validator_svc.wrap_record(
+        FIELDS, recs[0], recs[0]["source_text"], recs[0]["source_url"],
+        recs[0]["source_title"], page_id="p1",
+        valid_time=recs[0]["published_date"],
+        temporal={"kind": "window", "start": "2024-06-01", "end": "2025-12-31"}))
+    cell = wrapped["company_name"]
+    assert cell["valid_time"] == "2025-09-26"
+    assert cell["temporal_check"]["status"] == "within"
+
+
 def test_chunk_path_merges_and_dedupes(monkeypatch):
     from app.core import config as config_mod
     monkeypatch.setattr(config_mod.settings, "EXTRACT_MAX_CHARS", 2000)

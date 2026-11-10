@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.logging import log
 from app.providers.crawl import fetcher
 from app.providers.decision import jev
+from app.services import temporal as temporal_svc
 from app.services.source_router import triage_source
 
 
@@ -78,13 +79,14 @@ def _host_of(url: str) -> str:
 
 
 async def _diversify(run_id: str, plan: dict, accepted: list[dict],
-                     max_pages: int, search_capped, robots_ok, emit) -> list[dict]:
+                     max_pages: int, search_capped, robots_ok, emit,
+                     max_extra: int | None = None) -> list[dict]:
     """Top the accepted set up to the page budget, from hosts not yet used.
 
     Excluding the accepted hosts is what forces breadth: re-running the same
-    query against the same domain returns the same page. The loop is bounded by
-    the query list (at most five), so the extra spend is a handful of searches,
-    and it stops as soon as the plan's page budget is filled.
+    query against the same domain returns the same page. `max_extra` bounds what
+    this may spend on top of the supervisor's queries; None means the query list
+    is the only bound, which is what a caller with unlimited credit gets.
     """
     def _hosts(rows):
         return {h for h in (_host_of(r.get("url", "")) for r in rows) if h}
@@ -93,9 +95,12 @@ async def _diversify(run_id: str, plan: dict, accepted: list[dict],
     if len(accepted) >= max_pages:
         return accepted
     queries = list(plan.get("search_queries", [])[:5]) or [str(plan.get("goal", ""))]
+    issued = 0
     for q in queries:
-        if len(accepted) >= max_pages:
+        if len(accepted) >= max_pages or (
+                max_extra is not None and issued >= max(0, int(max_extra))):
             break
+        issued += 1
         try:
             results = await search_capped(
                 q, settings.RUN_MAX_RESULTS_PER_QUERY, [], sorted(hosts))
@@ -115,6 +120,7 @@ async def _diversify(run_id: str, plan: dict, accepted: list[dict],
             accepted.append({"url": url,
                              "title": str((r or {}).get("title") or "")[:300],
                              "snippet": str((r or {}).get("snippet") or "")[:500],
+                             "published_date": str((r or {}).get("published_date") or "")[:100],
                              "route": triage_source(url)})
             hosts.add(h)
             fresh += 1
@@ -167,16 +173,37 @@ def blocked_hosts_from_prior(prior: dict[str, dict],
 
 
 async def discover(run_id: str, plan: dict, search_fn: Any, llm: Any, emit: Any,
-                   host_prior: Any = None) -> list[dict]:
+                   host_prior: Any = None, stats: dict | None = None,
+                   query_budget: int | None = None) -> list[dict]:
     """Find candidate sources. `host_prior` is an optional `async () -> dict`
     returning `{host: {trust, known, block_count, ...}}` from past runs.
+
+    `stats` is an optional caller-owned dict, mutated in place, so the caller can
+    bill what was actually issued instead of what the plan projected. It gets
+    `queries` (search calls made, including diversity top-ups), `errors`
+    (transient failures) and `fatal` (the provider's refusal message, when one
+    stopped search entirely). Billing the projection charged for queries a
+    short-circuited discovery never ran.
 
     Discovery used to hold no data handle at all, so `source_reputation` and
     `yieldmap` existed and informed nothing here: the same host blocked last
     week was re-tried today, and a host with a 0.95 verified-cell rate was
     ranked the same as one with 0.02. The literature is clear that seed
     quality predicts crawl yield, so this is the cheapest available accuracy.
+
+    `query_budget` is the caller's spend ceiling in search calls. It bounds the
+    supervisor *and* the diversity top-up together — the top-up calls the search
+    function directly, outside the supervisor's own `max_queries` counter, so
+    without this a tight credit budget could issue five unbudgeted queries.
     """
+    stats = stats if stats is not None else {}
+    stats.setdefault("queries", 0)
+    stats.setdefault("errors", 0)
+    max_queries = settings.SUPERVISOR_MAX_QUERIES
+    if query_budget is not None:
+        max_queries = max(0, min(max_queries, int(query_budget)))
+        stats["query_budget"] = max_queries
+
     requested = max(1, int(plan.get("requested_count", plan.get("max_results", 15))))
     max_pages = min(int(plan.get("max_pages", 12)), settings.RUN_MAX_PAGES)
     include_domains, exclude_domains = _domains(plan)
@@ -256,8 +283,31 @@ async def discover(run_id: str, plan: dict, search_fn: Any, llm: Any, emit: Any,
     async def _search_capped(query: str, limit: int,
                              include: list[str], exclude: list[str]) -> list[dict]:
         from app.core.errors import AppError
+        if stats.get("fatal"):
+            # A hard refusal (key/plan/quota) will not heal mid-run. Every later
+            # query in this discovery would be the same doomed call, so stop
+            # issuing them instead of printing the same failure each round.
+            return []
         capped = min(limit, settings.RUN_MAX_RESULTS_PER_QUERY)
+        # Counted before the call, because the call is what costs a credit even
+        # when it fails. The TypeError probe below never reaches the network, so
+        # it stays one logical query.
+        stats["queries"] = int(stats.get("queries", 0)) + 1
+        # A request that named a time asks the engine for that time. Only when
+        # it named one: `current` deliberately invents no window (the engine's
+        # ranking already handles recency, and a hard cut-off would drop the
+        # authoritative older page).
+        start, end = temporal_svc.search_window(plan.get("temporal") or {})
+        bounds = {k: v for k, v in (("start_date", start), ("end_date", end)) if v}
         try:
+            if bounds:
+                try:
+                    return await search_fn(query, capped, include, exclude, **bounds)
+                except TypeError:
+                    # The injected `search_fn` does not accept date bounds — a
+                    # test double or a different provider. The search still runs;
+                    # it just is not date-shaped.
+                    pass
             return await search_fn(query, capped, include, exclude)
         except TypeError:
             # Backwards-compatible search_fn(query, limit) without domain args;
@@ -265,9 +315,15 @@ async def discover(run_id: str, plan: dict, search_fn: Any, llm: Any, emit: Any,
             return await search_fn(query, capped)
         except AppError as e:
             if e.code == "E_PROVIDER_FATAL":
-                return []  # auth/config: retrying is pointless (never retry 4xx/auth)
+                # Auth/config/quota: retrying is pointless. Recorded rather than
+                # swallowed, so the caller can say why search stopped instead of
+                # reporting "the web had nothing".
+                stats["fatal"] = str(e)[:200]
+                return []
+            stats["errors"] = int(stats.get("errors", 0)) + 1
             raise  # transient: propagate so the loop retries next round (bounded)
         except Exception:
+            stats["errors"] = int(stats.get("errors", 0)) + 1
             raise  # transient: propagate for bounded loop-level retry
 
     async def _robots_ok(url: str) -> bool:
@@ -304,7 +360,7 @@ async def discover(run_id: str, plan: dict, search_fn: Any, llm: Any, emit: Any,
         include_domains=include_domains,
         exclude_domains=exclude_domains,
         max_pages=max_pages,
-        max_queries=settings.SUPERVISOR_MAX_QUERIES,
+        max_queries=max_queries,
         results_per_query=settings.RUN_MAX_RESULTS_PER_QUERY,
         host_prior=prior,
     )
@@ -339,10 +395,14 @@ async def discover(run_id: str, plan: dict, search_fn: Any, llm: Any, emit: Any,
     # the accepted hosts, forcing the engine off the dominant domains. Same
     # robots gate and triage as the main loop; a top-up that surfaces nothing
     # crawlable simply adds nothing.
+    #
+    # Bounded by what the supervisor actually left in the query budget: the
+    # top-up calls `_search_capped` directly, so nothing else counts it.
+    remaining_queries = max(0, max_queries - int(stats.get("queries", 0)))
     try:
         accepted = await _diversify(
             run_id, plan, accepted, max_pages, _search_capped,
-            _robots_ok, emit)
+            _robots_ok, emit, max_extra=min(2, remaining_queries))
     except Exception:  # noqa: BLE001 (diversity is additive; never sink discovery)
         log.info("diversity top-up failed; keeping supervisor sources",
                  extra={"data": {"run_id": run_id}})

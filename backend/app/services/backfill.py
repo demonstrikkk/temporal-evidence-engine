@@ -485,7 +485,12 @@ async def run(store, dataset_id: str, fields: list[str] | None = None, *,
                 extract_specs, raw, raw.get("source_text", "") or raw.get("_evidence_text", ""),
                 raw.get("source_url", ""), raw.get("source_title", ""),
                 references=raw.get("references", ""),
-                page_id=raw.get("page_id", ""), budget=budget)
+                page_id=raw.get("page_id", ""), budget=budget,
+                # A re-read is still a write. The stored page's own date and the
+                # dataset's window travel with it, so a cell backfilled today is
+                # not the one cell that cannot say when its source was true.
+                valid_time=raw.get("published_date", ""),
+                temporal=plan.get("temporal") or {})
 
             existing = record.get("fields", {})
             for name, cell in cells.items():

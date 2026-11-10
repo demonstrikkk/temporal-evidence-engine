@@ -95,6 +95,35 @@ export default function RunView({ runId, title, enriched }) {
   const records = runRecordTotal(live, enriched, polled, stream.run);
 
   /*
+   * Live source/record tallies.
+   *
+   * The runner publishes its counters on the terminal event, so
+   * `GET /runs/{id}` answers with the initial zeros for the whole run: every
+   * source stat read 0 while twenty pages had already been fetched, and the
+   * header showed "0 attempted" next to a feed full of fetches. The stream's
+   * running tallies are the only live numbers. While the run is live these
+   * counters only grow, so taking the larger of the two cannot go backwards;
+   * once it ends the stored figures are authoritative and may legitimately be
+   * *lower* than the stream's (dedupe merges records after extraction), which
+   * is why the max is not applied then.
+   */
+  const pick = (counterValue, streamValue) => {
+    const n = Number(counterValue);
+    const s = Number(streamValue) || 0;
+    return isTerminal ? (Number.isFinite(n) ? n : s) : Math.max(Number.isFinite(n) ? n : 0, s);
+  };
+  const fetchedNow = pick(
+    c.fetched ?? (c.reused ? (c.successful ?? 0) - c.reused : c.successful),
+    stream.counts.sourcesFetched,
+  );
+  const attemptedNow = pick(
+    c.attempted,
+    stream.counts.sourcesFetched + stream.counts.sourcesFailed,
+  );
+  const failedNow = pick(c.failed, stream.counts.sourcesFailed);
+  const recordsNow = pick(records, stream.counts.extracted);
+
+  /*
    * The API assigns `status: "PLANNING"` when a run is created and only
    * rewrites it on a terminal event, so a run that is deep into discovery
    * still reports "Planning". The stage is the truthful signal, so the pill
@@ -206,8 +235,8 @@ export default function RunView({ runId, title, enriched }) {
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Stat
           label="Sources fetched"
-          value={<Counter value={c.fetched ?? (c.reused ? (c.successful ?? 0) - c.reused : c.successful) ?? stream.counts.sourcesFetched} />}
-          sub={`${num(c.attempted ?? stream.counts.sourcesDiscovered)} attempted`}
+          value={<Counter value={fetchedNow} />}
+          sub={`${num(attemptedNow)} attempted`}
         />
         <Stat
           label="Reused, not re-fetched"
@@ -221,10 +250,10 @@ export default function RunView({ runId, title, enriched }) {
         />
         <Stat
           label="Records"
-          value={<Counter value={records || stream.counts.extracted} />}
+          value={<Counter value={recordsNow} />}
           sub={
-            c.failed
-              ? `${num(c.failed)} fetch${c.failed === 1 ? '' : 'es'} failed`
+            failedNow
+              ? `${num(failedNow)} fetch${failedNow === 1 ? '' : 'es'} failed`
               : 'no fetches failed'
           }
         />
@@ -253,6 +282,39 @@ export default function RunView({ runId, title, enriched }) {
           }
         />
       </div>
+
+      {/* Temporal accounting, shown only when the run actually dated something.
+          It stays outside the evidence bar above: a verified quote from the
+          wrong year is still verified, and merging the two would make the
+          quality figure mean two different things. */}
+      {Number(c.cells_dated) || Number(c.temporal_unknown) ? (
+        <p className="text-[11px] leading-snug text-muted">
+          <span className="tnum text-ink-2">{num(c.cells_dated)}</span> extracted
+          value{Number(c.cells_dated) === 1 ? '' : 's'} carry their source&apos;s own date
+          {Number(c.temporal_within) ? (
+            <>
+              {' · '}
+              <span className="tnum text-ink-2">{num(c.temporal_within)}</span> inside the requested window
+            </>
+          ) : null}
+          {Number(c.temporal_before) + Number(c.temporal_after) ? (
+            <>
+              {' · '}
+              <span className="tnum text-warn">
+                {num(Number(c.temporal_before) + Number(c.temporal_after))}
+              </span>{' '}
+              outside it
+            </>
+          ) : null}
+          {Number(c.temporal_unknown) ? (
+            <>
+              {' · '}
+              <span className="tnum text-ink-2">{num(c.temporal_unknown)}</span> undated, which is unknown rather than wrong
+            </>
+          ) : null}
+          .
+        </p>
+      ) : null}
 
       {vsum?.total ? (
         <div className="surface p-3.5">

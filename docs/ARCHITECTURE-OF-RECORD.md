@@ -475,10 +475,13 @@ the dangerous one: a silent data loss that reports itself as an absence.
 - `POST /api/datasets/{id}/columns`, `/conflicts/resolve` and
   `/api/selectors/save` all write immediately, contradicting the contract's
   "no route applies a change without an explicit `apply` flag".
-- `GET /api/health` reports the *configured* adapter name; it issues no query, so
-  it cannot report reachability, as the contract claims. This is how a total DNS
-  failure to the database presented as a healthy API returning 503 on everything
-  else.
+- `GET /api/health` reports the *configured* adapter name **and** now pings it
+  (`SELECT 1`, bounded to five seconds) for an authorised caller, answering
+  `persistence.reachable`. Before that it issued no query, so a total DNS failure
+  to the database presented as a healthy API returning 503 on everything else.
+  The route still answers 200 with `status: "degraded"` rather than 503, because
+  a container health check that restarts on a database outage turns one failure
+  into a loop; the payload carries the truth.
 - `verify_field` accepts `required` and never reads it. Dropping a record for a
   missing required field is the runner's decision, not this function's, so the
   parameter is dead rather than wrong.

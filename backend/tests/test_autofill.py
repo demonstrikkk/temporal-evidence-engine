@@ -314,3 +314,44 @@ def test_the_runner_helper_hands_the_pass_the_repo(monkeypatch):
     assert seen["store"] is repo
     assert seen["dataset_id"] == "d1"
     assert out["cells_written"] == 1
+
+
+def test_a_gap_fill_that_outruns_the_run_budget_is_cut_and_says_so(monkeypatch):
+    """The search count bounded the pass, not the clock, so it could run for
+    half an hour after the dataset was already saved."""
+    from app.services import runner
+    events = []
+
+    async def _hang(**k):
+        await asyncio.sleep(30)
+        return {"cells_written": 99}
+
+    async def _emit(ev):
+        events.append(ev)
+
+    monkeypatch.setattr(runner.autofill_svc, "fill_open_gaps", _hang)
+    budget = runner._Budget(0.1)
+    out = asyncio.run(runner._autofill_within_budget(
+        _emit, "r1", _PLAN, object(), "d1", [{"record_id": "r0"}],
+        None, None, None, None, budget))
+    assert out["stopped"].startswith("runtime budget")
+    assert events and events[-1]["progress"] == 98
+    assert "unchanged" in events[-1]["message"]
+
+
+def test_a_spent_budget_does_not_start_the_pass_at_all(monkeypatch):
+    from app.services import runner
+    calls = []
+
+    async def _spy(**k):
+        calls.append(k)
+        return {}
+
+    monkeypatch.setattr(runner.autofill_svc, "fill_open_gaps", _spy)
+    budget = runner._Budget(0.1)
+    budget.started -= 1.0
+    out = asyncio.run(runner._autofill_within_budget(
+        None, "r1", _PLAN, object(), "d1", [{"record_id": "r0"}],
+        None, None, None, None, budget))
+    assert "already spent" in out["stopped"]
+    assert calls == []

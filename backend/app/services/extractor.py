@@ -69,8 +69,15 @@ def build_prompt(plan: dict, url: str, title: str, clean: str, part: str = "") -
         f"\"quote\": \"verbatim substring of the content below\", "
         f"\"source_url\": \"{url}\", "
         f"\"reference_id\": \"<n> citation marker when the quote comes from a "
-        f"cited span, else empty string\"}}]}}], \"coverage\": "
-        f"\"full\"|\"partial\"|\"none\"}}. No prose. No backticks. "
+        f"cited span, else empty string\"}}]}}], \"coverage\": \"full\"}}. "
+        # The shape above is the literal text a model copies. It used to say
+        # `"coverage": "full"|"partial"|"none"`, which is not JSON at all: a
+        # model that echoes the template emits three quoted strings joined by
+        # pipes. Groq's JSON mode validates the generation server-side and
+        # answered 400 `json_validate_failed`, which the classifier treated as
+        # fatal -- so long, quote-heavy pages killed the whole rung. The value
+        # is named once in the shape and the alternatives in prose.
+        f"coverage is exactly one of full, partial or none. No prose. No backticks. "
         f"Do not start the response with ```json. "
         f"Rules: extract ONLY values present in the content; "
         f"if you cannot find a value put \"NA\"; "
@@ -105,13 +112,20 @@ def media_block(page: dict, max_items: int = 30) -> str:
     return _mb(page, max_items)
 
 
-def split_chunks(clean: str, size: int = _CHUNK_CHARS,                 overlap: int = _CHUNK_OVERLAP,
-                 max_chunks: int = _MAX_CHUNKS) -> list[str]:
-    """Overlap-aware char chunks that prefer paragraph boundaries. Bounded."""
+def split_page(clean: str, size: int = _CHUNK_CHARS,
+               overlap: int = _CHUNK_OVERLAP,
+               max_chunks: int = _MAX_CHUNKS) -> tuple[list[str], int]:
+    """Overlap-aware char chunks that prefer paragraph boundaries, plus how
+    many characters of `clean` they actually cover.
+
+    See `chunk_plan` for why coverage is where the last chunk ends rather than
+    the sum of their lengths.
+    """
     text = clean or ""
     if len(text) <= size:
-        return [text] if text else []
+        return ([text] if text else []), (len(text) if text else 0)
     chunks: list[str] = []
+    covered = 0
     start = 0
     while start < len(text) and len(chunks) < max_chunks:
         end = min(start + size, len(text))
@@ -121,10 +135,63 @@ def split_chunks(clean: str, size: int = _CHUNK_CHARS,                 overlap: 
                 cut = text.rfind(" ", start + size - overlap, end)
             end = cut if cut > start else end
         chunks.append(text[start:end])
+        covered = max(covered, end)
         if end >= len(text):
             break
         start = max(end - overlap, start + 1)
-    return chunks
+    return chunks, covered
+
+
+def split_chunks(clean: str, size: int = _CHUNK_CHARS,                 overlap: int = _CHUNK_OVERLAP,
+                 max_chunks: int = _MAX_CHUNKS) -> list[str]:
+    """Overlap-aware char chunks that prefer paragraph boundaries. Bounded."""
+    return split_page(clean, size, overlap, max_chunks)[0]
+
+
+def chunk_plan(clean: str, limit: int) -> tuple[list[str], int]:
+    """The chunks a model will read, and how much of `clean` they cover.
+
+    Coverage is measured by where the chunks end, never by their lengths: chunks
+    overlap on purpose, so their lengths sum to more than the page. Measured
+    live, 22,321 summed characters over a 20,521-character page — which the
+    truncation audit read as "sent more than exists" and reported as an
+    undercount warning. Adding overlapping lengths is not a measure of coverage.
+    """
+    if len(clean) <= limit:
+        return [clean[:limit]], min(len(clean), limit)
+    pieces, covered = split_page(clean, max_chunks=_MAX_CHUNKS)
+    chunks = [c[:limit] for c in pieces]
+    # Only the tail chunk bounds coverage, so only its cut moves the end.
+    if pieces and len(pieces[-1]) > limit:
+        covered -= len(pieces[-1]) - limit
+    return chunks, covered
+
+
+def content_shortfall(clean: str, ev_stats: dict, limit: int,
+                      url: str = "") -> tuple[list[str], dict]:
+    """What the model will read, and what it will not, in a form worth logging.
+
+    `clean_truncated` is real data loss — it is the part carrying tables — and
+    it is the signal that the ceiling should be raised. `dom_truncated` is the
+    lower-priority filler being cut, which by construction is fine.
+    """
+    chunks, covered = chunk_plan(clean, limit)
+    clean_md = int(ev_stats.get("clean_md_chars") or 0)
+    total = max(len(clean), int(ev_stats.get("total_chars") or 0))
+    dropped = max(0, total - covered)
+    clean_truncated = max(0, clean_md - min(clean_md, total - dropped))
+    return chunks, {
+        "url": str(url or "")[:200],
+        "total_chars": total,
+        "clean_md_chars": clean_md,
+        "dom_chars": int(ev_stats.get("dom_chars") or 0),
+        "sent_chars": sum(len(c) for c in chunks),
+        "covered_chars": total - dropped,
+        "dropped_chars": dropped,
+        "clean_truncated": clean_truncated,
+        "dom_truncated": max(0, dropped - clean_truncated),
+        "chunks": len(chunks),
+    }
 
 
 def coerce_output(out: object, url: str) -> tuple[list[dict], str]:
@@ -328,6 +395,10 @@ def _record_shell(plan: dict, page: dict, source_text: str, cells: dict,
         "references": page.get("references", ""),
         "page_id": page.get("page_id", ""),
         "content_hash": page.get("content_hash", ""),
+        # The date the search result said this page was published. It travels
+        # with the record so the cell can carry a `valid_time` that is a fact
+        # about the source, not about when we happened to fetch it.
+        "published_date": page.get("published_date", ""),
         "ladder": ladder_svc.summarise(trace, filled),
     }
 
@@ -402,10 +473,15 @@ async def extract_page(plan: dict, page: dict, llm: object) -> tuple[list[dict],
     # match `Label: value` lines that a pretty-printed payload happens to contain.
     if raw_body:
         rungs.append(("json", jsonrung_svc.rung))
-    rungs.append(("labelled", labelled_svc.rung))
+    # Structured routes before the generic label reader. A page's own JSON-LD or
+    # checked-in selector schema is an explicit declaration; a `Label: value` line
+    # is a match by name. First writer wins, so the explicit declaration has to
+    # go first or a heading such as a page title could occupy the identity field
+    # and the structured answer would be refused.
     if dom_source:
         rungs.append(("selectors", ladder_svc.selectors_rung))
         rungs.append(("json_ld", ladder_svc.json_ld_rung))
+    rungs.append(("labelled", labelled_svc.rung))
 
     filled, trace = await asyncio.to_thread(
         _run_ladder_sync, fields_spec, rungs, ctx)
@@ -513,27 +589,10 @@ async def extract_page(plan: dict, page: dict, llm: object) -> tuple[list[dict],
     # ceiling is a guess that costs model calls and hits rate limits on free
     # providers to buy unknown signal.
     limit = settings.EXTRACT_MAX_CHARS
-    chunks = ([clean[:limit]] if len(clean) <= limit
-              else [c[:limit] for c in split_chunks(clean)][: _MAX_CHUNKS])
-    sent = sum(len(c) for c in chunks)
-    clean_md = int(ev_stats.get("clean_md_chars") or 0)
-    clean_in_window = min(clean_md, sent)
-    shortfall = {
-        "url": str(page.get("url") or "")[:200],
-        "total_chars": int(ev_stats.get("total_chars") or len(clean)),
-        "clean_md_chars": clean_md,
-        "dom_chars": int(ev_stats.get("dom_chars") or 0),
-        "sent_chars": sent,
-        "dropped_chars": max(0, int(ev_stats.get("total_chars") or len(clean)) - sent),
-        "clean_truncated": max(0, clean_md - clean_in_window),
-        "dom_truncated": max(0, int(ev_stats.get("dom_chars") or 0) - max(0, sent - clean_in_window)),
-        "chunks": len(chunks),
-    }
+    chunks, shortfall = content_shortfall(clean, ev_stats, limit,
+                                          str(page.get("url") or ""))
     if shortfall["dropped_chars"]:
         log.info("extract content truncated", extra={"data": shortfall})
-    elif shortfall["total_chars"] > limit:
-        # Defensive: the branches above should make this unreachable.
-        log.warning("extract window undercounted", extra={"data": shortfall})
 
     provider = "llm"
     batches: list[list[dict]] = []
@@ -640,6 +699,15 @@ async def extract_page(plan: dict, page: dict, llm: object) -> tuple[list[dict],
         r["references"] = page.get("references", "")
         r["page_id"] = page.get("page_id", "")
         r["content_hash"] = page.get("content_hash", "")
+        # The date the source published its content, carried on every record
+        # shape. `_record_shell` sets it for the deterministic rungs, and this
+        # loop set every other field the validator needs except this one — so a
+        # model-extracted record reached `wrap_record` with no date and every
+        # cell from a dated article was stamped `valid_time: ""` / `unknown`.
+        # Measured live: a page whose text says "September 26, 2025" produced
+        # three undated cells. Extraction and date travel together or the
+        # temporal check has nothing to check.
+        r["published_date"] = page.get("published_date", "")
         # The model only ever saw the fields the cheaper rungs could not answer,
         # so this is the ladder's manifest: what it avoided, and what it paid for.
         r["ladder"] = {"fields_filled": len(filled), "model_avoided": len(filled),

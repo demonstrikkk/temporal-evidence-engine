@@ -117,9 +117,13 @@ export function asField(pf) {
       status: pf.verification_status ?? null,
       source: pf.source ?? null,
       normalized: pf.normalized ?? null,
+      // The source's own publication date, and whether it fell inside the
+      // window the request asked for. Advisory: neither changes `status`.
+      validTime: pf.valid_time ?? '',
+      temporalCheck: pf.temporal_check ?? null,
     };
   }
-  return { value: pf, status: null, source: null, normalized: null };
+  return { value: pf, status: null, source: null, normalized: null, validTime: '', temporalCheck: null };
 }
 
 /** How much of a chain is actually present, so a rail can stop where it ends. */

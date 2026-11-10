@@ -136,6 +136,23 @@ def _candidates(node: dict, field: str) -> list[str]:
     return out
 
 
+def extract_from(docs: list[dict], field: str) -> tuple[str, str]:
+    """`extract` against already-parsed documents.
+
+    The ladder asks about several fields on one page. Parsing the same
+    `<script type="application/ld+json">` blocks per field meant every field paid
+    the regex scan and the `json.loads` again — the whole page's structured data
+    decoded once per column, on a route that runs for every page of every run.
+    Callers that ask more than once should parse with `documents` and use this.
+    """
+    for node in docs:
+        for prop in _candidates(node, field):
+            text = _as_text(node.get(prop))
+            if text:
+                return text, prop
+    return "", ""
+
+
 def extract(html: str, field: str) -> tuple[str, str]:
     """The first declared object that states `field`. Returns (value, property).
 
@@ -146,32 +163,52 @@ def extract(html: str, field: str) -> tuple[str, str]:
     authority, and it is why the value still passes the field's own type check
     downstream.
     """
-    for node in documents(html):
-        for prop in _candidates(node, field):
-            text = _as_text(node.get(prop))
-            if text:
-                return text, prop
-    return "", ""
+    return extract_from(documents(html), field)
 
 
-def extract_all(html: str) -> dict[str, str]:
-    """Every hinted field the first declared object states, as a flat mapping."""
-    node = None
-    for candidate in documents(html):
-        node = candidate
-        break
-    if not node:
-        return {}
-    out: dict[str, str] = {}
-    for field in _PROPERTY_HINTS:
-        for prop in _candidates(node, field):
-            text = _as_text(node.get(prop))
-            if text:
-                out[field] = text
-                break
-    return out
+#: `@type` values that describe the site around the content rather than the
+#: content. `Organization` is handled separately: it is furniture only when it
+#: carries nothing that makes it the subject.
+_PAGE_LEVEL_TYPES = frozenset({
+    "website", "webpage", "newsmediaorganization", "blog",
+    "collectionpage", "itemlist", "searchresultspage",
+})
+
+#: Properties that make an `Organization` the subject of the page rather than
+#: its publisher. A company's own About page carries at least one.
+_SUBJECT_MARKERS = ("subOrganization", "hasCredential", "address", "identifier",
+                    "legalName", "founder", "numberOfEmployees")
 
 
-def present(html: str) -> bool:
-    """Whether the page publishes any JSON-LD at all. Cheap gate for the rung."""
-    return bool(_blocks(html or ""))
+def _norm_text(text: object) -> str:
+    return " ".join(str(text or "").lower().split()).strip(" |-–—:·")
+
+
+def site_entity_names(docs: list[dict]) -> set[str]:
+    """Names of entities that describe the page rather than its content.
+
+    `WebSite`, `NewsMediaOrganization`, `Blog`, `WebPage` and a bare
+    `Organization` with neither `subOrganization` nor credentials are page
+    furniture. An `Organization` that is clearly the subject — one carrying its
+    own `hasCredential`, an address, or an identifier — is left alone, so a
+    company page that publishes its own Organization still works.
+
+    Takes parsed documents so the caller that already parsed the page does not
+    decode it a second time.
+    """
+    site: set[str] = set()
+    for node in docs:
+        raw_type = node.get("@type") or node.get("type") or ""
+        types = raw_type if isinstance(raw_type, list) else [raw_type]
+        names = {str(t).lower() for t in types if t}
+        text = node.get("name")
+        if isinstance(text, dict):
+            text = text.get("@value") or text.get("name")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if names & _PAGE_LEVEL_TYPES:
+            site.add(_norm_text(text))
+        elif "organization" in names and not any(
+                node.get(k) for k in _SUBJECT_MARKERS):
+            site.add(_norm_text(text))
+    return site

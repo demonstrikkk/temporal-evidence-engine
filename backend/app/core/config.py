@@ -22,7 +22,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _ENV_FILE = next(
     (p / ".env" for p in Path(__file__).resolve().parents
      if (p / ".env").is_file()),
-    None,
+    # No file is a valid configuration: keys may come from the process
+    # environment. The path is still absolute, so a `Settings()` built from any
+    # working directory reads the same place.
+    Path(__file__).resolve().parents[3] / ".env",
 )
 
 
@@ -70,8 +73,18 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_PLAN_MODEL: str = "gemini-2.5-flash"
     GEMINI_EXTRACT_MODEL: str = "gemini-2.5-flash"
+    # A configured key is not a working rung. On this host every Gemini call
+    # hung to the 60s ceiling and the chain paid that timeout per page before
+    # reporting a failure. Turning the rung off is a configuration decision,
+    # so it is a setting rather than a comment; `structured_generate` and the
+    # health payload both read it.
+    GEMINI_ENABLED: bool = True
     GROQ_API_KEY: str = ""
     GROQ_FALLBACK_MODEL: str = "openai/gpt-oss-20b"
+    # Tokens per minute the Groq key may spend. Free tier = 8,000; the client
+    # paces itself to this once the API answers a 429, instead of firing every
+    # page concurrently and failing the ones that arrive second.
+    GROQ_TPM_LIMIT: int = Field(default=8_000, ge=1_000, le=2_000_000)
     # Primary: local OpenCode server (OpenAI-compatible). Serve it with e.g.
     #   OPENCODE_SERVER_PASSWORD=... opencode serve --port 4096
     # then set the same password here. Server down => transient => Groq/Gemini
@@ -92,6 +105,35 @@ class Settings(BaseSettings):
     OPENCODE_TIMEOUT_S: int = Field(default=240, ge=30, le=1200)
     LLM_TIMEOUT_S: int = Field(default=60, ge=5, le=300)
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5)
+
+    # --- PS05: Temporal Evidence Engine -----------------------------------
+    # The verifier does not own any provider credential. It speaks to a
+    # Bifrost gateway, which owns routing, fallback, budgets and logging.
+    BIFROST_BASE_URL: str = "http://127.0.0.1:8080"
+    BIFROST_VIRTUAL_KEY: str = ""
+    BIFROST_MODEL_EXTRACTOR: str = "groq/openai/gpt-oss-20b"
+    BIFROST_MODEL_JUDGE: str = "groq/openai/gpt-oss-20b"
+    BIFROST_MODEL_REWRITER: str = "groq/openai/gpt-oss-20b"
+    BIFROST_TIMEOUT_S: int = Field(default=60, ge=5, le=300)
+    BIFROST_MAX_RETRIES: int = Field(default=2, ge=0, le=5)
+    BIFROST_BUDGET_USD: float = Field(default=5.0, ge=0)
+
+    TAVILY_API_KEY: str = ""
+    TAVILY_BASE_URL: str = "https://api.tavily.com"
+    TAVILY_MAX_RESULTS: int = Field(default=5, ge=1, le=20)
+    TAVILY_MAX_URLS_PER_CLAIM: int = Field(default=4, ge=1, le=10)
+    TAVILY_ALLOW_CRAWLER_FALLBACK: bool = True
+    TAVILY_TIMEOUT_S: int = Field(default=45, ge=5, le=180)
+
+    #: Stamped on every verdict, event and report so a result can be
+    #: reproduced after the rules move.
+    RULE_VERSION: str = "tev-1.0.0"
+    CLAIM_MAX_PER_ANSWER: int = Field(default=40, ge=1, le=200)
+    RESEARCH_MAX_QUERIES_PER_CLAIM: int = Field(default=3, ge=1, le=6)
+    #: read-write | read-only (snapshot/demo) | off
+    CACHE_MODE: Literal["read-write", "read-only", "off"] = "read-write"
+    #: Local JSON store is the default only when no DATABASE_URL is present.
+    TEV_LOCAL_DIR: str = ".tev"
 
     # --- OpenCode Zen: one key, the whole model gateway --------------------
     # Zen serves OpenAI/Anthropic/Google-shaped REST under /zen/v1. Free-tier

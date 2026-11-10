@@ -35,6 +35,7 @@ import { num } from '../../lib/format.js';
 const GLYPH = {
   overview: '◉',
   records: '▦',
+  casefiles: '§',
   fields: '⌗',
   buckets: '⊞',
   sources: '◌',
@@ -48,6 +49,7 @@ const GLYPH = {
 export const RAIL_ITEMS = [
   { value: 'overview', label: 'Overview', title: 'What this dataset turned out to hold' },
   { value: 'records', label: 'Records', title: 'The ledger — every stored row' },
+  { value: 'casefiles', label: 'Case files', title: 'Judgments read as cases, not as cells' },
   { value: 'fields', label: 'Fields', title: 'Every field, its shape and its trust' },
   { value: 'buckets', label: 'Buckets', title: 'Derived views over stored cells' },
   { value: 'review', label: 'Review', title: 'Values the pipeline could not settle' },

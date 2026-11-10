@@ -75,6 +75,7 @@ export function useVerifyRun(runId) {
 
   useEffect(() => {
     if (!runId) return undefined;
+    let closed = false;
     const controller = new AbortController();
 
     (async () => {

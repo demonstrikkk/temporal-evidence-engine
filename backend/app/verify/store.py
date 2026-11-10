@@ -19,15 +19,18 @@ Invariants this layer owns:
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
-from app.core.config import settings
+from app.core.config import REPO_ROOT, settings
+from app.core.logging import log
 
 #: Collections the local store persists. Order matters only for readability.
 COLLECTIONS = (
@@ -121,10 +124,15 @@ class LocalStore:
     adapter = "local"
 
     def __init__(self, directory: str | None = None) -> None:
-        self._dir = Path(directory or settings.TEV_LOCAL_DIR)
+        target = Path(directory or settings.TEV_LOCAL_DIR)
+        # Anchor a relative setting at the repo root, not the process cwd: the
+        # API was run once from `backend/` and once from the root, producing two
+        # stores whose runs each looked missing from the other.
+        self._dir = target if target.is_absolute() else REPO_ROOT / target
         self._dir.mkdir(parents=True, exist_ok=True)
         self._path = self._dir / "state.json"
         self._lock = threading.RLock()
+        self._save_counter = itertools.count(1)
         self._data: dict[str, list[dict]] = {c: [] for c in COLLECTIONS}
         if self._path.is_file():
             try:
@@ -139,10 +147,45 @@ class LocalStore:
 
     # -- plumbing ---------------------------------------------------------
     def _save(self) -> None:
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._data, default=str, ensure_ascii=False),
-                       encoding="utf-8")
-        os.replace(tmp, self._path)
+        """Persist the in-memory state, tolerating a Windows file lock.
+
+        `os.replace` onto `state.json` fails with `WinError 5` whenever another
+        handle has the destination open — a virus scanner, an editor, a backup
+        agent, or an earlier reader. That is not a corruption and it is not the
+        caller's fault, but a single failed replace used to bubble out of
+        `update_claim` and turn into `extraction_failed` on a claim whose
+        extraction had worked perfectly. A transient lock was being reported as
+        a model failure.
+
+        The retry loop is bounded and each attempt writes its own temp file, so
+        two writers cannot collide on one `.tmp` name either. If every attempt
+        fails the in-memory state is still coherent and the next successful save
+        persists it; the failure is logged at error level rather than swallowed,
+        because a dev store that cannot write is something an operator needs to
+        know about.
+        """
+        payload = json.dumps(self._data, default=str, ensure_ascii=False)
+        last: OSError | None = None
+        for attempt in range(6):
+            tmp = self._dir / (f"state.{os.getpid()}."
+                               f"{next(self._save_counter)}.tmp")
+            try:
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, self._path)
+                return
+            except OSError as exc:  # noqa: PERF203 — retries are the point
+                last = exc
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                time.sleep(0.02 * (2 ** attempt))
+        log.error("local store could not persist state",
+                  extra={"data": {"path": str(self._path),
+                                  "error": str(last)[:300]}})
 
     def _insert(self, collection: str, row: dict) -> dict:
         with self._lock:

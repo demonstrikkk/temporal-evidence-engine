@@ -113,6 +113,7 @@ def propose(client: BifrostClient, *, claim: ClaimDraft, content: str,
 
     receipt = {"provider": result.provider, "model": result.model,
                "request_id": result.request_id, "status": result.status,
+               "created_at": result.created_at,
                "input_tokens": result.input_tokens,
                "output_tokens": result.output_tokens,
                "cost_usd": result.cost_usd, "latency_ms": result.latency_ms,

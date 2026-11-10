@@ -169,7 +169,95 @@ def test_a_replayed_extraction_is_labelled_in_the_event_rail(
     snapshots = [e for e in events if e["event_type"] == "model.snapshot"]
     assert snapshots, "a replayed model call must say so"
     assert snapshots[0]["payload"]["stage"] == "extract_claims"
+    assert snapshots[0]["payload"]["created_at"], \
+        "a replay must say when the answer it replayed was recorded"
     assert events[-1]["payload"]["counters"]["replays"] == 1
+
+
+def test_a_replayed_proposal_carries_the_time_it_was_recorded(
+        store, make_gateway, make_tavily, claim_payload):
+    """The rail must distinguish a replayed answer from an undated one."""
+    run = _start(store)
+    gw = make_gateway(
+        claims=[claim_payload()], status="snapshot",
+        responses={"https://acme.test/pricing": {
+            "relationship": "supports",
+            "quote": "Acme Pro costs $99 per month",
+            "candidate_value": "", "reasoning": ""}})
+    tv = make_tavily(pages={
+        "https://acme.test/pricing":
+            "Acme pricing. Acme Pro costs $99 per month, billed monthly."})
+
+    Verifier(store, run.run_id, bifrost=gw, tavily=tv).execute()
+
+    events = store.list_events(run.run_id)
+    proposals = [e["payload"] for e in events
+                 if e["event_type"] == "model.snapshot"
+                 and e["payload"].get("stage") == "propose_relationship"]
+    assert proposals, "the proposal replay must appear in the rail"
+    assert all(row.get("created_at") for row in proposals), proposals
+    assert all(row.get("provider") and row.get("model") for row in proposals), proposals
+
+
+def test_a_passage_about_another_plan_does_not_refute_this_one(
+        store, make_gateway, make_tavily, claim_payload):
+    """One model mistake used to outweigh four agreeing sources.
+
+    Live, `Business costs $24 monthly` settled as a contradiction of `Notion
+    Plus costs $10 per member per month`: the value gate saw $24 in the quote and
+    never asked which plan the quote was about. The claim is supported by its own
+    sources, and the mislabelled passage is recorded as unsettled evidence
+    rather than silently dropped.
+    """
+    run = _start(store)
+    gw = make_gateway(
+        claims=[claim_payload()],
+        responses={
+            "https://acme.test/pricing": {
+                "relationship": "supports",
+                "quote": "Acme Pro costs $99 per month",
+                "candidate_value": "", "reasoning": "same price"},
+            "https://acme.test/plans": {
+                "relationship": "contradicts",
+                "quote": "Acme Business costs $249 per month",
+                "candidate_value": "$249/month",
+                "reasoning": "a different plan's price"},
+        })
+    tv = make_tavily(pages={
+        "https://acme.test/pricing":
+            "Acme pricing. Acme Pro costs $99 per month, billed monthly.",
+        "https://acme.test/plans":
+            "Acme plans. Acme Business costs $249 per month.",
+    })
+
+    Verifier(store, run.run_id, bifrost=gw, tavily=tv).execute()
+
+    claim = store.list_claims(run.run_id)[0]
+    assert claim["status"] == "supported", claim["reason_code"]
+    rows = store.list_evidence(claim["id"])
+    settled = {row["link"]["relationship_proposed"]: row["link"]["settlement_status"]
+               for row in rows}
+    assert settled == {"supports": "settled", "contradicts": "not_settled"}
+    skipped = _events(store, run.run_id, "evidence.settled")
+    refusal = [e for e in skipped if not e["payload"]["settled"]][0]
+    assert "subject" in refusal["payload"]["reason"], refusal["payload"]["reason"]
+
+
+def test_first_party_credibility_is_read_from_the_domain_label():
+    """R7 needs to know which sources are first-party. It never could before.
+
+    `_credibility` stripped every non-alphanumeric character from the host
+    before splitting on the dot, so `acme.example` became `acmeexample`, the
+    `"." in host` branch was unreachable, and no subject ever matched its own
+    domain. The rule existed, had a direct unit test, and could not fire.
+    """
+    from app.verify.orchestrator import _credibility
+
+    assert _credibility("acme.example", "Acme Pro") == "primary"
+    assert _credibility("www.acme.com", "Acme") == "primary"
+    assert _credibility("techcrunch.com", "Acme Pro") == "secondary"
+    assert _credibility("notacme.example", "Acme Pro") == "secondary"
+    assert _credibility("", "Acme Pro") == "secondary"
 
 
 def test_a_model_outage_ends_the_run_as_failed_not_as_a_verdict(store, make_gateway,

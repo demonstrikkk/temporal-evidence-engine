@@ -19,7 +19,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from app.bifrost.client import BifrostClient, BifrostError
-from app.core.config import settings
+from app.core.config import RULE_VERSION, settings
 from app.core.logging import log
 from app.research.planner import plan_queries
 from app.research.sources import (canonicalize_url, domain_of, save_revision,
@@ -83,12 +83,20 @@ def _credibility(domain: str, subject: str) -> str:
     for the same claim. This is a naming heuristic, not a reputation database,
     and it only ever changes which rule resolves a conflict — never whether a
     quote counts.
+
+    The label has to be read before the dots are stripped. An earlier version
+    removed every non-alphanumeric character first, so `acme.example` became
+    `acmeexample`, the `"." in host` branch was dead, and R7 could never fire:
+    a rule that existed, was tested directly, and was unreachable from the
+    product.
     """
     name = re.sub(r"[^a-z0-9]", "", (subject or "").lower())
-    host = re.sub(r"[^a-z0-9]", "", (domain or "").lower())
-    if not name or not host:
+    host = (domain or "").lower().split(":", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    label = re.sub(r"[^a-z0-9]", "", host.split(".")[0]) if host else ""
+    if not name or not label:
         return "secondary"
-    label = host.split(".")[0] if "." in host else host
     if len(label) >= 3 and (name.startswith(label) or label.startswith(name[:12])):
         return "primary"
     return "secondary"
@@ -133,7 +141,7 @@ def create_run(store: VerifyStore, payload: AnswerIn) -> RunCreated:
     })
     store.create_run({
         "id": run_id, "answer_id": answer_id, "status": "queued",
-        "stage": "queued", "rule_version": settings.RULE_VERSION,
+        "stage": "queued", "rule_version": RULE_VERSION,
         "cache_mode": settings.CACHE_MODE, "started_at": iso(stamp),
     })
     return RunCreated(run_id=run_id, answer_id=answer_id)
@@ -200,7 +208,7 @@ class Verifier:
         generated_at = parse_iso(answer.get("generated_at"))
         self.emit("run.started", {
             "run_id": self.run_id, "answer_id": run["answer_id"],
-            "rule_version": settings.RULE_VERSION,
+            "rule_version": RULE_VERSION,
             "cache_mode": settings.CACHE_MODE,
             "generated_at": iso(generated_at),
             "gateway": self.bifrost.base_url,
@@ -407,8 +415,15 @@ class Verifier:
                                claim_id=claim_id)
             if proposal.model_call.get("status") == "snapshot":
                 self.counters["replays"] += 1
-                self.emit("model.snapshot", {"claim_id": claim_id,
-                                             "stage": "propose_relationship"})
+                # The rail must be able to say *when* this answer came from. A
+                # replay labelled only "snapshot" tells a reader the run is not
+                # live, but not that the evidence behind it is a day old.
+                self.emit("model.snapshot", {
+                    "claim_id": claim_id, "stage": "propose_relationship",
+                    "created_at": proposal.model_call.get("created_at"),
+                    "provider": proposal.model_call.get("provider"),
+                    "model": proposal.model_call.get("model"),
+                    "request_id": proposal.model_call.get("request_id")})
             if proposal.error.startswith("model_failed"):
                 self.counters["failed_calls"] += 1
                 self.emit("model.failed", {"claim_id": claim_id,
@@ -433,7 +448,8 @@ class Verifier:
                     settlement = settle_assertion(
                         subject=draft.subject, predicate=draft.predicate,
                         value_raw=proposal.candidate_value_raw,
-                        quote=proposal.quote, source_text=content)
+                        quote=proposal.quote, source_text=content,
+                        must_name_subject=True)
                 else:
                     # Contradiction by explicit negation: settle the negation
                     # itself, so the contradiction is still evidence-backed.
@@ -443,7 +459,7 @@ class Verifier:
                         settlement = settle_assertion(
                             subject=draft.subject, predicate=draft.predicate,
                             value_raw=cue, quote=proposal.quote,
-                            source_text=content)
+                            source_text=content, must_name_subject=True)
                     else:
                         settlement = None
 
@@ -524,7 +540,7 @@ class Verifier:
             "id": new_id(), "claim_id": claim_id, "run_id": self.run_id,
             "previous_status": claim_row.get("status") or "pending",
             "new_status": status, "reason_code": decision.reason.value,
-            "rule_version": settings.RULE_VERSION, "decided_at": iso(stamp),
+            "rule_version": RULE_VERSION, "decided_at": iso(stamp),
         })
         self.store.add_assertion({
             "id": new_id(), "claim_id": claim_id, "value_raw": draft.object_raw,
@@ -556,7 +572,7 @@ class Verifier:
             "contradicting": list(decision.contradicting),
             "replacement_evidence_id": decision.replacement_id,
             "freshness_index": freshness_index(draft.volatility_class, stamp),
-            "rule_version": settings.RULE_VERSION,
+            "rule_version": RULE_VERSION,
         })
 
     def _settle_empty(self, claim_row: dict, draft: ClaimDraft,
@@ -575,7 +591,7 @@ class Verifier:
             "run_id": self.run_id, "status": status,
             "counters": dict(self.counters),
             "failures": self.failures[:50],
-            "rule_version": settings.RULE_VERSION,
+            "rule_version": RULE_VERSION,
             "completed_at": iso(stamp),
         }
         # The terminal event carries the reason the run ended. Without it a

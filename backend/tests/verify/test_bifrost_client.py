@@ -160,6 +160,54 @@ def test_a_read_only_run_refuses_to_invent_a_call(tmp_path, monkeypatch):
     assert _Http.seen == []
 
 
+def test_a_rate_limit_is_waited_out_for_as_long_as_it_asks(tmp_path, monkeypatch):
+    """A 429 states its own window; retrying inside it burns the retries.
+
+    The first live gold run lost a whole case because the retries fired within
+    the same exhausted minute. `Retry-After` is honoured up to a cap, so a run
+    waits out a token window but never hangs on a provider that asks for an hour.
+    """
+
+    class _Limited:
+        status_code = 429
+        text = '{"error": {"message": "rate limit"}}'
+
+        def __init__(self, asked: str) -> None:
+            self.headers = httpx.Headers({"retry-after": asked})
+
+        def json(self) -> dict:  # pragma: no cover — never reached on a 429
+            return {}
+
+    class _Sequence:
+        queue: list = []
+
+        def __init__(self, *_, **__) -> None:
+            pass
+
+        def __enter__(self) -> "_Sequence":
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+        def post(self, url: str, *, json: dict, headers: dict):
+            return _Sequence.queue.pop(0)
+
+    slept: list[float] = []
+    monkeypatch.setattr(client_mod.httpx, "Client", _Sequence)
+    monkeypatch.setattr(client_mod.time, "sleep", lambda seconds: slept.append(seconds))
+
+    _Sequence.queue = [_Limited("3"), _Response()]
+    client = _client(tmp_path, "off")
+    assert client.complete(PROMPT, stage=STAGE, model=REQUESTED).status == "live"
+    assert slept == [3.0], slept
+
+    _Sequence.queue = [_Limited("3600"), _Response()]
+    slept.clear()
+    assert client.complete(PROMPT, stage=STAGE, model=REQUESTED).status == "live"
+    assert slept == [float(client.retry_after_cap)], slept
+
+
 def test_the_request_carries_both_authentication_headers(tmp_path, monkeypatch):
     """Bifrost only reads a key without the `sk-bf-` prefix from `x-bf-vk`."""
     monkeypatch.setattr(client_mod.httpx, "Client", _Http)

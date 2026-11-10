@@ -76,6 +76,31 @@ def test_normalize_shape_is_stable_for_the_ui():
     assert money["per_unit"] == "seat"
 
 
+def test_a_per_unit_price_parses_in_the_order_people_write_it():
+    """"per member per month" is two qualifiers, not an unparseable tail.
+
+    It used to fail because the tail was split on the literal word `per`, so the
+    value stayed a string. A string claim value cannot use the currency/period
+    scope checks, which is the whole reason `changed` is trustworthy for prices.
+    """
+    money = normalize_value("$10 per member per month")
+    assert money["type"] == "money", money
+    assert money["amount"] == 10.0
+    assert money["period"] == "month"
+    assert money["per_unit"] == "member"
+
+    # The same fact, written three ways.
+    for variant in ("$10 per member/month", "10 USD per member per month",
+                    "$10/member/month"):
+        assert compare("$10 per member per month", variant).equivalent, variant
+
+
+def test_a_billing_note_does_not_overwrite_the_price_period():
+    money = normalize_value("$10 per member per month (billed annually)")
+    assert money["period"] == "month", money
+    assert money["per_unit"] == "member"
+
+
 def test_unparseable_values_fall_back_to_text_not_to_an_error():
     assert normalize_value("Acme Corp")["type"] == "string"
     assert compare("Acme Corp", "acme  corp.").equivalent

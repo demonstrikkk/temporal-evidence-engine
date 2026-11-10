@@ -24,7 +24,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.services import validator
-from app.verify.value_normalizer import CompareResult, compare, normalize_value
+from app.verify.value_normalizer import (CURRENCY_MARKS, PERIOD_MARKS,
+                                         UNIT_MARKS, compare, mentions,
+                                         normalize_value)
 
 
 @dataclass(frozen=True)
@@ -51,17 +53,28 @@ def synthetic_cell(subject: str, predicate: str, value_raw: Any) -> dict[str, An
     }
 
 
-_CURRENCY_MARKS = {
-    "USD": ("$", "us$", "usd"), "EUR": ("€", "eur"),
-    "GBP": ("£", "gbp"), "INR": ("₹", "inr"),
+#: Words that describe a plan or a page rather than the thing being claimed. A
+#: subject is anchored by its last *distinctive* word, because "Notion Plus" and
+#: "Notion Business" are the same brand and different facts.
+_GENERIC_SUBJECT_WORDS = {
+    "the", "a", "an", "of", "and", "for", "to", "in", "on", "at", "with",
+    "plan", "plans", "tier", "tiers", "price", "pricing", "cost", "costs",
+    "subscription", "subscriptions", "service", "services", "product",
+    "products", "platform", "app", "apps", "software", "tool", "tools",
+    "company", "companies", "team", "teams", "edition", "editions", "level",
 }
-_PERIOD_MARKS = {
-    "month": ("month", "monthly", "/mo", "per mo", "mo."),
-    "year": ("year", "annual", "yearly", "/yr", "per year"),
-    "week": ("week", "weekly", "/wk"),
-    "day": ("day", "daily", "/day"),
+
+#: Same word, different register. Only aliases that a reader would accept as
+#: naming the same thing; no speculative synonyms.
+_QUALIFIER_ALIASES = {
+    "pro": ("pro", "professional"),
+    "plus": ("plus",),
+    "enterprise": ("enterprise", "enterprises"),
+    "business": ("business",),
+    "free": ("free",),
+    "student": ("student", "students"),
+    "teacher": ("teacher", "teachers"),
 }
-_UNIT_MARKS = {"seat": ("seat",), "user": ("user",), "employee": ("employee",)}
 
 
 def _amount_marks(amount: float) -> list[str]:
@@ -72,6 +85,67 @@ def _amount_marks(amount: float) -> list[str]:
     else:
         marks.add(f"{amount:.2f}")
     return [m.replace(",", "") for m in marks]
+
+
+def _states_amount(amount: float, text: str) -> bool:
+    """The quote states this number, not a longer one that contains its digits."""
+    return mentions(text.replace(",", ""), _amount_marks(amount))
+
+
+def _is_statement(quote: str) -> tuple[bool, str]:
+    """Is this a sentence a reader could check, or just a fragment?
+
+    A page's footnote marker is a perfectly locatable string: `[2013]` exists in
+    the stored text at an exact offset, and `settle` will happily verify it. It
+    is not evidence. A live run produced exactly that — `[2013]` was returned as
+    the quote for a contradiction of "Notion was founded in 2013", the number in
+    the marker matched the claim's value, and a citation index became a
+    refutation of a true fact.
+
+    So the gate refuses anything without enough words to be a statement. This is
+    a floor, not an entailment check: three words can still be wrong, but a
+    bracket, a bare number, a date, or a heading fragment cannot be right.
+    """
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]+", quote or "")
+    if len(words) >= 3:
+        return True, ""
+    return False, "the quote is not a statement about the claim"
+
+
+def _subject_forms(subject: str) -> tuple[str, ...]:
+    words = re.findall(r"[a-z0-9]+", (subject or "").casefold())
+    distinctive = [w for w in words if len(w) >= 2 and w not in _GENERIC_SUBJECT_WORDS]
+    if not distinctive:
+        return ()
+    qualifier = distinctive[-1]
+    return _QUALIFIER_ALIASES.get(qualifier, (qualifier, qualifier + "s"))
+
+
+def subject_named(quote: str, subject: str) -> tuple[bool, str]:
+    """Does the passage name the part of the subject that makes it this fact?
+
+    A contradiction asserts that a claim is false, so it has to be about the
+    same thing. The model's own proposal is not enough: in a live run, "Business
+    costs $24 monthly" was proposed — and settled — as a refutation of "Notion
+    Plus costs $10 per member per month". The value check passed because $24 is
+    in the quote; the subject was never checked, so a statement about a
+    *different plan* became a contradiction of a claim four sources supported.
+
+    The qualifier is required rather than the brand, because a passage may drop
+    the brand ("The Plus plan costs $10...") on a page that is entirely about it,
+    while dropping the qualifier is exactly what makes the sentence about a
+    different fact. Matching is on word boundaries: `pro` must not be satisfied
+    by `product`.
+    """
+    forms = _subject_forms(subject)
+    if not forms:
+        return True, ""
+    text = (quote or "").casefold()
+    for form in forms:
+        if re.search(rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])", text):
+            return True, ""
+    return False, (f"the quote does not mention the claim's subject "
+                   f"({forms[0]})")
 
 
 def evidence_speaks_to(value_raw: Any, quote: str) -> tuple[bool, str]:
@@ -89,35 +163,37 @@ def evidence_speaks_to(value_raw: Any, quote: str) -> tuple[bool, str]:
     """
     if not quote:
         return False, "no quote"
+    statement, why = _is_statement(quote)
+    if not statement:
+        return False, why
     text = quote.casefold()
-    flat = text.replace(",", "")
     value = normalize_value(value_raw)
     kind = value.get("type")
 
     if kind == "money":
-        if not any(mark in flat for mark in _amount_marks(float(value["amount"]))):
+        if not _states_amount(float(value["amount"]), text):
             return False, "the quote does not contain the stated amount"
-        marks = _CURRENCY_MARKS.get(str(value.get("currency")), ())
-        if marks and not any(mark in text for mark in marks):
+        marks = CURRENCY_MARKS.get(str(value.get("currency")), ())
+        if marks and not mentions(text, marks):
             return False, "the quote does not contain the stated currency"
         if value.get("period"):
-            if not any(mark in text for mark in _PERIOD_MARKS.get(str(value["period"]), ())):
+            if not mentions(text, PERIOD_MARKS.get(str(value["period"]), ())):
                 return False, "the quote does not state the same billing period"
         if value.get("per_unit"):
-            if not any(mark in text for mark in _UNIT_MARKS.get(str(value["per_unit"]), ())):
+            if not mentions(text, UNIT_MARKS.get(str(value["per_unit"]), ())):
                 return False, "the quote does not state the same per-unit basis"
         return True, ""
 
     if kind in {"number", "percent", "duration"}:
-        if not any(mark in flat for mark in _amount_marks(float(value["amount"]))):
+        if not _states_amount(float(value["amount"]), text):
             return False, "the quote does not contain the stated amount"
         return True, ""
 
     if kind == "quantity":
-        if not any(mark in flat for mark in _amount_marks(float(value["amount"]))):
+        if not _states_amount(float(value["amount"]), text):
             return False, "the quote does not contain the stated amount"
         unit = str(value.get("unit") or "")
-        if unit and unit not in text:
+        if unit and not mentions(text, (unit, unit + "s")):
             return False, "the quote does not state the same unit"
         return True, ""
 
@@ -141,14 +217,25 @@ def evidence_speaks_to(value_raw: Any, quote: str) -> tuple[bool, str]:
 
 
 def settle_assertion(*, subject: str, predicate: str, value_raw: Any,
-                     quote: str, source_text: str) -> Settlement:
-    """Did this passage establish this value, at a locatable position?"""
+                     quote: str, source_text: str,
+                     must_name_subject: bool = False) -> Settlement:
+    """Did this passage establish this value, at a locatable position?
+
+    `must_name_subject` is set by the caller for a proposal that *contradicts*:
+    refuting a claim requires naming the same subject, which a support does not
+    (a supporting sentence may say "it costs $10" in a paragraph that already
+    named the subject). See `subject_named` for the defect this prevents.
+    """
     if not quote or not source_text:
         return Settlement(False, None, None,
                           "no quote to settle against the stored source text", "")
     speaks, why = evidence_speaks_to(value_raw, quote)
     if not speaks:
         return Settlement(False, None, None, why, "")
+    if must_name_subject:
+        named, why = subject_named(quote, subject)
+        if not named:
+            return Settlement(False, None, None, why, "")
     cell = synthetic_cell(subject, predicate, value_raw)
     settled = validator.settle(cell, status="verified", quote=quote,
                                source_text=source_text,

@@ -64,7 +64,7 @@ export const REASON = {
   temporal_ambiguity: 'event dates unknown or conflicting',
   conflicting_evidence: 'sources disagree',
   missing_event_date: 'event date missing',
-  scope_mismatch: 'the replacement differs in scope',
+  scope_mismatch: 'values differ in scope (currency, period, per unit)',
   extraction_failed: 'extraction failed',
   generation_time_unknown: 'generation time unknown',
   no_claims: 'no checkable claims',
@@ -154,7 +154,8 @@ const EVENT_COPY = {
     p.settled ? `${p.relationship} settled` : `${p.relationship} not settled${p.reason ? ` — ${p.reason}` : ''}`],
   'evidence.skipped': ['Evidence skipped', (p) => p.reason || ''],
   'model.failed': ['Model call failed', (p) => `${p.stage || 'model'}${p.error ? ` — ${p.error}` : ''}`],
-  'model.snapshot': ['Snapshot replay', (p) => p.stage || ''],
+  'model.snapshot': ['Snapshot replay', (p) =>
+    `${p.stage || ''}${p.created_at ? ` · recorded ${shortDate(p.created_at)}` : ''}`],
   'run.failure': ['Stage reported a failure', (p) => `${p.stage || ''}${p.message ? ` — ${p.message}` : ''}`],
   'run.completed': ['Run completed', (p) => `${p.counters?.claims ?? 0} claims`],
   'run.failed': ['Run failed', (p) => p.error?.message || p.error?.code || 'no reason recorded'],

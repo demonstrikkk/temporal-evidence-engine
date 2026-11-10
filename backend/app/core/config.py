@@ -28,6 +28,21 @@ _ENV_FILE = next(
     Path(__file__).resolve().parents[3] / ".env",
 )
 
+#: Absolute repo root. Relative runtime paths (`TEV_LOCAL_DIR`) are anchored
+#: here so starting the API from `backend/` and from the repo root address the
+#: same store instead of creating two divergent `state.json` files.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: Stamped on every verdict, event and report so a result can be reproduced
+#: after the rules move.
+#:
+#: Deliberately not a `Settings` field. It was one, and `.env` pinned
+#: `tev-1.0.0`, so the code said `1.1.0` while every running verdict was stamped
+#: `1.0.0` - a label that can be changed without changing the rules is not a
+#: rule version. Bumping this constant is a code change, reviewed with the rule
+#: change it describes.
+RULE_VERSION = "tev-1.1.0"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -116,6 +131,10 @@ class Settings(BaseSettings):
     BIFROST_MODEL_REWRITER: str = "groq/openai/gpt-oss-20b"
     BIFROST_TIMEOUT_S: int = Field(default=60, ge=5, le=300)
     BIFROST_MAX_RETRIES: int = Field(default=2, ge=0, le=5)
+    #: Longest a rate limit's own `Retry-After` may make the client wait. A
+    #: per-minute token window is worth waiting out; a provider asking for an
+    #: hour is not, and the run should fail rather than hold a worker open.
+    BIFROST_RETRY_AFTER_CAP_S: int = Field(default=20, ge=0, le=120)
     BIFROST_BUDGET_USD: float = Field(default=5.0, ge=0)
 
     TAVILY_API_KEY: str = ""
@@ -125,9 +144,6 @@ class Settings(BaseSettings):
     TAVILY_ALLOW_CRAWLER_FALLBACK: bool = True
     TAVILY_TIMEOUT_S: int = Field(default=45, ge=5, le=180)
 
-    #: Stamped on every verdict, event and report so a result can be
-    #: reproduced after the rules move.
-    RULE_VERSION: str = "tev-1.0.0"
     CLAIM_MAX_PER_ANSWER: int = Field(default=40, ge=1, le=200)
     RESEARCH_MAX_QUERIES_PER_CLAIM: int = Field(default=3, ge=1, le=6)
     #: read-write | read-only (snapshot/demo) | off

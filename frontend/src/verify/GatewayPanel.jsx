@@ -157,6 +157,12 @@ export default function GatewayPanel({ gateway }) {
             </table>
           </div>
         </>
+      ) : gateway?.replays ? (
+        <Empty title={`${gateway.replays} model result${gateway.replays === 1 ? '' : 's'} replayed`}>
+          Nothing was spent: every model answer in this run came from the recorded
+          cache, and each replay is stamped with the time it was originally
+          obtained. The result is a snapshot, not a live call.
+        </Empty>
       ) : (
         <Empty title="No model calls recorded">
           This run has not asked the gateway for anything yet. A run that settles

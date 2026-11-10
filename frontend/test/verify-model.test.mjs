@@ -154,7 +154,9 @@ test('known events are narrated and unknown ones fall back to their type', () =>
 
 test('a missing reason code reads as a sentence, not as an empty string', () => {
   assert.equal(reasonLabel(null), 'no reason code');
-  assert.equal(reasonLabel('scope_mismatch'), 'the replacement differs in scope');
+  // Scope is currency, period or per-unit basis — not only a replacement value.
+  assert.equal(reasonLabel('scope_mismatch'),
+    'values differ in scope (currency, period, per unit)');
   assert.equal(reasonLabel('brand_new_code'), 'brand new code');
 });
 

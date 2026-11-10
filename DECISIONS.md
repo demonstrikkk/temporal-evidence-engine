@@ -152,3 +152,154 @@ Regression protection: `tests/verify/test_bifrost_client.py` (cache off still
 records; read-write replays under the requested key and reports the resolved
 model; read-only replays and refuses to invent a call), plus two pipeline tests
 for the terminal event and the replayed-extraction label.
+
+## D-013 - The second live run: six defects between "settled" and "true" (2026-11-10)
+
+The first run against real providers (Groq through Bifrost, Tavily for discovery;
+run `e9a7b9e4-2014-4681-9093-d972eb28d7bd`) returned four verdicts. Two were
+wrong, one crashed a claim, and the wrongness was never in the layer the unit
+tests covered: `settle` did exactly what it was told with passages that were not
+evidence. Each defect below is reproduced by a test that fails on the old code.
+
+1. **A citation marker became a refutation.** The model returned `[2013]` as the
+   quote that *contradicted* "Notion was founded in 2013". It located in the
+   stored text at an exact offset, and its number matched the claim's value, so
+   `settle` verified it: a footnote index outweighed two supporting sources.
+   `settlement._is_statement` now refuses a quote with fewer than three words.
+   That is a floor, not an entailment check, but a bracket, a bare number, a date
+   or a heading cannot be a sentence about anything.
+   Test: `test_a_citation_marker_is_not_a_statement`,
+   `test_a_citation_marker_is_refused_for_being_a_fragment_not_a_wrong_subject`.
+
+2. **A different plan's price refuted this plan's price.** "Business costs $24
+   monthly" was proposed — and settled — as a contradiction of "Notion Plus costs
+   $10 per member per month", because the value gate checks the amount, currency,
+   period and unit and never checks *what the sentence is about*. Contradictions
+   now name the claim's distinctive qualifier (`settlement.subject_named`,
+   `must_name_subject=True`). Supports are exempt on purpose: a supporting
+   sentence may say "it costs $10" in a paragraph that already named the subject.
+   Matching is on word boundaries, so `pro` is not satisfied by `product`.
+   Test: `test_a_contradiction_must_name_the_claim_subject`,
+   `test_subject_matching_is_on_words_not_substrings`,
+   `test_a_passage_about_another_plan_does_not_refute_this_one`.
+
+3. **`$10 per member per month` was not a money value.** The tail parser split on
+   the literal word `per`, so `member per month` was an unknown token, the parse
+   failed, and the value stayed a string. A string value cannot use the currency,
+   period or per-unit scope checks, which is the whole reason `changed` is
+   trustworthy for prices. The tail is now read as a list of qualifiers, with a
+   billing note (`billed annually`) not allowed to overwrite the price's period.
+   Test: `test_a_per_unit_price_parses_in_the_order_people_write_it`,
+   `test_a_billing_note_does_not_overwrite_the_price_period`.
+
+4. **Settlement kept its own copy of the vocabulary.** Even after (3), every
+   `per member` support was refused with "the quote does not state the same
+   per-unit basis", because `settlement` had a second, hand-written `_UNIT_MARKS`
+   table that had never heard of `member`. The mark tables are now derived from
+   the parser tables in `value_normalizer` (`CURRENCY_MARKS`, `PERIOD_MARKS`,
+   `UNIT_MARKS`), so adding a unit in one place cannot leave the other silently
+   refusing it. Amount matching is on word boundaries for the same reason the
+   subject match is: `10` is a substring of `$100`.
+   Test: `test_a_per_member_price_support_settles_from_a_live_shaped_quote`,
+   `test_a_longer_number_does_not_contain_the_stated_amount`.
+
+5. **Rule 7 could never fire, and a scope difference could still refute.** Two
+   independent defects in the same rule:
+   - `_credibility` stripped every non-alphanumeric character from the host
+     *before* splitting on the dot, so `acme.example` became `acmeexample`, the
+     `"." in host` branch was dead, and no subject ever matched its own domain.
+     R7 (`conflicting_evidence`) requires two primary sources, so it was
+     unreachable from the product while its unit test passed.
+   - A contradiction in a different currency, period or per-unit basis could
+     produce a decisive `contradicted` whenever no support was found, because
+     settlement only checks a proposal against its own quote. `decision.py` now
+     reroutes the no-support case to `unverifiable/scope_mismatch`. The
+     support-present case is left to R5, which already abstained.
+   Tests: `test_first_party_credibility_is_read_from_the_domain_label`,
+   `test_a_different_currency_does_not_refute_without_a_support`,
+   gold cases `conflicting-primary-sources`, `scope-mismatch-without-support`.
+
+6. **A transient Windows file lock was reported as a model failure.** A claim
+   whose extraction had worked perfectly ended as `unverifiable/extraction_failed`
+   because `os.replace` onto `state.json` hit `WinError 5` while another handle
+   held the file. `LocalStore._save` retries with a unique temp file per attempt,
+   `fsync`s, and logs rather than raises when every attempt fails: the in-memory
+   state is still coherent and the next save persists it. Separately,
+   `TEV_LOCAL_DIR` was resolved against the process working directory, so running
+   the API from `backend/` and from the repository root produced two stores that
+   each looked empty to the other. Relative paths are now anchored at the repo
+   root (`config.REPO_ROOT`).
+   Tests: `test_a_locked_state_file_is_retried_not_reported_as_a_claim_failure`,
+   `test_a_state_file_that_stays_locked_does_not_take_the_run_down`.
+
+**`RULE_VERSION` is now `tev-1.1.0`.** Two rules changed: a contradiction must
+name its subject (2), and a scope-incompatible contradiction with no support is
+`unverifiable/scope_mismatch` instead of `contradicted` (5). The R1-R7 table in
+BUILD-PLAN 8.1 is unchanged otherwise, and the gold set grew from 12 cases to 18
+so that both changes, the citation-marker refusal, the other-plan refusal and the
+per-seat money parse are regression gates rather than intentions.
+
+## D-014 - Two gates, because they answer two questions (2026-11-10)
+
+The first live gold run (`--live --limit 3`) failed at 33% status accuracy and
+the failures were not product defects: one run died on a Groq 429, and two cases
+used invented entities (`Acme`, `Zorbiax`) whose facts no real search engine can
+confirm. Using that file as a live gate would have taught us to lower a threshold
+until the news agreed with us.
+
+The two modes now measure different things and gate on different things:
+
+| | hermetic | live |
+|---|---|---|
+| asks | is the decision/settlement layer correct? | does the whole path work against the real web? |
+| data | `eval/gold.jsonl`, proposals from the file | `eval/gold_live.jsonl`, real entities, real Tavily + Bifrost |
+| gates on | 100% status accuracy, false supported = 0, false changed = 0, quotes 100%, event dates 100% | quotes 100%, false supported = 0, false changed = 0, every claim extracted, every run finished |
+| reports, does not gate | — | status accuracy, per-case outcomes |
+
+Live accuracy is a measurement of the world, not a regression signal: a gold
+case that says `Acme Pro costs $99` is a statement about 2026-11-10, and a gate
+that reddens when the price moves is measuring the news. What live mode does
+gate — a quote that does not resolve at its offsets, a claim the extractor
+dropped, a run that ends `failed`, or a false decisive verdict — is entirely
+inside the product, and stays at zero.
+
+`eval/gold_live.jsonl` therefore contains only cases whose answers are stable and
+widely republished, plus one product that does not exist (the honest abstention).
+Contradiction and change paths are gated hermetically, where the source text is
+fixed and the rule — not the web — is what is under test.
+
+Known constraint: Groq's free tier answers 429 on token-per-minute bursts and
+Bifrost falls back to local Ollama (`llama3.2:1b`), which works but takes 30-60 s
+per call. A live run of three cases is therefore minutes, not seconds, and the
+run records each fallback rather than hiding it.
+
+## D-015 - `RULE_VERSION` is code, not configuration (2026-11-10)
+
+D-013 changed two rules and bumped `RULE_VERSION` to `tev-1.1.0`. The running
+product kept stamping `tev-1.0.0` on every verdict and on `/api/verify/health` —
+not because the constant was wrong, but because `RULE_VERSION` was also a
+`Settings` field and this machine's `.env` still pinned `tev-1.0.0`. An env file
+silently outranked the code. The label a reviewer trusts to say *which rules
+produced this verdict* could be changed without changing a rule: a comment that
+can lie.
+
+The fix is structural:
+
+- `RULE_VERSION` is a module constant in `backend/app/core/config.py`; it is not
+  in `Settings`, `.env`, or `.env.example`.
+- migration `021_ps05_rule_version_no_default.sql` drops the column defaults, so
+  the database cannot invent a version either; the writer must supply one.
+- `backend/tests/verify/test_config_contract.py` fails if the value becomes a
+  setting again, if it stops looking like a version, or if any module reads it
+  from `settings`.
+
+Evidence after the change: `/api/verify/health` reports `tev-1.1.0`, and the
+read-only replay `a139882f-abe6-494f-bcf9-1219bfea5c75` stamps `claim.settled`
+events with `tev-1.1.0`. The earlier replay `72379f1c-…` still reports
+`tev-1.0.0`, because it was executed under those rules; historical stamps are
+evidence and are not rewritten.
+
+Known limit: migration 021 is written and reviewed but has not been applied to a
+Postgres database in this environment — no dedicated `DATABASE_URL` exists yet,
+and the shared DataGoblin database must not be migrated. The local store path is
+verified.

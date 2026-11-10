@@ -4,6 +4,7 @@ Precedence, exactly as specified (BUILD-PLAN §8.1):
 
   R1 no locatable evidence            -> unverifiable / no_source
   R2 evidence, nothing entails it     -> unverifiable / no_entailment
+  R2b only contradiction is out of scope -> unverifiable / scope_mismatch
   R3 contradiction, no support        -> contradicted
   R7 two primary sources disagree     -> unverifiable / conflicting_evidence
   R6 an event date involved is unknown-> contradicted / temporal_ambiguity
@@ -26,6 +27,33 @@ from typing import Any
 
 from app.verify.schemas import ClaimStatus, ReasonCode, Relationship
 from app.verify.settlement import SCOPE_REASONS, compare
+from app.verify.value_normalizer import normalize_value
+
+
+#: Value kinds that carry a scope: a currency, a period, a per-unit basis, a
+#: unit family, a version or a percent basis. Two of these can only refute each
+#: other when the comparison is meaningful on both sides.
+SCOPED_KINDS = {"money", "quantity", "number", "percent", "duration", "version"}
+
+
+def _scope_blocks(claim_value: Any, fact: EvidenceFact) -> bool:
+    """Does this "contradiction" compare a different kind of number?
+
+    A claim of `$99 per month` is not refuted by `€129 per month`, `$99 per
+    month per seat`, or `$99 per year`: those are different scopes, and the
+    honest reading is that the values are not comparable, not that the answer
+    was wrong. `settle` only checks the proposal against its own quote, so
+    without this gate a scope difference became a decisive `contradicted`
+    whenever no support happened to be found. Textual contradictions are left
+    alone: there is no scope to compare, and settlement already decided.
+    """
+    if fact.candidate_value is None:
+        return False
+    left = normalize_value(claim_value).get("type")
+    right = normalize_value(fact.candidate_value).get("type")
+    if left not in SCOPED_KINDS or right not in SCOPED_KINDS:
+        return False
+    return compare(claim_value, fact.candidate_value).reason in SCOPE_REASONS
 
 
 @dataclass(frozen=True)
@@ -87,6 +115,18 @@ def decide(*, claim_value: Any, answer_generated_at: datetime | None,
     counted = [f for f in locatable if f.settled]
     supports = [f for f in counted if f.relationship == Relationship.SUPPORTS]
     contradicts = [f for f in counted if f.relationship == Relationship.CONTRADICTS]
+
+    # A contradiction about a differently-scoped number is not a refutation.
+    # Only the no-support case is rerouted: when a support exists, the table
+    # below already decides between `supported` and `scope_mismatch`, and
+    # changing that path would be a second rule change in the same breath.
+    blocked = [f for f in contradicts if _scope_blocks(claim_value, f)]
+    if blocked and not supports and len(blocked) == len(contradicts):
+        return Decision(
+            ClaimStatus.UNVERIFIABLE, ReasonCode.SCOPE_MISMATCH, "R2b",
+            "A passage disagrees, but states its value in a different scope "
+            "(currency, period, or per-unit basis), so it cannot refute the claim.",
+            contradicting=_ids(blocked))
 
     # R2 — sources exist that discuss the claim, but none establishes it.
     if not supports and not contradicts:

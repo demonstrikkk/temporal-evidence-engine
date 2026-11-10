@@ -74,7 +74,11 @@ Everything is in `.env.example`. The important ones:
 | `TAVILY_API_KEY` | live research |
 | `PERSISTENCE` | `postgres` (default when `DATABASE_URL` set) or `local` |
 | `CACHE_MODE` | `read-write`, `read-only` (snapshot demo), `off` |
-| `RULE_VERSION` | stamped on every verdict and report |
+
+`RULE_VERSION` is not a setting. It is a constant in
+`backend/app/core/config.py`, stamped on every verdict and every report, and a
+test fails if anyone turns it back into an environment variable. A label that can
+be changed without changing a rule is not a rule version.
 
 ## Evaluation
 
@@ -82,16 +86,41 @@ Everything is in `.env.example`. The important ones:
 # hermetic: gold claims + gold evidence, no keys, no network, no database
 backend\.venv\Scripts\python.exe eval\run_eval.py
 
-# live: real Bifrost + Tavily, costs money and depends on what the web said
-backend\.venv\Scripts\python.exe eval\run_eval.py --live --limit 3
+# live: real Bifrost + Tavily against eval\gold_live.jsonl; costs credits
+backend\.venv\Scripts\python.exe eval\run_eval.py --live --cases eval\gold_live.jsonl --pause 20
 ```
 
-The gate is absolute: 100% status accuracy on the gold set, zero false
-`supported`, zero false `changed`, every stored quote resolving at its recorded
-offsets, and every stated event date correct. Hermetic mode holds extraction and
-relationship proposals constant so the measured part is the one that must never
-be probabilistic. Reports include abstention recall, over-abstention and
-recorded model cost. See `docs/BUILD-PLAN.md` §14.
+Hermetic mode holds extraction and relationship proposals constant so the
+measured part is the one that must never be probabilistic: quote location, the
+settlement gate, event-date reading, rule precedence and the final status. Its
+gate is exact — 100% status accuracy, zero false `supported`, zero false
+`changed`, every stored quote resolving at its recorded offsets, every stated
+event date correct.
+
+Live mode answers a different question — does the whole thing work against the
+real world? — so it gates only on what the product controls: every gold claim
+extracted, every run finished, every stored quote valid, and no claim marked
+`supported` or `changed` when the gold says otherwise. Live status accuracy is
+printed as evidence, not used as a switch, because the web is not deterministic.
+Reports include abstention recall, over-abstention and recorded model cost.
+See `docs/BUILD-PLAN.md` §14 and `DECISIONS.md` D-014.
+
+Latest recorded runs (2026-11-10):
+
+- hermetic: 18 cases / 19 claims, status accuracy 100%, 26 quotes valid, event
+  dates 8/8, `$0.0000` recorded model cost, **Gate: PASS**.
+- live: 3 cases / 3 claims against Groq + Tavily, status accuracy 100%, 11/11
+  quotes valid, zero false `supported`/`changed`, `$0.0000` (free tier),
+  **Gate: PASS**.
+- replay `a139882f-abe6-494f-bcf9-1219bfea5c75`: same four verdicts, 30
+  `model.snapshot` events, **0 gateway calls**, `$0`, and 12/12 quotes resolving
+  at their stored offsets.
+- replay `c0496df3-eba3-4baa-a4bb-135f5ad96055`: after the receipt fix, all
+  **30/30** replays carry the timestamp they were originally obtained, still
+  **0 gateway calls**, `$0`, 12/12 quotes resolving.
+- cache-off run `1f64a7f8-52de-400a-831d-294dd160a93c`: ended `partial` because
+  Groq rate-limited real calls; 8 audit rows (ok and error) and 0 replays were
+  still recorded. A failed call is never a verdict.
 
 ## Verifying the build
 

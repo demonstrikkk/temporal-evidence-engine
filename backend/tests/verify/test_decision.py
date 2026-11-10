@@ -38,6 +38,35 @@ def test_r2_an_unsettled_support_does_not_count():
     assert out.reason == ReasonCode.NO_ENTAILMENT
 
 
+def test_a_different_currency_does_not_refute_without_a_support():
+    """`€129/month` and `$99/month` are not comparable, so neither is refuted."""
+    out = run([fact(rel=Relationship.CONTRADICTS, event=date(2026, 9, 1),
+                    candidate="€129/month")])
+    assert (out.status, out.reason, out.rule) == (
+        ClaimStatus.UNVERIFIABLE, ReasonCode.SCOPE_MISMATCH, "R2b")
+
+
+def test_a_different_per_unit_basis_does_not_refute_without_a_support():
+    out = run([fact(rel=Relationship.CONTRADICTS, event=date(2026, 9, 1),
+                    candidate="$99/month per seat")])
+    assert out.reason == ReasonCode.SCOPE_MISMATCH
+
+
+def test_a_same_scope_different_amount_still_refutes():
+    out = run([fact(rel=Relationship.CONTRADICTS, event=date(2026, 9, 1),
+                    candidate="$129/month")])
+    assert (out.status, out.reason) == (ClaimStatus.CONTRADICTED,
+                                        ReasonCode.CONTRADICTED_BY_SOURCE)
+
+
+def test_a_textual_contradiction_has_no_scope_to_block():
+    """A settled sentence that refutes a sentence is not held to money rules."""
+    out = run([fact(rel=Relationship.CONTRADICTS, event=date(2026, 9, 1),
+                    candidate="included in the Business and Enterprise plans")],
+              value="included in all paid plans at no additional cost")
+    assert out.status == ClaimStatus.CONTRADICTED
+
+
 def test_r3_contradiction_without_support():
     out = run([fact(rel=Relationship.CONTRADICTS, event=date(2026, 9, 1),
                     candidate="$129/month")])

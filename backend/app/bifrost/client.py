@@ -109,6 +109,27 @@ def _int(value: Any) -> int:
         return 0
 
 
+def _retry_delay(exc: BifrostError, attempt: int, cap: float) -> float:
+    """How long to wait before retrying a transient gateway failure.
+
+    A rate limit states its own window in `Retry-After`. Retrying after 0.4 s
+    spends every retry inside the same exhausted minute and converts a temporary
+    refusal into a `run.failed`, which is what happened to the first live gold
+    run. The requested delay is honoured up to `cap`: a verifier may wait for a
+    provider, but it must not hang on one that asks for an hour.
+    """
+    delay = 0.4 * (2 ** attempt)
+    if exc.status == 429:
+        raw = (exc.detail or {}).get("retry_after")
+        try:
+            asked = float(str(raw))
+        except (TypeError, ValueError):
+            asked = 0.0
+        if asked > 0:
+            delay = max(delay, min(asked, cap))
+    return delay
+
+
 class BifrostClient:
     """OpenAI-compatible gateway client with a durable, labelled cache."""
 
@@ -124,6 +145,7 @@ class BifrostClient:
             else settings.BIFROST_VIRTUAL_KEY
         self.timeout = timeout or settings.BIFROST_TIMEOUT_S
         self.retries = settings.BIFROST_MAX_RETRIES if retries is None else retries
+        self.retry_after_cap = settings.BIFROST_RETRY_AFTER_CAP_S
         self.budget_usd = settings.BIFROST_BUDGET_USD if budget_usd is None \
             else budget_usd
         self.cache_mode = cache_mode or settings.CACHE_MODE
@@ -241,7 +263,7 @@ class BifrostClient:
                 last_error = exc
                 if not exc.retryable or attempt >= self.retries:
                     break
-                time.sleep(0.4 * (2 ** attempt))
+                time.sleep(_retry_delay(exc, attempt, self.retry_after_cap))
         assert last_error is not None
         self._record_failure(last_error, stage=stage, claim_id=claim_id,
                              digest=digest, model=model, latency_ms=int(

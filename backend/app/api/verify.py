@@ -17,7 +17,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from app.api.deps import correlation_id, require_api_key
 from app.bifrost.client import BifrostClient
-from app.core.config import settings
+from app.core.config import RULE_VERSION, settings
 from app.core.errors import not_found, validation
 from app.verify import orchestrator
 from app.verify.report import build_report
@@ -77,7 +77,7 @@ async def health() -> dict[str, Any]:
         "store": store.adapter,
         "gateway": gateway,
         "tavily": {"configured": bool(settings.TAVILY_API_KEY)},
-        "rule_version": settings.RULE_VERSION,
+        "rule_version": RULE_VERSION,
         "cache_mode": settings.CACHE_MODE,
         "search_depth": settings.TAVILY_SEARCH_DEPTH,
     }
@@ -118,7 +118,7 @@ async def create_verification(body: AnswerIn) -> dict[str, Any]:
     await asyncio.to_thread(orchestrator.launch, store, created.run_id)
     return {"run_id": created.run_id, "answer_id": created.answer_id,
             "status": "queued", "store": store.adapter,
-            "rule_version": settings.RULE_VERSION,
+            "rule_version": RULE_VERSION,
             "cache_mode": settings.CACHE_MODE}
 
 
@@ -152,6 +152,12 @@ async def get_run(run_id: str) -> dict[str, Any]:
     claims = await asyncio.to_thread(store.list_claims, run_id)
     gateway = await asyncio.to_thread(store.gateway_stats, run_id)
     calls = await asyncio.to_thread(store.list_model_calls, 25, run_id)
+    # A replay spends nothing and writes no call row, so the panel would show an
+    # empty table for a run whose model answers all came from `model_calls`.
+    # Count the replays from the rail instead of implying nothing happened.
+    events = await asyncio.to_thread(store.list_events, run_id)
+    replays = sum(1 for event in events
+                  if event.get("event_type") == "model.snapshot")
     counts: list[dict] = []
     for claim in claims:
         evidence = await asyncio.to_thread(store.list_evidence, str(claim["id"]))
@@ -176,7 +182,7 @@ async def get_run(run_id: str) -> dict[str, Any]:
         },
         "claims": counts,
         "counters": _counters(claims),
-        "gateway": {**gateway, "recent": calls},
+        "gateway": {**gateway, "recent": calls, "replays": replays},
     }
 
 

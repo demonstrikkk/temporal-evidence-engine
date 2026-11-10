@@ -35,13 +35,20 @@ _GLYPHS = {
 _PERIODS = {
     "month": "month", "mo": "month", "monthly": "month", "per month": "month",
     "year": "year", "yr": "year", "annual": "year", "yearly": "year",
+    "annum": "year", "p.a": "year", "pa": "year",
+    # A billing note is a period word too: "$10 per month (billed annually)"
+    # states a monthly price. Without the adverb the whole value failed to
+    # parse and fell back to string equality.
+    "annually": "year", "quarterly": "quarter",
     "week": "week", "wk": "week", "weekly": "week",
     "day": "day", "daily": "day",
 }
 
 _UNITS = {
     "seat": "seat", "seats": "seat", "user": "user", "users": "user",
-    "employee": "employee", "employees": "employee", "unit": "unit",
+    "member": "member", "members": "member", "employee": "employee",
+    "employees": "employee", "person": "person", "people": "person",
+    "unit": "unit", "units": "unit",
 }
 
 _DATA = {"b": 1, "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3,
@@ -51,6 +58,45 @@ _TIME = {"s": 1, "sec": 1, "second": 1, "min": 60, "minute": 60,
          "h": 3600, "hr": 3600, "hour": 3600, "day": 86400}
 
 _NUM = r"\d[\d,]*(?:\.\d+)?"
+
+
+def _marks(table: dict[str, str]) -> dict[str, tuple[str, ...]]:
+    """Invert a parser table into the surface forms a passage might contain.
+
+    Parsing a value and *detecting* one in a quote need the same vocabulary.
+    Keeping two hand-written copies is what let `member` be a valid per-unit for
+    parsing while settlement still refused every `per member` quote: the second
+    table had never heard of it. Deriving one from the other makes that class of
+    drift impossible.
+    """
+    out: dict[str, list[str]] = {}
+    for word, canonical in table.items():
+        out.setdefault(canonical, []).append(word)
+    return {key: tuple(dict.fromkeys(words)) for key, words in out.items()}
+
+
+#: `USD` -> `("$", "us$", "usd")`, `month` -> `("month", "mo", "monthly", ...)`.
+CURRENCY_MARKS: dict[str, tuple[str, ...]] = _marks(
+    {glyph.lower(): code for glyph, (code, _amb) in _GLYPHS.items()})
+PERIOD_MARKS: dict[str, tuple[str, ...]] = _marks(_PERIODS)
+UNIT_MARKS: dict[str, tuple[str, ...]] = _marks(_UNITS)
+
+
+def mentions(text: str, marks: tuple[str, ...] | list[str]) -> bool:
+    """Is any surface form present as a word, not as a substring of another?
+
+    Substring matching made `10` find `$100` and `mo` find `most`. The claim's
+    value must actually appear. A mark that begins or ends with a symbol (`$`,
+    `/mo`) is not bounded on that side, because the symbol *is* the boundary.
+    """
+    text = (text or "").casefold()
+    for mark in marks:
+        body = re.escape(mark)
+        left = r"(?<![a-z0-9])" if mark[:1].isalnum() else ""
+        right = r"(?![a-z0-9])" if mark[-1:].isalnum() else ""
+        if re.search(left + body + right, text):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -75,7 +121,17 @@ def _clean(text: str) -> str:
 
 
 def _money(text: str) -> dict[str, Any] | None:
-    """`$99/month`, `99 USD per month`, `$1,299 / year per seat`."""
+    """`$99/month`, `99 USD per month`, `$10 per member per month`.
+
+    The tail is a list of qualifiers, not a fixed shape: a price can be per
+    member, per month, or per member per month, and the order varies. An earlier
+    version split on the literal word `per`, which turned `member per month`
+    into an unknown token, failed the parse, and left the value as a string.
+    A string claim value cannot use the currency/period scope checks, so the one
+    comparison that matters most for pricing claims silently degraded to text
+    equality — and `$10 per member per month` then looked like a contradiction of
+    `$10 per member/month`.
+    """
     t = _clean(text).lower()
     currency = None
     ambiguous = False
@@ -84,35 +140,45 @@ def _money(text: str) -> dict[str, Any] | None:
             currency, ambiguous = code, amb
             t = t[len(glyph):].strip()
             break
-    m = re.match(rf"^({_NUM})\s*([a-z]{{3}})?\s*(?:/|per\s+)?\s*([a-z ]*)$", t)
+    m = re.match(rf"^({_NUM})\s*([a-z]{{3}})?\s*(.*)$", t)
     if not m:
         return None
-    amount = _amount(m.group(1))
+    amount_raw = m.group(1)
+    code = (m.group(2) or "").strip()
+    tail = (m.group(3) or "").strip()
+    if code in {"per", "each", "the", "and"}:
+        # The three-letter slot matched a connector, not a currency code.
+        tail, code = f"{code} {tail}".strip(), ""
+    amount = _amount(amount_raw)
     if amount is None:
         return None
-    if currency is None and m.group(2):
-        code = m.group(2).upper()
-        if code in {c for c, _ in _GLYPHS.values()}:
-            currency = code
-    period = per_unit = None
-    tail = (m.group(3) or "").strip()
-    if tail:
-        for word in re.split(r"\s*per\s+|/|\s+", tail):
-            word = word.strip()
-            if not word:
-                continue
-            if word in _PERIODS:
-                period = _PERIODS[word]
-            elif word in _UNITS:
-                per_unit = _UNITS[word]
-            else:
-                return None
+    if currency is None and code:
+        upper = code.upper()
+        if upper in {c for c, _ in _GLYPHS.values()}:
+            currency = upper
     if currency is None:
         return None
+
+    # `billed`/`charged`/`paid` carry no value: "billed annually" and "annually"
+    # state the same period.
+    words = [w for w in re.split(r"[^a-z]+", tail)
+             if w and w not in {"per", "each", "a", "an", "the", "and",
+                                "billed", "charged", "paid"}]
+    period = per_unit = None
+    for word in words:
+        # First mention wins: in "per member per month (billed annually)" the
+        # price is monthly and the annual note is about how it is billed, so
+        # letting the later word overwrite the period would invert the fact.
+        if word in _PERIODS and period is None:
+            period = _PERIODS[word]
+        elif word in _UNITS and per_unit is None:
+            per_unit = _UNITS[word]
+        elif word not in _PERIODS and word not in _UNITS:
+            return None
     return {"type": "money", "amount": amount, "currency": currency,
             "currency_ambiguous": ambiguous, "period": period,
-            "per_unit": per_unit, "precision": len(m.group(1).split(".")[-1])
-            if "." in m.group(1) else 0}
+            "per_unit": per_unit, "precision": len(amount_raw.split(".")[-1])
+            if "." in amount_raw else 0}
 
 
 def _percent(text: str) -> dict[str, Any] | None:

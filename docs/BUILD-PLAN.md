@@ -151,6 +151,7 @@ BIFROST_MODEL_JUDGE=groq/openai/gpt-oss-20b
 BIFROST_MODEL_REWRITER=groq/openai/gpt-oss-20b
 BIFROST_TIMEOUT_S=60
 BIFROST_MAX_RETRIES=2
+BIFROST_RETRY_AFTER_CAP_S=20     # honour Retry-After, but never hold a worker longer
 BIFROST_BUDGET_USD=5.00
 
 # --- Tavily: the ONLY research path -------------------------------------
@@ -161,7 +162,8 @@ TAVILY_MAX_URLS_PER_CLAIM=4
 TAVILY_ALLOW_CRAWLER_FALLBACK=true
 
 # --- Verifier ------------------------------------------------------------
-RULE_VERSION=tev-1.0.0
+# RULE_VERSION is a code constant (app/core/config.py), not a setting: a
+# label that an env file can change without changing the rules is noise.
 CLAIM_MAX_PER_ANSWER=40
 RESEARCH_MAX_QUERIES_PER_CLAIM=3
 EVENT_DATE_MODEL=bifrost-judge
@@ -268,7 +270,7 @@ CREATE TABLE IF NOT EXISTS verification_runs (
   answer_id uuid NOT NULL REFERENCES answers(id),
   status text NOT NULL DEFAULT 'queued',
   stage text NOT NULL DEFAULT 'queued',
-  rule_version text NOT NULL DEFAULT '',
+  rule_version text NOT NULL DEFAULT '',  -- 021 drops this default; the writer supplies the version
   cache_mode text NOT NULL DEFAULT 'read-write',
   started_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz NULL,
@@ -443,17 +445,21 @@ Notes:
 
 ---
 
-## 8. Verifier rules (freeze as `RULE_VERSION=tev-1.0.0`)
+## 8. Verifier rules (frozen as `RULE_VERSION=tev-1.1.0`; see D-013)
 
 ### 8.1 Decision precedence
 
 Inputs: only evidence rows where `relationship_settled != 'silent'` and, for
-`supports`/`contradicts`, `settlement_status = 'verified'`.
+`supports`/`contradicts`, `settlement_status = 'verified'`. A settled row also
+has to be a statement (three words minimum) and, for a contradiction, has to name
+the claim's own qualifier; both are enforced in `app/verify/settlement.py`
+(D-013).
 
 | # | Condition | Status | Reason |
 |---|---|---|---|
 | 1 | No evidence with a locatable quote | `unverifiable` | `no_source` |
 | 2 | Evidence exists; nothing settles as support; no valid contradiction | `unverifiable` | `no_entailment` |
+| 2b | The only contradiction states a different currency, period or per-unit basis (and no support exists) | `unverifiable` | `scope_mismatch` |
 | 3 | Valid contradiction refutes the claim; no support | `contradicted` | `contradicted_by_source` |
 | 4 | Support exists and any contradiction is older than the supporting evidence | `supported` | `supported_by_source` |
 | 5 | Support exists **and** a newer source settles a replacement value with `event_date > answer_generated_at` | `changed` | `value_changed_after_generation` |
@@ -760,14 +766,30 @@ Distribution: supported 25, changed 25, contradicted 20, unverifiable-no-source
 Domains: API/versions, pricing/plans, leadership, law/policy, statistics,
 stable historical controls. Hold out ~20% (fixed, untouched until the final run).
 
-**As built (2026-11-10): 12 cases / 13 claims, not 120.** The set is built
-case-by-case from the edge cases in §14.4 rather than padded to a count: every
-mandatory edge case is a case, and the gate is 100% status accuracy on those,
-with zero false `supported` and zero false `changed`. It is honest about what it
-is — a regression gate for the decision table, not yet a measurement of
-generalisation. The held-out split and the 80-claim floor are still open, and the
-number is not quoted anywhere else in this repository. Do not describe this as a
-benchmark until the set is big enough to be one.
+**As built (2026-11-10): 18 cases / 19 claims in `eval/gold.jsonl`, plus 3
+real-entity cases in `eval/gold_live.jsonl`.** The set is built case-by-case
+from the edge cases in §14.4 rather than padded to a count: every mandatory edge
+case is a case, and the hermetic gate is 100% status accuracy on those, with zero
+false `supported`, zero false `changed`, 100% quote validity and 100% event-date
+accuracy where the case states dates. It is honest about what it is — a
+regression gate for the decision table, not yet a measurement of generalisation.
+The held-out split and the 80-claim floor are still open, and the number is not
+quoted anywhere else in this repository. Do not describe this as a benchmark
+until the set is big enough to be one.
+
+The live set is deliberately small and names real, checkable entities (Notion's
+founding year, Python's creator, and one product that does not exist). It runs
+the full path — real Groq through Bifrost, real Tavily — and is gated on the
+things the product controls: every stored quote resolves, every claim is
+extracted, every run finishes, and no claim is called `supported` or `changed`
+against the gold. Live status accuracy is printed but not gated, because the
+gold describes the world at authoring time and a gate that fails when a price
+moves would be measuring the news (D-014).
+
+```powershell
+backend\.venv\Scripts\python.exe eval\run_eval.py                                  # hermetic gate
+backend\.venv\Scripts\python.exe eval\run_eval.py --live --cases eval\gold_live.jsonl
+```
 
 ### 14.2 Metrics, in priority order
 
@@ -791,6 +813,11 @@ benchmark until the set is big enough to be one.
 
 Run the baseline on a 40-claim subset if the token budget is tight; the full
 pipeline runs on all 120 from cache.
+
+**Status on 2026-11-10: not run.** The ablation needs a baseline verifier (one
+prompt, no settlement) and the gold set is still 19 claims, so an ablation
+number today would compare two things nobody should quote. It is sequenced after
+the held-out split, and until then this section describes intent, not results.
 
 ### 14.4 Mandatory edge cases (each a test)
 
@@ -917,7 +944,7 @@ fabricated verdict.
 capabilities and a task in this schedule? If not, cut it or log it in
 `DECISIONS.md`. Does any non-negotiable in §1 have a test? If not, it is not done.
 
-### State on 2026-11-10 (end of day 2)
+### State on 2026-11-10 (end of day 3)
 
 Built and exercised:
 
@@ -925,38 +952,70 @@ Built and exercised:
   value normalization, temporal fields, decision table, report builder,
   orchestrator with durable events. `backend/app/bifrost/client.py` is the only
   model interface; `backend/app/research/{tavily,sources,planner}.py` the only
-  research path. Migrations 014–019 create schema `tev`.
+  research path. Migrations 014–020 create schema `tev`; 021 removes the
+  rule-version column default.
 - `backend/app/api/verify.py` — create/list/get run, claim detail, events, SSE,
-  report (md/json), watchlist, health, and `/gateway`.
+  report (md/json), watchlist, health, and `/gateway`. A run detail now also
+  reports `gateway.replays`, counted from the rail, because a replayed run writes
+  no `model_calls` row and an empty table would look like a bug.
 - `frontend/src/verify/` — intake, run list, three-pane workspace, watchlist,
-  gateway panel, export.
-- `eval/run_eval.py` + `eval/gold.jsonl` — hermetic gate passing, `--live` path
-  written but not yet run against real providers.
+  gateway panel with a replay empty-state and the recorded date of each replay,
+  export.
+- `eval/run_eval.py` + `eval/gold.jsonl` + `eval/gold_live.jsonl` — two gates:
+  hermetic for the rules, live for the whole path (D-014).
 - `scripts/bifrost_up.ps1` + `bifrost/config.json` — the gateway starts without
   Docker, imports its config, and reports separately whether it is alive and
   whether the virtual key is accepted.
 
-Verified by command, not by memory: `pytest backend\tests\verify -q`,
-`pytest backend\tests -q`, `npm test`, `npm run build`, `eval\run_eval.py`
-(hermetic), and a real `POST /v1/chat/completions` through the running gateway.
+Six defects were found by running against real providers, and each has a test
+that fails on the old code (D-013): a citation marker cannot refute; a
+contradiction must name the claim's subject; `$10 per member per month` parses;
+settlement shares the parser's vocabulary tables; R7 is reachable and a
+scope-incompatible contradiction without support abstains; a transient Windows
+file lock is not a model failure. `RULE_VERSION` is `tev-1.1.0` and is a module
+constant, not an environment variable (D-015).
 
-A live end-to-end run was also made against a running API (`PERSISTENCE=local`,
-local Ollama as the model, no Tavily key) and it changed the code: the run
-returned `partial` with `claims.extracted` and a recorded `model_calls` row, then
-`search.failed` for every query and `unverifiable/no_source` per claim — and in
-doing so exposed three defects (D-012): a cache-off run recorded no model calls
-at all, the replay cache was keyed on the gateway's resolved model instead of the
-requested one, and a failed run announced itself as `run.partial` with no reason.
-All three are fixed, migration 020 adds `resolved_model`, and a second identical
-run now reports `model.snapshot` with `replays: 1` and spends nothing.
+Verified by command, not by memory:
 
-Not yet done, in order: a live end-to-end run with real Tavily + a hosted
-provider key; the held-out set and the three ablations (§14.3); the recorded demo
-(§15); public repository visibility and the submission form. The live run above
-used the 1B fallback model, which is honest about what it is: on the real
-extraction prompt it often cannot produce claims that are exact substrings of the
-answer, so it returns zero claims. The product handles that correctly
-(`run.partial`, `no_claims`, no verdicts) but a demo needs the hosted primary.
+| command | last output |
+|---|---|
+| `pytest backend\tests -q` | 2313 passed, 8 skipped |
+| `pytest backend\tests\verify -q` | 136 passed |
+| `npm test` | 33 tests in 3 suites, 0 failures |
+| `npm run build` | exit 0; 58 modules; `dist` JS 248.18 kB (78.21 kB gzip) |
+| `eval\run_eval.py` (hermetic) | 18 cases / 19 claims; status 100%; false supported 0; false changed 0; 26 quotes valid; event dates 8/8; `$0.0000`; **Gate: PASS** |
+| `eval\run_eval.py --live --cases eval\gold_live.jsonl --pause 20` | 3 cases / 3 claims; status accuracy 100%; 11/11 quotes valid; false supported 0; false changed 0; `$0.0000`; **Gate: PASS** |
+
+Live end-to-end evidence, both runs on the local API:
+
+- `1f64a7f8-52de-400a-831d-294dd160a93c`, `CACHE_MODE=off`: ended `partial`
+  after Groq rate-limited real calls. It still recorded 8 audit rows (`ok` and
+  `error`), 0 replays, and one honest `supported` verdict; a failed model call
+  never became a verdict.
+- `a139882f-abe6-494f-bcf9-1219bfea5c75`, `CACHE_MODE=read-only`: replayed the
+  Notion answer under the final rules. Same four verdicts (3 `supported`,
+  1 `contradicted`), 30 `model.snapshot` events, **0 gateway calls**, `$0`, and
+  12/12 quotes resolving at their stored offsets. The extraction receipt was the
+  one replay without its original timestamp; it now carries `created_at`, and
+  `test_a_replayed_extraction_is_labelled_in_the_event_rail` asserts it.
+  Re-running the same answer as `c0496df3-eba3-4baa-a4bb-135f5ad96055` replayed
+  **30/30** results with their original timestamps, 0 gateway calls, `$0`, and
+  12/12 quotes resolving: the fix is visible in the product, not only in a test.
+- `5037ddbd-21da-48d6-839a-57998f25830f`, `CACHE_MODE=read-write`, a fresh
+  answer the cache had never seen: the Eiffel Tower claim settled `supported`
+  from a stored quote; the Brazil-language claim abstained
+  `unverifiable/no_source` after 10 of the run's 13 model calls were rate-limited
+  and recorded as `model.failed`. The run ended `partial`, 1/1 stored quote
+  resolved, and the true claim was not called supported on evidence nobody read.
+
+Not yet done, in order: a dedicated `DATABASE_URL`, so the Postgres adapter and
+migration 021 can be exercised (the shared DataGoblin database is deliberately
+untouched); the held-out split and the three ablations (§14.3); a larger gold set
+(the current 18 hermetic + 3 live cases are a working gate, not the 105–120 in the
+plan); the recorded demo (§15). Live evaluation is paced with `--pause 20`
+because the Groq free tier answers 429 on bursts and Bifrost then falls back to
+the 1B local model at 30–60 s per call. The product records the fallback or the
+failure; it does not hide either.
 
 ---
 
@@ -975,18 +1034,27 @@ cd frontend; npm test; npm run build
 
 # evaluation gate (hermetic: gold claims + scripted evidence, no keys)
 backend\.venv\Scripts\python.exe eval\run_eval.py
+
+# live gate (real Bifrost + Tavily; paced for the Groq free tier)
+backend\.venv\Scripts\python.exe eval\run_eval.py --live --cases eval\gold_live.jsonl --pause 20
 ```
 
-`eval\run_eval.py` exits non-zero when any absolute gate fails: 100% status
-accuracy on the gold set, zero false `supported`, zero false `changed`, every
-quote resolving at its recorded offsets, every stated event date matching. The
-last hermetic run printed `Gate: PASS`. The number is whatever the command
+`eval\run_eval.py` (hermetic) exits non-zero when any absolute gate fails: 100%
+status accuracy on the gold set, zero false `supported`, zero false `changed`,
+every quote resolving at its recorded offsets, every stated event date matching.
+`--live` gates on what the product controls — quote validity, no false
+`supported`/`changed`, every claim extracted, every run finished — and prints
+status accuracy without gating it, because the web is not deterministic (D-014).
+Both modes printed `Gate: PASS` on 2026-11-10. The number is whatever the command
 prints; do not quote a count that a later run can change.
 
 Static guards to extend, not bypass:
 
 - `test_promotion_chokepoint.py` — `settle` stays the only promoter.
 - `test_event_contract.py` — every declared SSE event is emitted and vice versa.
+- `test_migrations.py` — every `ALTER COLUMN` names a column that a
+  `CREATE TABLE` actually created; migration 021 named the wrong tables once and
+  only PostgreSQL would have noticed.
 - New `test_no_direct_providers.py` — greps `app/verify`, `app/research`,
   `app/bifrost` for `groq`, `openai`, `gemini`, `anthropic` client imports and
   fails on any direct provider construction.

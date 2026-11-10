@@ -183,6 +183,10 @@ def extract_claims(client: BifrostClient, *, answer: str, original_prompt: str =
     receipt = {
         "provider": result.provider, "model": result.model,
         "request_id": result.request_id, "status": result.status,
+        # A replay says *what* it replayed; the receipt says when the answer was
+        # originally obtained, so the UI can show the date, not just the word
+        # "snapshot".
+        "created_at": result.created_at,
         "input_tokens": result.input_tokens, "output_tokens": result.output_tokens,
         "cost_usd": result.cost_usd, "latency_ms": result.latency_ms,
         "fallback_attempts": result.fallback_attempts,

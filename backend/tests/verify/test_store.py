@@ -105,3 +105,55 @@ def test_the_local_store_survives_a_restart(tmp_path):
     first.append_event("run", "run.started", {"kept": True})
     second = LocalStore(directory)
     assert second.list_events("run")[0]["payload"] == {"kept": True}
+
+
+def test_a_locked_state_file_is_retried_not_reported_as_a_claim_failure(
+        tmp_path, monkeypatch):
+    """Windows refuses `os.replace` while another handle holds the target.
+
+    That is a virus scanner, not a bug in the run, but the exception used to
+    escape `update_claim` and be caught by the orchestrator as
+    `extraction_failed` — a claim whose extraction had worked perfectly was
+    marked unverifiable for a transient file lock. The write is retried; the
+    claim keeps its real verdict.
+    """
+    import os as os_mod
+
+    from app.verify import store as store_mod
+
+    real_replace = os_mod.replace
+    attempts = {"count": 0}
+
+    def flaky_replace(src, dst, *args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] <= 2:
+            raise PermissionError(13, "Access is denied", str(dst))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(store_mod.os, "replace", flaky_replace)
+    store = LocalStore(str(tmp_path / "state"))
+    store.add_claim({"id": "c1", "run_id": "r", "ordinal": 0,
+                     "claim_text": "Acme Pro costs $99 per month"})
+
+    assert attempts["count"] == 3, "the write must be retried, not abandoned"
+    assert LocalStore(str(tmp_path / "state")).list_claims("r")[0]["id"] == "c1"
+
+
+def test_a_state_file_that_stays_locked_does_not_take_the_run_down(
+        tmp_path, monkeypatch):
+    """Persistent failure is logged, not raised: memory is still the truth."""
+    from app.verify import store as store_mod
+
+    def always_locked(*_args, **_kwargs):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(store_mod.os, "replace", always_locked)
+    store = LocalStore(str(tmp_path / "state"))
+    store.add_claim({"id": "c1", "run_id": "r", "ordinal": 0,
+                     "claim_text": "still here"})
+
+    assert store.list_claims("r")[0]["id"] == "c1"
+    # Nothing half-written is left behind under a stale temp name.
+    leftovers = [p.name for p in (tmp_path / "state").iterdir()
+                 if p.name.endswith(".tmp")]
+    assert leftovers == [], leftovers

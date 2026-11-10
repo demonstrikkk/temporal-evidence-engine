@@ -10,23 +10,31 @@ rule precedence, and the final status. It needs no keys, no network, no database
 and it is byte-for-byte reproducible.
 
 **Live** (`--live`) answers "does the whole thing work against the real world?".
-It calls the configured Bifrost gateway and Tavily. It costs money and its result
-depends on what the web said that morning, which is exactly why the hermetic
-mode exists as the regression gate.
+It calls the configured Bifrost gateway and Tavily against `eval/gold_live.jsonl`,
+whose cases name real, checkable entities. It costs money and its result depends
+on what the web said that morning, which is exactly why the hermetic mode exists
+as the regression gate.
 
 Metrics that fail the run:
 
-* `status_accuracy` below 100% — a gold case is a rule, not a trend;
-* any false `supported` — the most expensive error a verifier can make;
-* any false `changed` — a new article misread as a new fact;
-* quote validity below 100% — every stored quote must resolve at its offsets;
-* event-date accuracy below 100% where the gold case states dates.
+* hermetic: `status_accuracy` below 100% — a gold case is a rule, not a trend;
+* both modes: any false `supported` — the most expensive error a verifier can
+  make;
+* both modes: any false `changed` — a new article misread as a new fact;
+* both modes: quote validity below 100% — every stored quote must resolve at its
+  offsets;
+* both modes: a claim the extractor dropped, or a run that ended `failed`;
+* hermetic only: event-date accuracy below 100% where the gold case states dates.
+
+Live status accuracy is printed and is not a gate: the gold case describes the
+world at authoring time, and a gate that fails when a price moves would be
+measuring the news. What live mode does gate is everything the product controls.
 
 Run:
 
     python eval/run_eval.py
     python eval/run_eval.py --json
-    python eval/run_eval.py --live --limit 3
+    python eval/run_eval.py --live --cases eval/gold_live.jsonl
 """
 from __future__ import annotations
 
@@ -36,6 +44,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -97,8 +106,13 @@ class ScriptedGateway:
             payload = {"relationship": "silent", "quote": "",
                        "candidate_value": "", "reasoning": "no scripted proposal"}
             for proposal in self.proposals:
+                # The URL must end where it ends in the prompt: `/pricing` is a
+                # prefix of `/pricing-update`, and a naive substring match fed
+                # the support proposal to the *update* document, which then
+                # failed to locate a quote that was never in it.
                 if (proposal["claim_text"] == claim_text
-                        and proposal["url"] in prompt):
+                        and re.search(re.escape(proposal["url"]) + r"(?![\w.\-/])",
+                                      prompt)):
                     payload = {
                         "relationship": proposal["relationship"],
                         "quote": proposal["quote"],
@@ -152,6 +166,10 @@ class CaseResult:
     claims_total: int = 0
     rows: list[dict] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    #: Failures that are the product's fault whatever the web said: a claim the
+    #: extractor dropped, a run that ended `failed`, a stored quote that does not
+    #: resolve. Live accuracy is reported separately because the world changes.
+    structural: list[str] = field(default_factory=list)
     quote_total: int = 0
     quote_valid: int = 0
     event_total: int = 0
@@ -208,7 +226,9 @@ def run_hermetic_case(case: dict, base: Path) -> CaseResult:
         expected = gold.get("expect") or {}
         row = by_text.get(gold["claim_text"])
         if row is None:
-            result.failures.append(f"claim was not extracted: {gold['claim_text']!r}")
+            reason_text = f"claim was not extracted: {gold['claim_text']!r}"
+            result.failures.append(reason_text)
+            result.structural.append(reason_text)
             continue
         actual = str(row.get("status"))
         reason = row.get("reason_code")
@@ -239,9 +259,10 @@ def run_hermetic_case(case: dict, base: Path) -> CaseResult:
             if _quote_valid(store, item):
                 result.quote_valid += 1
             else:
-                result.failures.append(
-                    f"{gold['claim_text']!r}: a stored quote does not resolve "
-                    f"at its offsets")
+                reason_text = (f"{gold['claim_text']!r}: a stored quote does not "
+                               f"resolve at its offsets")
+                result.failures.append(reason_text)
+                result.structural.append(reason_text)
 
         if expected.get("event_dates"):
             result.event_total += 1
@@ -257,7 +278,9 @@ def run_hermetic_case(case: dict, base: Path) -> CaseResult:
     result.cost_usd = float((store.gateway_stats(created.run_id) or {})
                             .get("cost_usd") or 0.0)
     if result.run_status != "completed":
-        result.failures.append(f"run status was {result.run_status!r}, not 'completed'")
+        reason_text = f"run status was {result.run_status!r}, not 'completed'"
+        result.failures.append(reason_text)
+        result.structural.append(reason_text)
     return result
 
 
@@ -306,8 +329,10 @@ def run_live_case(case: dict, base: Path) -> CaseResult:
         expected = gold.get("expect") or {}
         row = mapping.get(index)
         if row is None:
-            result.failures.append(
-                f"claim was not extracted or not matched: {gold['claim_text']!r}")
+            reason_text = (f"claim was not extracted or not matched: "
+                           f"{gold['claim_text']!r}")
+            result.failures.append(reason_text)
+            result.structural.append(reason_text)
             continue
         actual = str(row.get("status"))
         reason = row.get("reason_code")
@@ -331,8 +356,10 @@ def run_live_case(case: dict, base: Path) -> CaseResult:
             if _quote_valid(store, item):
                 result.quote_valid += 1
             else:
-                result.failures.append(
-                    f"{gold['claim_text']!r}: a stored quote does not resolve")
+                reason_text = (f"{gold['claim_text']!r}: a stored quote does not "
+                               f"resolve")
+                result.failures.append(reason_text)
+                result.structural.append(reason_text)
         if expected.get("event_dates"):
             result.event_total += 1
             actual_dates = sorted(str(item["event_date"])
@@ -347,7 +374,9 @@ def run_live_case(case: dict, base: Path) -> CaseResult:
     result.cost_usd = float((store.gateway_stats(created.run_id) or {})
                             .get("cost_usd") or 0.0)
     if result.run_status not in {"completed", "partial"}:
-        result.failures.append(f"run status was {result.run_status!r}")
+        reason_text = f"run status was {result.run_status!r}"
+        result.failures.append(reason_text)
+        result.structural.append(reason_text)
     return result
 
 
@@ -355,7 +384,7 @@ def run_live_case(case: dict, base: Path) -> CaseResult:
 # aggregate
 # ---------------------------------------------------------------------------
 
-def summarise(results: list[CaseResult]) -> dict[str, Any]:
+def summarise(results: list[CaseResult], mode: str = "hermetic") -> dict[str, Any]:
     rows = [row for result in results for row in result.rows]
     total = len(rows)
     correct = sum(1 for row in rows if row["ok_status"])
@@ -390,16 +419,33 @@ def summarise(results: list[CaseResult]) -> dict[str, Any]:
         "event_checks": events,
         "event_accuracy": event_ok / events if events else 1.0,
         "cost_usd": round(sum(result.cost_usd for result in results), 6),
+        "structural_failures": sum(len(result.structural) for result in results),
         "failures": [f"{result.case_id}: {failure}"
                      for result in results for failure in result.failures],
     }
+    # Hermetic mode is the regression gate: the gold set is a rule table, so it
+    # must be exact. Live mode answers a different question. What the open web
+    # says this morning is not deterministic, so gating on agreement with a
+    # snapshot of it would gate on the news. Live mode gates on what the product
+    # controls: every claim is extracted, every run finishes, every stored quote
+    # resolves, and no claim is marked supported or changed when the gold says
+    # otherwise. Accuracy is printed either way; it is evidence, not a switch.
+    summary["gate_basis"] = (
+        "status accuracy, false supported/changed, quote validity, event dates"
+        if mode == "hermetic" else
+        "quote validity, no false supported/changed, every claim extracted and "
+        "every run finished"
+    )
     summary["gate"] = (
-        summary["status_accuracy"] >= 1.0
+        summary["quote_validity"] >= 1.0
         and summary["false_supported"] == 0
         and summary["false_changed"] == 0
-        and summary["quote_validity"] >= 1.0
-        and summary["event_accuracy"] >= 1.0
+        and summary["structural_failures"] == 0
     )
+    if mode == "hermetic":
+        summary["gate"] = (summary["gate"]
+                           and summary["status_accuracy"] >= 1.0
+                           and summary["event_accuracy"] >= 1.0)
     return summary
 
 
@@ -431,6 +477,7 @@ def _print_markdown(results: list[CaseResult], summary: dict[str, Any],
     print(f"- event-date accuracy: {summary['event_accuracy']:.1%} "
           f"({summary['event_checks']} checks)")
     print(f"- recorded model cost: ${summary['cost_usd']:.4f}")
+    print(f"- gate basis: {summary['gate_basis']}")
     print()
     if summary["failures"]:
         print("## Failures\n")
@@ -463,6 +510,9 @@ def main() -> int:
     parser.add_argument("--mode", choices=["hermetic", "live"], default="hermetic")
     parser.add_argument("--live", action="store_true", help="alias for --mode live")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--pause", type=float, default=0.0,
+                        help="seconds between live cases; paced for a free-tier "
+                             "token-per-minute limit")
     parser.add_argument("--json", action="store_true", help="print JSON instead of a table")
     args = parser.parse_args()
 
@@ -485,11 +535,15 @@ def main() -> int:
     base = Path(tempfile.mkdtemp(prefix="tev-eval-"))
     try:
         runner = run_hermetic_case if mode == "hermetic" else run_live_case
-        results = [runner(case, base) for case in cases]
+        results = []
+        for index, case in enumerate(cases):
+            if mode == "live" and index and args.pause > 0:
+                time.sleep(args.pause)
+            results.append(runner(case, base))
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
-    summary = summarise(results)
+    summary = summarise(results, mode)
     if args.json:
         print(json.dumps({
             "mode": mode,

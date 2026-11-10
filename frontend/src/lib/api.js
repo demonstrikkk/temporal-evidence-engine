@@ -468,6 +468,41 @@ export const api = {
     report: (id, o) => request(`/verify/runs/${encodeURIComponent(id)}/report`, o),
     watchlist: (o) => request('/verify/watchlist', o),
   },
+
+  /* --- conversational research ------------------------------------------ */
+  chat: {
+    conversations: (o) => request('/chat/conversations', o),
+    createConversation: (body, o) =>
+      request('/chat/conversations', { ...o, method: 'POST', body }),
+    conversation: (id, o) =>
+      request(`/chat/conversations/${encodeURIComponent(id)}`, o),
+    messages: (id, o) =>
+      request(`/chat/conversations/${encodeURIComponent(id)}/messages`, o),
+    postMessage: (id, body, o) =>
+      request(`/chat/conversations/${encodeURIComponent(id)}/messages`, {
+        ...o, method: 'POST', body,
+      }),
+    challenge: (convId, msgId, body, o) =>
+      request(
+        `/chat/conversations/${encodeURIComponent(convId)}/messages/${encodeURIComponent(msgId)}/challenge`,
+        { ...o, method: 'POST', body },
+      ),
+  },
+
+  /* --- governance & quota ---------------------------------------------- */
+  governance: {
+    quota: (o) => request('/governance/quota', o),
+    cacheMetrics: (o) => request('/cache/stats', o),
+    purgeCache: (body, o) =>
+      request('/cache/purge', { ...o, method: 'POST', body }),
+    setBudgetMode: (body, o) =>
+      request('/governance/budget-mode', { ...o, method: 'POST', body }),
+    invalidateConfig: (body, o) =>
+      request('/governance/cache/invalidate-config', {
+        ...o, method: 'POST', body,
+      }),
+    bifrostDiagnostic: (o) => request('/governance/bifrost/diagnostic', o),
+  },
 };
 
 /** Filename for an export, derived from the format the server actually used. */

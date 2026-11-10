@@ -221,3 +221,47 @@ def render_windows(content: str, query: str, *, max_chars: int = 6000) -> str:
         parts.append(f"[window {index} | chars {window['start']}-{window['end']}]\n"
                      f"{window['text']}")
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Existing-source discovery
+# ---------------------------------------------------------------------------
+
+def find_existing_revisions(store: VerifyStore, *,
+                            subject: str = "", predicate: str = "",
+                            value_scope: str = "", limit: int = 5) -> list[dict[str, Any]]:
+    """Find stored source revisions that may already cover this claim.
+
+    Used before spending Tavily credits: if we already extracted a page that
+    mentions the subject and predicate, reuse it instead of searching again.
+    Relevance is heuristic (subject/predicate terms present in title, domain,
+    or stored content) — final settlement is still done by the evidence gate.
+    """
+    terms = [t for t in (subject or "").split() + (predicate or "").split()
+             if len(t) >= 3]
+    if not terms:
+        return []
+
+    # Scan all sources/revisions for relevance. Keep it bounded.
+    candidates: list[dict[str, Any]] = []
+    for source in store.list_sources(limit=50):
+        haystack = f"{source.get('title', '')} {source.get('canonical_url', '')} {source.get('domain', '')}".lower()
+        if not any(t.lower() in haystack for t in terms):
+            continue
+        revisions = store.list_revisions_for_source(str(source["id"]), limit=3)
+        for revision in revisions:
+            content = str(revision.get("content") or "")
+            content_lower = content.lower()
+            score = sum(1 for t in terms if t.lower() in content_lower)
+            if score > 0:
+                candidates.append({
+                    "source_id": source["id"],
+                    "revision_id": revision["id"],
+                    "canonical_url": source.get("canonical_url", ""),
+                    "title": source.get("title", ""),
+                    "content": content,
+                    "published_date": revision.get("published_date"),
+                    "relevance_score": score,
+                })
+    candidates.sort(key=lambda c: c["relevance_score"], reverse=True)
+    return candidates[:limit]

@@ -35,6 +35,30 @@ _MONTHS = {
     "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 
+#: Quarter patterns: "Q1 2026", "first quarter 2026", "Q4'25"
+_QUARTER = re.compile(
+    r"\bq([1-4])[\s'\-]*(20\d{2})\b", re.I)
+_QUARTER_WORD = re.compile(
+    r"\b(first|second|third|fourth)\s+quarter\s+(20\d{2})\b", re.I)
+
+#: Fiscal year: "FY2026", "fiscal year 2026", "FY'26"
+_FISCAL_YEAR = re.compile(
+    r"\b(?:fy|fiscal\s+year)[\s'\-]*(20\d{2})\b", re.I)
+
+#: Effective date phrases: "effective November 7, 2026", "from 2026-11-07",
+#: "starting January 15, 2026", "as of November 7, 2026"
+_EFFECTIVE = re.compile(
+    r"\b(?:effective|from|starting|as of|commencing|in effect)\s+" +
+    r"(" + "|".join(sorted(_MONTHS, key=len, reverse=True)) +
+    r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20\d{2})\b", re.I)
+
+_EFFECTIVE_ISO = re.compile(
+    r"\b(?:effective|from|starting|as of|commencing|in effect)\s+" +
+    r"(20\d{2})-(\d{2})-(\d{2})\b", re.I)
+
+#: "in 2026", "during 2026", "by 2026" - year only, lower precision
+_YEAR_ONLY = re.compile(r"\b(?:in|during|by)\s+(20\d{2})\b", re.I)
+
 _ISO = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
 _MONTH_DAY_YEAR = re.compile(
     r"\b(" + "|".join(sorted(_MONTHS, key=len, reverse=True)) +
@@ -50,7 +74,7 @@ _RELATIVE = re.compile(r"\b(yesterday|today)\b", re.I)
 class EventDate:
     value: date | None
     quote: str | None
-    status: Literal["explicit", "relative", "missing"]
+    status: Literal["explicit", "relative", "quarter", "fiscal_year", "year", "missing"]
     detail: str = ""
 
     @property
@@ -68,27 +92,93 @@ def _valid(y: int, m: int, d: int) -> date | None:
         return None
 
 
+def _quarter_to_month(q: str) -> int:
+    return {"1": 1, "2": 4, "3": 7, "4": 10}[q]
+
+
+def _quarter_word_to_month(word: str) -> int:
+    return {"first": 1, "second": 4, "third": 7, "fourth": 10}[word.lower()]
+
+
 def find_date_expression(text: str) -> tuple[date, str, str] | None:
-    """First calendar date in `text` -> (date, matched_text, "explicit")."""
+    """First calendar date in `text` -> (date, matched_text, status).
+
+    Status is one of: "explicit" (exact calendar date), "quarter" (Q1/Q2/Q3/Q4
+    or first/second/third/fourth quarter), "fiscal_year" (FY2026), "year"
+    (year-only, lower precision), "relative" (yesterday/today).
+    """
     if not text:
         return None
+
+    # 1. Exact ISO date: 2026-11-07
     m = _ISO.search(text)
     if m:
         found = _valid(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         if found:
             return found, m.group(0), "explicit"
 
+    # 2. Month Day, Year: November 7, 2026
     m = _MONTH_DAY_YEAR.search(text)
     if m:
         found = _valid(int(m.group(3)), _MONTHS[m.group(1).lower()], int(m.group(2)))
         if found:
             return found, m.group(0), "explicit"
 
+    # 3. Day Month Year: 7 November 2026
     m = _DAY_MONTH_YEAR.search(text)
     if m:
         found = _valid(int(m.group(3)), _MONTHS[m.group(2).lower()], int(m.group(1)))
         if found:
             return found, m.group(0), "explicit"
+
+    # 4. Quarter: Q1 2026, Q4'25, first quarter 2026
+    m = _QUARTER.search(text)
+    if m:
+        q = m.group(1)
+        year = int(m.group(2))
+        month = _quarter_to_month(q)
+        found = _valid(year, month, 1)
+        if found:
+            return found, m.group(0), "quarter"
+
+    m = _QUARTER_WORD.search(text)
+    if m:
+        word = m.group(1)
+        year = int(m.group(2))
+        month = _quarter_word_to_month(word)
+        found = _valid(year, month, 1)
+        if found:
+            return found, m.group(0), "quarter"
+
+    # 5. Fiscal year: FY2026, fiscal year 2026 (treated as year-start)
+    m = _FISCAL_YEAR.search(text)
+    if m:
+        year = int(m.group(1))
+        found = _valid(year, 1, 1)
+        if found:
+            return found, m.group(0), "fiscal_year"
+
+    # 6. Effective date phrases: effective November 7, 2026
+    m = _EFFECTIVE.search(text)
+    if m:
+        found = _valid(int(m.group(3)), _MONTHS[m.group(1).lower()], int(m.group(2)))
+        if found:
+            return found, m.group(0), "explicit"
+
+    m = _EFFECTIVE_ISO.search(text)
+    if m:
+        found = _valid(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if found:
+            return found, m.group(0), "explicit"
+
+    # 7. Year only: in 2026, during 2026 (lowest precision)
+    m = _YEAR_ONLY.search(text)
+    if m:
+        year = int(m.group(1))
+        found = _valid(year, 1, 1)
+        if found:
+            return found, m.group(0), "year"
+
     return None
 
 
@@ -113,8 +203,14 @@ def event_date_from_quote(quote: str, content: str,
         offset = quote.find(matched)
         abs_start = start + offset if offset >= 0 else start
         abs_end = abs_start + len(matched)
+        detail = {
+            "explicit": "explicit calendar date in the quote",
+            "quarter": "calendar quarter in the quote (treated as quarter start)",
+            "fiscal_year": "fiscal year in the quote (treated as year start)",
+            "year": "calendar year only in the quote (lower precision)",
+        }.get(status, "date expression in the quote")
         return EventDate(value, content[abs_start:abs_end], status,
-                         "explicit calendar date in the quote")
+                         detail)
 
     rel = _RELATIVE.search(quote)
     if rel and published_date is not None:

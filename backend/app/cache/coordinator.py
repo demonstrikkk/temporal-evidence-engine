@@ -259,6 +259,29 @@ class CacheCoordinator:
         with self._lock:
             return dict(self._stats)
 
+    # -- Cache invalidation -------------------------------------------------
+    def invalidate_for_source_revision(self, canonical_url: str,
+                                       content_hash: str) -> int:
+        """Invalidate L5 claim-evidence cache entries that depend on a source
+        whose revision has changed. Reuse eligible evidence, but recompute the
+        temporal verdict — never blindly reuse a verdict from stale text."""
+        if settings.CACHE_MODE == "off":
+            return 0
+        removed = self.store.purge_cache_by_prefix("l5:claim:", canonical_url)
+        return removed
+
+    def invalidate_for_config_change(self, previous_version: str,
+                                     new_version: str) -> int:
+        """Invalidate L2 model KV cache entries when the rule/model config
+        changes. A cached result must never be presented as live after the
+        governing rules have moved."""
+        if settings.CACHE_MODE == "off":
+            return 0
+        removed = self.store.purge_cache_by_version("l2:kv",
+                                                     previous_version,
+                                                     new_version)
+        return removed
+
 
 # Global singleton
 cache_coordinator = CacheCoordinator()

@@ -22,8 +22,8 @@ from app.bifrost.client import BifrostClient, BifrostError
 from app.core.config import RULE_VERSION, settings
 from app.core.logging import log
 from app.research.planner import plan_queries
-from app.research.sources import (canonicalize_url, domain_of, save_revision,
-                                  save_source)
+from app.research.sources import (canonicalize_url, domain_of, find_existing_revisions,
+                                  save_revision, save_source)
 from app.research.tavily import ResearchError, TavilyClient
 from app.verify.decision import EvidenceFact, decide
 from app.verify.extract import extract_claims
@@ -371,6 +371,46 @@ class Verifier:
             return
 
         revision_ids: list[str] = []
+        facts: list[EvidenceFact] = []
+
+        # Existing-source discovery: before spending Tavily credits, check if
+        # we already extracted a page that mentions this claim's subject and
+        # predicate. Reuse it instead of searching again.
+        existing = find_existing_revisions(
+            self.store,
+            subject=draft.subject,
+            predicate=draft.predicate,
+            value_scope=draft.object_raw or "",
+            limit=5)
+        for ev in existing:
+            try:
+                ev_date = None
+                if ev.get("published_date"):
+                    ev_date = parse_iso(ev["published_date"])
+                facts.append(EvidenceFact(
+                    evidence_id=str(ev["revision_id"]),
+                    relationship=Relationship.SILENT,
+                    quote_located=False,
+                    settled=False,
+                    event_date=ev_date,
+                    event_date_status="missing",
+                    candidate_value=None,
+                    publication_date=ev_date,
+                    credibility="secondary",
+                    retrieved_at=None,
+                ))
+                revision_ids.append(str(ev["revision_id"]))
+            except Exception:
+                continue
+        if facts:
+            self.emit("claim.source_reused", {"claim_id": claim_id,
+                                              "sources": len(facts)})
+            self.counters["sources"] += len(facts)
+            decision = decide(claim_value=draft.object_raw,
+                              answer_generated_at=generated_at, facts=facts)
+            self._record(claim_row, draft, decision, facts, generated_at)
+            return
+
         for query in queries:
             self.counters["queries"] += 1
             try:
@@ -433,6 +473,13 @@ class Verifier:
                     fetch_outcome={"search_status": outcome.status,
                                    "extract_status": extract.status,
                                    "credits": outcome.credits + extract.credits})
+                # A new source revision invalidates dependent L5 evidence
+                # mappings: reuse eligible evidence, but recompute the
+                # temporal verdict against the new text.
+                if not revision.reused:
+                    self.cache.invalidate_for_source_revision(
+                        canonical_url=canonical,
+                        content_hash=revision.content_hash)
                 extracted[canonical] = revision
                 revision_ids.append(revision.revision_id)
                 self.counters["sources"] += 1

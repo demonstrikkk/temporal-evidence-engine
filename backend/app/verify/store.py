@@ -85,9 +85,11 @@ class VerifyStore(Protocol):
     # sources
     def add_source(self, row: dict) -> dict: ...
     def get_source(self, source_id: str) -> dict | None: ...
+    def list_sources(self, limit: int = 50) -> list[dict]: ...
     def add_revision(self, row: dict) -> dict: ...
     def get_revision(self, revision_id: str) -> dict | None: ...
     def find_revision(self, source_id: str, content_hash: str) -> dict | None: ...
+    def list_revisions_for_source(self, source_id: str, limit: int = 5) -> list[dict]: ...
 
     # evidence
     def add_evidence(self, row: dict) -> dict: ...
@@ -281,6 +283,12 @@ class LocalStore:
     def get_source(self, source_id: str) -> dict | None:
         return self._find("sources", id=source_id)
 
+    def list_sources(self, limit: int = 50) -> list[dict]:
+        with self._lock:
+            rows = list(self._data.get("sources") or [])
+        rows.sort(key=lambda r: str(r.get("first_seen_at") or ""), reverse=True)
+        return rows[:limit]
+
     def add_revision(self, row: dict) -> dict:
         with self._lock:
             existing = self._find("revisions", source_id=row["source_id"],
@@ -294,6 +302,13 @@ class LocalStore:
 
     def find_revision(self, source_id: str, content_hash: str) -> dict | None:
         return self._find("revisions", source_id=source_id, content_hash=content_hash)
+
+    def list_revisions_for_source(self, source_id: str, limit: int = 5) -> list[dict]:
+        with self._lock:
+            rows = [r for r in self._data.get("revisions") or []
+                    if r.get("source_id") == source_id]
+        rows.sort(key=lambda r: str(r.get("retrieved_at") or ""), reverse=True)
+        return rows[:limit]
 
     # -- evidence ---------------------------------------------------------
     def add_evidence(self, row: dict) -> dict:
@@ -448,6 +463,41 @@ class LocalStore:
                     e for e in self._data.get("cache_entries") or []
                     if e.get("cache_type") != cache_type
                 ]
+            removed = before - len(self._data.get("cache_entries") or [])
+            if removed > 0:
+                self._save()
+            return removed
+
+    def purge_cache_by_prefix(self, prefix: str, metadata_contains: str = "") -> int:
+        """Purge cache entries whose cache_key starts with `prefix`. Optionally
+        also require `metadata_contains` to appear in the entry's metadata."""
+        with self._lock:
+            before = len(self._data.get("cache_entries") or [])
+            self._data["cache_entries"] = [
+                e for e in self._data.get("cache_entries") or []
+                if not (
+                    e.get("cache_key", "").startswith(prefix)
+                    and (not metadata_contains
+                         or metadata_contains in str(e.get("metadata") or {})))
+            ]
+            removed = before - len(self._data.get("cache_entries") or [])
+            if removed > 0:
+                self._save()
+            return removed
+
+    def purge_cache_by_version(self, cache_type: str,
+                               previous_version: str,
+                               new_version: str) -> int:
+        """Purge cache entries of `cache_type` whose cache_version equals
+        `previous_version` (the config that just changed). `new_version` is
+        recorded for audit but entries are keyed by version."""
+        with self._lock:
+            before = len(self._data.get("cache_entries") or [])
+            self._data["cache_entries"] = [
+                e for e in self._data.get("cache_entries") or []
+                if not (e.get("cache_type") == cache_type
+                        and e.get("cache_version") == previous_version)
+            ]
             removed = before - len(self._data.get("cache_entries") or [])
             if removed > 0:
                 self._save()
@@ -720,6 +770,11 @@ class PgStore:
     def get_source(self, source_id: str) -> dict | None:
         return self._one("SELECT * FROM sources WHERE id = %s", (source_id,))
 
+    def list_sources(self, limit: int = 50) -> list[dict]:
+        return self._all(
+            "SELECT * FROM sources ORDER BY first_seen_at DESC LIMIT %s",
+            (limit,))
+
     def add_revision(self, row: dict) -> dict:
         return self._write(
             """INSERT INTO source_revisions (id, source_id, content_hash, content,
@@ -740,6 +795,12 @@ class PgStore:
         return self._one(
             "SELECT * FROM source_revisions WHERE source_id = %s AND content_hash = %s",
             (source_id, content_hash))
+
+    def list_revisions_for_source(self, source_id: str, limit: int = 5) -> list[dict]:
+        return self._all(
+            "SELECT * FROM source_revisions WHERE source_id = %s "
+            "ORDER BY retrieved_at DESC LIMIT %s",
+            (source_id, limit))
 
     # -- evidence ---------------------------------------------------------
     def add_evidence(self, row: dict) -> dict:
@@ -939,6 +1000,23 @@ class PgStore:
             return 1 if res else 0
         res = self._write("DELETE FROM cache_entries WHERE cache_type = %s RETURNING cache_key", (cache_type,))
         return 1 if res else 0
+
+    def purge_cache_by_prefix(self, prefix: str, metadata_contains: str = "") -> int:
+        """Purge cache entries whose cache_key starts with `prefix`."""
+        res = self._write(
+            "DELETE FROM cache_entries WHERE cache_key LIKE %s RETURNING cache_key",
+            (prefix + "%",))
+        return len(res) if res else 0
+
+    def purge_cache_by_version(self, cache_type: str,
+                               previous_version: str,
+                               new_version: str) -> int:
+        """Purge cache entries of `cache_type` whose cache_version equals
+        `previous_version`."""
+        res = self._write(
+            "DELETE FROM cache_entries WHERE cache_type = %s AND cache_version = %s RETURNING cache_key",
+            (cache_type, previous_version))
+        return len(res) if res else 0
 
     def find_revision_by_hash(self, canonical_url: str, content_hash: str) -> dict | None:
         return self._one(

@@ -106,8 +106,19 @@ class RequestScheduler:
 
 
 # Global singleton scheduler
+def configured_tpm_limit() -> int:
+    """The per-minute token ceiling this gateway is paced against.
+
+    One pacer fronts every provider, so the ceiling is a gateway property, not a
+    Groq one. `BIFROST_TPM_LIMIT` wins when set; otherwise the older
+    `GROQ_TPM_LIMIT` still governs, so existing `.env` files keep working.
+    """
+    return int(getattr(settings, "BIFROST_TPM_LIMIT", None)
+               or getattr(settings, "GROQ_TPM_LIMIT", 8000))
+
+
 scheduler = RequestScheduler(
     max_concurrency=2,
     rpm_limit=30,
-    tpm_limit=getattr(settings, "GROQ_TPM_LIMIT", 8000),
+    tpm_limit=configured_tpm_limit(),
 )

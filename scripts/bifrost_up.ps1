@@ -291,6 +291,21 @@ if (-not $env:GROQ_API_KEY) {
     }
 }
 
+# Mistral is the second hosted provider, and an optional one: `bifrost\config.json`
+# declares it, but a machine with no key still starts a gateway that serves Groq.
+# The Vibe CLI keeps its Mistral key in the OS credential store, not in `.env`;
+# copying it into `.env` once is what makes both the script and the backend agree
+# on where provider keys live.
+if (-not $env:MISTRAL_API_KEY) {
+    $imported = Import-DotEnvKey 'MISTRAL_API_KEY'
+    if ($imported) {
+        Write-Host 'Loaded MISTRAL_API_KEY from .env into the shell environment.' -ForegroundColor Cyan
+    }
+    else {
+        Write-Host 'Mistral: no MISTRAL_API_KEY, so only the providers that do have keys will answer.' -ForegroundColor Yellow
+    }
+}
+
 $binary = Resolve-Binary
 Write-Host "Starting Bifrost: $binary" -ForegroundColor Cyan
 # The committed config resolves the Ollama base URL from `env.OLLAMA_BASE_URL`.

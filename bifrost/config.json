@@ -16,6 +16,16 @@
         }
       ]
     },
+    "mistral": {
+      "keys": [
+        {
+          "name": "mistral-primary",
+          "value": "env.MISTRAL_API_KEY",
+          "models": ["*"],
+          "weight": 1.0
+        }
+      ]
+    },
     "ollama": {
       "keys": [
         {
@@ -42,6 +52,8 @@
         "provider_configs": [
           { "provider": "groq", "weight": 1.0,
             "allowed_models": ["*"], "key_ids": ["*"] },
+          { "provider": "mistral", "weight": 1.0,
+            "allowed_models": ["*"], "key_ids": ["*"] },
           { "provider": "ollama", "weight": 1.0,
             "allowed_models": ["llama3.2:1b"], "key_ids": ["*"] }
         ]
@@ -49,16 +61,27 @@
     ],
     "routing_rules": [
       {
-        "id": "ps05-default-with-fallback",
-        "name": "default-with-ollama-fallback",
-        "description": "Try the hosted provider first; when it refuses or is exhausted, answer from the local Ollama model so a run degrades instead of failing.",
+        "id": "ps05-groq-with-ollama-fallback",
+        "name": "groq-with-ollama-fallback",
+        "description": "Groq models keep their hosted route, then degrade to the local Ollama model instead of failing when Groq refuses or is exhausted. One rule per provider family exists because a single rule that pinned `groq` as its target rewrote every request to Groq - a Mistral call was served by the wrong vendor and nothing said so.",
         "enabled": true,
-        "cel_expression": "true",
+        "cel_expression": "model.startsWith(\"groq/\")",
         "priority": 0,
         "targets": [
           { "provider": "groq", "weight": 1.0 }
         ],
         "fallbacks": ["ollama/llama3.2:1b"]
+      },
+      {
+        "id": "ps05-mistral-with-ollama-fallback",
+        "name": "mistral-with-ollama-fallback",
+        "description": "Mistral models route to Mistral and no further: the Ollama fallback is a small local model, and quietly answering a Mistral judge prompt with it would change the verifier's brain mid-run without changing the model name in the record.",
+        "enabled": true,
+        "cel_expression": "model.startsWith(\"mistral/\")",
+        "priority": 1,
+        "targets": [
+          { "provider": "mistral", "weight": 1.0 }
+        ]
       }
     ]
   }

@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     # paces itself to this once the API answers a 429, instead of firing every
     # page concurrently and failing the ones that arrive second.
     GROQ_TPM_LIMIT: int = Field(default=8_000, ge=1_000, le=2_000_000)
+    # The same pacer fronts every provider Bifrost serves. When a run is pointed
+    # at a provider with a different ceiling (Mistral's free tier, a local model)
+    # this wins over the Groq number; unset means "use GROQ_TPM_LIMIT".
+    BIFROST_TPM_LIMIT: int | None = Field(default=None, ge=1_000, le=2_000_000)
     # Primary: local OpenCode server (OpenAI-compatible). Serve it with e.g.
     #   OPENCODE_SERVER_PASSWORD=... opencode serve --port 4096
     # then set the same password here. Server down => transient => Groq/Gemini

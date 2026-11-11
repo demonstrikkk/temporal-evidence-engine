@@ -48,6 +48,25 @@ _STAGE_MODEL = {
 
 Kind = Literal["transient", "fatal", "cache_miss", "budget"]
 
+#: Characters per token for the pacing estimate. Four is the usual English
+#: average for this family of models; it is deliberately not exact, because the
+#: number exists to stop the limiter believing a 2,700-token call costs 500.
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(system: str, prompt: str, max_tokens: int) -> int:
+    """What this call will cost the provider's per-minute budget.
+
+    Counting only `max_tokens // 2` made the limiter blind: it recorded ~500
+    tokens for a call the provider billed at 2,671 input, so the window never
+    filled, the header check never tripped, and the run walked straight into a
+    429 that a 25-second pause would have avoided.
+    """
+    return max(
+        200,
+        (len(system) + len(prompt)) // _CHARS_PER_TOKEN + int(max_tokens),
+    )
+
 
 class BifrostError(RuntimeError):
     def __init__(self, kind: Kind, message: str, *, status: int | None = None,
@@ -314,7 +333,7 @@ class BifrostClient:
                                        max_tokens=max_tokens,
                                        json_mode=json_mode),
                     stage=stage,
-                    estimated_tokens=max_tokens // 2,
+                    estimated_tokens=_estimate_tokens(system, prompt, max_tokens),
                     timeout=float(self.timeout),
                 )
                 return result
@@ -358,9 +377,18 @@ class BifrostClient:
                              f"{response.text[:200]}", status=response.status_code,
                 detail={"retry_after": response.headers.get("retry-after")})
         if response.status_code >= 400:
+            # A 400 is usually our fault (bad key, unknown model, malformed body)
+            # and must not be retried. `json_validate_failed` is the exception:
+            # the provider's constrained decoder rejected the *model's own*
+            # generation, which is a stochastic failure wearing a 4xx. Measured
+            # on Groq: two of thirty propose calls died this way and their sources
+            # were discarded, while a second attempt on the same prompt succeeded.
+            generation_failed = ("json_validate_failed" in response.text
+                                 or "Failed to generate JSON" in response.text)
             raise BifrostError(
-                "fatal", f"Bifrost refused the request ({response.status_code}): "
-                         f"{response.text[:300]}", status=response.status_code)
+                "transient" if generation_failed else "fatal",
+                f"Bifrost refused the request ({response.status_code}): "
+                f"{response.text[:300]}", status=response.status_code)
 
         try:
             payload = response.json()

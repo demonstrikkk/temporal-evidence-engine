@@ -38,6 +38,7 @@ COLLECTIONS = (
     "answers", "runs", "claims", "sources", "revisions", "evidence", "links",
     "assertions", "history", "events", "calls", "queries", "cache",
     "cache_entries", "conversations", "messages", "quota_ledger",
+    "assertion_spans", "coverage_audits",
 )
 
 
@@ -102,6 +103,13 @@ class VerifyStore(Protocol):
     def list_assertions(self, claim_id: str) -> list[dict]: ...
     def add_history(self, row: dict) -> dict: ...
     def list_history(self, claim_id: str) -> list[dict]: ...
+
+    # coverage: the durable answer to "what was not checked"
+    def add_assertion_span(self, row: dict) -> dict: ...
+    def list_assertion_spans(self, run_id: str) -> list[dict]: ...
+    def replace_assertion_spans(self, run_id: str, rows: list[dict]) -> list[dict]: ...
+    def put_coverage_audit(self, row: dict) -> dict: ...
+    def get_coverage_audit(self, run_id: str) -> dict | None: ...
 
     # events
     def append_event(self, run_id: str, event_type: str, payload: dict) -> dict: ...
@@ -351,6 +359,39 @@ class LocalStore:
 
     def list_history(self, claim_id: str) -> list[dict]:
         return [r for r in self._data["history"] if r.get("claim_id") == claim_id]
+
+    # -- coverage ---------------------------------------------------------
+    def add_assertion_span(self, row: dict) -> dict:
+        return self._insert("assertion_spans", row)
+
+    def list_assertion_spans(self, run_id: str) -> list[dict]:
+        return [r for r in self._data["assertion_spans"]
+                if r.get("run_id") == run_id]
+
+    def replace_assertion_spans(self, run_id: str, rows: list[dict]) -> list[dict]:
+        """Rebuild one run's spans. Used when a repair pass changes the audit."""
+        with self._lock:
+            self._data["assertion_spans"] = [
+                r for r in self._data["assertion_spans"]
+                if r.get("run_id") != run_id]
+            self._data["assertion_spans"].extend(rows)
+            self._save()
+        return rows
+
+    def put_coverage_audit(self, row: dict) -> dict:
+        """One row per run: the audit is recomputed after repair, not appended."""
+        with self._lock:
+            for existing in self._data["coverage_audits"]:
+                if existing.get("run_id") == row.get("run_id"):
+                    existing.update(row)
+                    self._save()
+                    return existing
+            self._data["coverage_audits"].append(row)
+            self._save()
+        return row
+
+    def get_coverage_audit(self, run_id: str) -> dict | None:
+        return self._find("coverage_audits", run_id=run_id)
 
     # -- events -----------------------------------------------------------
     def append_event(self, run_id: str, event_type: str, payload: dict) -> dict:
@@ -889,6 +930,84 @@ class PgStore:
         return self._all(
             "SELECT * FROM claim_status_history WHERE claim_id = %s ORDER BY decided_at",
             (claim_id,))
+
+    # -- coverage ---------------------------------------------------------
+    def add_assertion_span(self, row: dict) -> dict:
+        return self._write(
+            """INSERT INTO assertion_spans (id, run_id, answer_id, claim_id,
+                   kind, text, start_char, end_char, sentence_start,
+                   sentence_end, disposition, signals, created_at)
+               VALUES (%(id)s, %(run_id)s, %(answer_id)s, %(claim_id)s,
+                   %(kind)s, %(text)s, %(start_char)s, %(end_char)s,
+                   %(sentence_start)s, %(sentence_end)s, %(disposition)s,
+                   %(signals)s, %(created_at)s)
+               RETURNING *""",
+            {**row, "signals": _jsonb(row.get("signals") or {}),
+             "created_at": row.get("created_at") or now()})
+
+    def list_assertion_spans(self, run_id: str) -> list[dict]:
+        return self._all(
+            """SELECT * FROM assertion_spans WHERE run_id = %s
+               ORDER BY start_char""", (run_id,))
+
+    def replace_assertion_spans(self, run_id: str, rows: list[dict]) -> list[dict]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM assertion_spans WHERE run_id = %s", (run_id,))
+            if rows:
+                cur.executemany(
+                    """INSERT INTO assertion_spans (id, run_id, answer_id,
+                           claim_id, kind, text, start_char, end_char,
+                           sentence_start, sentence_end, disposition, signals,
+                           created_at)
+                       VALUES (%(id)s, %(run_id)s, %(answer_id)s, %(claim_id)s,
+                           %(kind)s, %(text)s, %(start_char)s, %(end_char)s,
+                           %(sentence_start)s, %(sentence_end)s, %(disposition)s,
+                           %(signals)s, %(created_at)s)""",
+                    [{**row, "signals": _jsonb(row.get("signals") or {}),
+                      "created_at": row.get("created_at") or now()}
+                     for row in rows])
+        return rows
+
+    def put_coverage_audit(self, row: dict) -> dict:
+        return self._write(
+            """INSERT INTO coverage_audits (run_id, answer_id, answer_chars,
+                   sentences, candidates, claims, claims_without_candidate,
+                   total_assertions, checked, coverage, material_assertions,
+                   material_coverage, dispositions, repair_calls,
+                   repaired_claims, repair_targets, created_at, updated_at)
+               VALUES (%(run_id)s, %(answer_id)s, %(answer_chars)s,
+                   %(sentences)s, %(candidates)s, %(claims)s,
+                   %(claims_without_candidate)s, %(total_assertions)s,
+                   %(checked)s, %(coverage)s, %(material_assertions)s,
+                   %(material_coverage)s, %(dispositions)s, %(repair_calls)s,
+                   %(repaired_claims)s, %(repair_targets)s, %(created_at)s,
+                   %(updated_at)s)
+               ON CONFLICT (run_id) DO UPDATE SET
+                   answer_chars = EXCLUDED.answer_chars,
+                   sentences = EXCLUDED.sentences,
+                   candidates = EXCLUDED.candidates,
+                   claims = EXCLUDED.claims,
+                   claims_without_candidate = EXCLUDED.claims_without_candidate,
+                   total_assertions = EXCLUDED.total_assertions,
+                   checked = EXCLUDED.checked,
+                   coverage = EXCLUDED.coverage,
+                   material_assertions = EXCLUDED.material_assertions,
+                   material_coverage = EXCLUDED.material_coverage,
+                   dispositions = EXCLUDED.dispositions,
+                   repair_calls = EXCLUDED.repair_calls,
+                   repaired_claims = EXCLUDED.repaired_claims,
+                   repair_targets = EXCLUDED.repair_targets,
+                   updated_at = EXCLUDED.updated_at
+               RETURNING *""",
+            {**row,
+             "dispositions": _jsonb(row.get("dispositions") or {}),
+             "repair_targets": _jsonb(row.get("repair_targets") or []),
+             "created_at": row.get("created_at") or now(),
+             "updated_at": row.get("updated_at") or now()})
+
+    def get_coverage_audit(self, run_id: str) -> dict | None:
+        return self._one("SELECT * FROM coverage_audits WHERE run_id = %s",
+                         (run_id,))
 
     # -- events -----------------------------------------------------------
     def append_event(self, run_id: str, event_type: str, payload: dict) -> dict:

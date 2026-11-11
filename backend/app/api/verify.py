@@ -54,6 +54,7 @@ def _claim_view(claim: dict, evidence_count: int = 0) -> dict[str, Any]:
         "volatility_class": claim.get("volatility_class") or "moderate",
         "status": claim.get("status") or "pending",
         "reason_code": claim.get("reason_code"),
+        "extracted_by": claim.get("extracted_by") or "extractor",
         "next_check_at": claim.get("next_check_at"),
         "last_verified_at": claim.get("last_verified_at"),
         "evidence_count": evidence_count,
@@ -158,6 +159,7 @@ async def get_run(run_id: str) -> dict[str, Any]:
     events = await asyncio.to_thread(store.list_events, run_id)
     replays = sum(1 for event in events
                   if event.get("event_type") == "model.snapshot")
+    coverage = await asyncio.to_thread(store.get_coverage_audit, run_id)
     counts: list[dict] = []
     for claim in claims:
         evidence = await asyncio.to_thread(store.list_evidence, str(claim["id"]))
@@ -183,7 +185,46 @@ async def get_run(run_id: str) -> dict[str, Any]:
         },
         "claims": counts,
         "counters": _counters(claims),
+        "coverage": _coverage_summary(coverage),
         "gateway": {**gateway, "recent": calls, "replays": replays},
+    }
+
+
+def _coverage_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    dispositions = row.get("dispositions") or {}
+    return {
+        "total_assertions": row.get("total_assertions") or 0,
+        "checked": row.get("checked") or 0,
+        "coverage": row.get("coverage") or 0.0,
+        "material_coverage": row.get("material_coverage") or 0.0,
+        "dispositions": dispositions,
+        "uncovered": dispositions.get("not_checked", 0),
+        "repair_calls": row.get("repair_calls") or 0,
+        "repaired_claims": row.get("repaired_claims") or 0,
+    }
+
+
+@router.get("/runs/{run_id}/coverage")
+async def get_coverage(run_id: str) -> dict[str, Any]:
+    """Every assertion the answer made, and what happened to it.
+
+    A separate endpoint because the assertion list is long: the run view wants
+    the summary, a reader investigating a gap wants the spans.
+    """
+    store = _store()
+    run = await asyncio.to_thread(store.get_run, run_id)
+    if not run:
+        raise not_found("run", run_id)
+    audit = await asyncio.to_thread(store.get_coverage_audit, run_id)
+    spans = await asyncio.to_thread(store.list_assertion_spans, run_id)
+    return {
+        "run_id": run_id,
+        "audit": audit,
+        "assertions": spans,
+        "note": "A disposition describes the extraction, not the fact. "
+                "`not_checked` is a coverage gap, not a verdict.",
     }
 
 

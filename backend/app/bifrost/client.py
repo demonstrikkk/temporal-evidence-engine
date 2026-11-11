@@ -39,6 +39,7 @@ from app.verify.store import VerifyStore, iso, new_id, now, parse_iso
 #: Stage -> the model routed for it, when the caller does not name one.
 _STAGE_MODEL = {
     "extract_claims": "BIFROST_MODEL_EXTRACTOR",
+    "repair_coverage": "BIFROST_MODEL_EXTRACTOR",
     "propose_relationship": "BIFROST_MODEL_JUDGE",
     "replacement_value": "BIFROST_MODEL_JUDGE",
     "plan_research": "BIFROST_MODEL_EXTRACTOR",

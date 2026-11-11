@@ -88,23 +88,32 @@ def _span(claim_text: str, answer: str) -> tuple[int, int] | None:
     return int(start), int(end)
 
 
-def _clean_claim(raw: dict[str, Any], answer: str) -> ClaimDraft | None:
+def _clean_claim(raw: dict[str, Any],
+                 answer: str) -> tuple[ClaimDraft | None, str]:
+    """Return `(draft, "")` or `(None, reason)` — never a silent drop.
+
+    The reason is a machine-readable code, not prose, so the run can count the
+    drop paths: a model that paraphrases every claim (`not_locatable`) is a
+    different failure from a model that returns opinions (`non_verifiable`).
+    """
     text = re.sub(r"\s+", " ", str(raw.get("claim_text") or "")).strip()
-    if len(text) < 8 or len(text) > 1200:
-        return None
+    if len(text) < 8:
+        return None, "claim_too_short"
+    if len(text) > 1200:
+        return None, "claim_too_long"
     span = _span(text, answer)
     if span is None:
         # The model paraphrased. Try the sentence containing the paraphrase.
         log.info("claim text was not a substring of the answer; dropped",
                  extra={"data": {"claim": text[:120]}})
-        return None
+        return None, "not_locatable"
 
     try:
         claim_type = ClaimType(str(raw.get("claim_type") or "factual"))
     except ValueError:
         claim_type = ClaimType.FACTUAL
     if claim_type in NON_VERIFIABLE_TYPES:
-        return None
+        return None, f"non_verifiable:{claim_type.value}"
 
     object_raw = str(raw.get("object_raw") or "").strip()[:400]
     if not object_raw:
@@ -140,12 +149,30 @@ def _clean_claim(raw: dict[str, Any], answer: str) -> ClaimDraft | None:
         extraction_confidence=max(0.0, min(1.0, confidence)),
         span_start=span[0],
         span_end=span[1],
-    )
+    ), ""
+
+
+def _overlaps_any(span: tuple[int, int],
+                  ranges: list[tuple[int, int]]) -> bool:
+    start, end = span
+    return any(start < range_end and end > range_start
+               for range_start, range_end in ranges)
 
 
 def postprocess(payload: Any, answer: str, *,
-                skip_non_factual: bool = True) -> list[ClaimDraft]:
-    """Pure, testable half of extraction: JSON in, located claims out."""
+                skip_non_factual: bool = True,
+                span_ranges: list[tuple[int, int]] | None = None,
+                drops: list[dict[str, Any]] | None = None) -> list[ClaimDraft]:
+    """Pure, testable half of extraction: JSON in, located claims out.
+
+    `span_ranges` restricts the result to proposals that land inside the given
+    answer offsets; the coverage repair uses it so a focused re-extraction
+    cannot smuggle in claims about the whole answer.
+
+    `drops` is an out-parameter. Every proposal that does not become a claim is
+    appended with a reason and its index, because "the extractor returned four
+    and we stored two" is only auditable if the other two are named.
+    """
     if isinstance(payload, dict):
         raw_claims = payload.get("claims")
     elif isinstance(payload, list):
@@ -157,31 +184,48 @@ def postprocess(payload: Any, answer: str, *,
 
     claims: list[ClaimDraft] = []
     seen: set[str] = set()
-    for raw in raw_claims:
+    for index, raw in enumerate(raw_claims):
         if not isinstance(raw, dict):
+            _drop(drops, index, raw, "not_an_object")
             continue
-        draft = _clean_claim(raw, answer)
+        draft, reason = _clean_claim(raw, answer)
         if draft is None:
+            _drop(drops, index, raw, reason)
             continue
         if skip_non_factual and draft.claim_type in NON_VERIFIABLE_TYPES:
+            _drop(drops, index, raw,
+                  f"non_verifiable:{draft.claim_type.value}")
+            continue
+        if span_ranges is not None and not _overlaps_any(
+                (draft.span_start, draft.span_end), span_ranges):
+            _drop(drops, index, raw, "outside_requested_span")
             continue
         key = re.sub(r"\W+", " ", draft.claim_text.casefold()).strip()
         if key in seen:
+            _drop(drops, index, raw, "duplicate")
             continue
         seen.add(key)
         claims.append(draft)
         if len(claims) >= settings.CLAIM_MAX_PER_ANSWER:
+            for rest in range(index + 1, len(raw_claims)):
+                _drop(drops, rest, raw_claims[rest], "claim_limit")
             break
     return claims
 
 
-def extract_claims(client: BifrostClient, *, answer: str, original_prompt: str = "",
-                   skip_non_factual: bool = True) -> tuple[list[ClaimDraft], dict[str, Any]]:
-    """One model call. Returns claims plus the call receipt for the UI."""
-    result = client.complete(_prompt(answer, original_prompt),
-                             stage="extract_claims", system=_SYSTEM,
-                             max_tokens=2600)
-    receipt = {
+def _drop(drops: list[dict[str, Any]] | None, index: int,
+          raw: Any, reason: str) -> None:
+    if drops is None:
+        return
+    text = ""
+    if isinstance(raw, dict):
+        text = str(raw.get("claim_text") or "")[:300]
+    drops.append({"index": index, "reason": reason, "claim_text": text})
+
+
+
+def _receipt(result: Any) -> dict[str, Any]:
+    return {
         "provider": result.provider, "model": result.model,
         "request_id": result.request_id, "status": result.status,
         # A replay says *what* it replayed; the receipt says when the answer was
@@ -193,6 +237,72 @@ def extract_claims(client: BifrostClient, *, answer: str, original_prompt: str =
         "cost_usd": result.cost_usd, "latency_ms": result.latency_ms,
         "fallback_attempts": result.fallback_attempts,
     }
+
+
+def extract_claims(client: BifrostClient, *, answer: str, original_prompt: str = "",
+                   skip_non_factual: bool = True,
+                   drops: list[dict[str, Any]] | None = None
+                   ) -> tuple[list[ClaimDraft], dict[str, Any]]:
+    """One model call. Returns claims plus the call receipt for the UI."""
+    result = client.complete(_prompt(answer, original_prompt),
+                             stage="extract_claims", system=_SYSTEM,
+                             max_tokens=2600)
+    receipt = _receipt(result)
     claims = postprocess(result.json(), answer,
-                         skip_non_factual=skip_non_factual)
+                         skip_non_factual=skip_non_factual, drops=drops)
     return claims, receipt
+
+
+_REPAIR_SYSTEM = """You extract atomic factual claims from specific sentences of
+an AI-generated answer that an earlier pass did not cover.
+
+Rules you must follow:
+- Return only claims that are stated in the supplied EXCERPTS.
+- "claim_text" must be an exact substring of the answer. Copy it verbatim.
+- One claim per assertion: split conjunctions and lists of values.
+- Do not return opinions, predictions, or recommendations. Do not add outside
+  knowledge. Do not repeat a claim you were not shown.
+- "object_raw" is the asserted value exactly as written, and it must appear in
+  the excerpt.
+- "claim_type" is one of: factual, time_sensitive, stable_factual, opinion,
+  prediction, ambiguous.
+- "volatility_class" is one of: ephemeral, high, moderate, low, stable.
+
+The response must be a json object. Return JSON only: {"claims": [{...}]}
+Never return prose, never return a verdict, never judge the claim.
+"""
+
+
+def extract_missing_claims(client: BifrostClient, *, answer: str,
+                           targets: list[dict[str, Any]],
+                           drops: list[dict[str, Any]] | None = None
+                           ) -> tuple[list[ClaimDraft], list[str], dict[str, Any]]:
+    """One focused re-extraction over the sentences coverage could not attribute.
+
+    `targets` are the audit's repair targets: absolute `(start, end)` windows in
+    the answer plus the candidate values that were not covered. At most one call
+    is made per run and its results are restricted back to those windows, so the
+    repair cannot silently expand into a second full extraction.
+    """
+    excerpts: list[str] = []
+    for index, target in enumerate(targets):
+        start, end = int(target["start"]), int(target["end"])
+        excerpts.append(f"[{index}] {answer[start:end].strip()}")
+    prompt = (
+        "ANSWER (for locating exact substrings; only the excerpts below are in "
+        f"scope):\n{answer}\n\n"
+        "EXCERPTS THAT NO CLAIM COVERED:\n" + "\n\n".join(excerpts) + "\n\n"
+        "Return at most one claim per uncovered value. Values the audit did not "
+        "see a claim for: "
+        + "; ".join(value for target in targets
+                    for value in target.get("candidates") or [])
+    )
+    result = client.complete(prompt, stage="repair_coverage",
+                             system=_REPAIR_SYSTEM, max_tokens=1800)
+    receipt = _receipt(result)
+    ranges = [(int(t["start"]), int(t["end"])) for t in targets]
+    claims = postprocess(result.json(), answer, span_ranges=ranges,
+                         drops=drops)
+    texts = [claim.claim_text for claim in claims]
+    return claims, texts, receipt
+

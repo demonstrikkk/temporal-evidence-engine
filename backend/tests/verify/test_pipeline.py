@@ -172,7 +172,12 @@ def test_a_replayed_extraction_is_labelled_in_the_event_rail(
     assert snapshots[0]["payload"]["stage"] == "extract_claims"
     assert snapshots[0]["payload"]["created_at"], \
         "a replay must say when the answer it replayed was recorded"
-    assert events[-1]["payload"]["counters"]["replays"] == 1
+    counters = events[-1]["payload"]["counters"]
+    # The count is of every replay the rail labelled, not of one hard-coded
+    # stage: coverage repair is also a model call, and a replay of it must be
+    # counted exactly like a replay of extraction.
+    assert counters["replays"] == len(snapshots), (
+        "every replayed call is counted, and nothing else is")
 
 
 def test_a_replayed_proposal_carries_the_time_it_was_recorded(

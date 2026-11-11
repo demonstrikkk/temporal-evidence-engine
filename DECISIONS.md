@@ -535,3 +535,84 @@ share a word actually addresses the property. It is a floor on absurd
 refutations, and the reason it is confined to textual values is that numbers do
 not need it.
 
+## D-021 - Coverage is a record beside the claim, never a claim status (2026-11-11)
+
+The Eiffel paragraph produced two claims from roughly seven assertions and
+nothing anywhere said five were skipped. The tempting fix is a sixth status
+(`not_checked`, `subjective`), and it is the wrong one: it would break the
+four-status verdict contract, put an extraction fact in a column that means
+"what the evidence established", and give `validator.settle` a second value it
+does not own.
+
+So coverage lives in its own tables:
+
+- `tev.assertion_spans` - one row per checkable value found by the deterministic
+  scanner, with the claim that covers it (or `NULL`) and a disposition;
+- `tev.coverage_audits` - one row per run with the counts and ratios.
+
+`claims.status` keeps exactly `pending | supported | changed | contradicted |
+unverifiable`. The coverage dispositions are `checked | subjective |
+prediction | not_checked`, and they are not verdicts. `test_coverage.py` pins
+that the audit has no status field to write.
+
+## D-022 - Coverage is deterministic, and every assertion gets a row or a reason (2026-11-11)
+
+The audit does not ask a model what the answer asserted:
+
+1. split the answer into sentences with absolute offsets (`segment.py`);
+2. find money, percentages, measures, dates, versions and bare quantities with
+   ordered regexes, longest match first (`assertions.py`);
+3. a candidate is `checked` when a stored claim span **contains** it;
+4. a claim that contains no candidate is still an assertion in the
+   denominator - otherwise ten claims from one sentence would report 100%;
+5. anything left is given `subjective`, `prediction`, or the admission
+   `not_checked` from the sentence's own words.
+
+`coverage` is checked / every assertion. `material_coverage` removes opinions
+and predictions from the denominator, because declining to verify a preference
+is not an incomplete run. Both are reported; neither is a gate.
+
+The extraction drop paths now name themselves. `postprocess(drops=...)` records
+every proposal that did not become a claim with a code (`not_locatable`,
+`non_verifiable:opinion`, `duplicate`, `claim_limit`, ...), and the orchestrator
+emits a `claim.dropped` event for each. "The model returned four and we stored
+two" is only auditable if the other two are named.
+
+## D-023 - One capped repair pass; a recovered claim is a first-class claim (2026-11-11)
+
+When the audit leaves `not_checked` values, the run may make **one** focused
+re-extraction over those sentences (`COVERAGE_MAX_REPAIR_CALLS`, default 1;
+`COVERAGE_MAX_TARGETS`, default 12). It is disabled in `offline` mode. The
+repair:
+
+- is a normal Bifrost call (`stage="repair_coverage"`), cached and priced like
+  every other call;
+- is restricted back to the target windows by `span_ranges`, so it cannot
+  become a second full extraction;
+- drops duplicates of claims already stored (`duplicate_existing`), proposals
+  already covered (`already_covered`), and anything past the claim ceiling;
+- stores accepted claims with `claims.extracted_by='coverage_repair'` and then
+  verifies them through the same research and settlement path as the first
+  pass.
+
+A failed repair is a `coverage.repair_failed` event and an unchanged number,
+never a quietly improved one. A coverage failure cannot fail the run: the
+verification of the claims already extracted is the product, and the audit is
+the lens on it.
+
+## D-024 - The disposition vocabulary is closed (2026-11-11)
+
+`checked`, `subjective`, `prediction`, `not_checked` are the only values
+`tev.assertion_spans.disposition` may hold. Adding a fifth needs a migration and
+a decision here, for the same reason a sixth claim status would: a vocabulary
+that grows by accident stops being checkable.
+
+Measured after the change:
+
+- `backend\.venv\Scripts\python.exe -m pytest backend\tests -q` ->
+  **2517 passed, 16 skipped** in 191.50 s;
+- hermetic gold -> 106 cases / 107 claims, 100.0% status accuracy, 0 false
+  supported, 0 false changed, 138/138 quotes, 44/44 event dates, **Gate PASS**;
+- `frontend npm test` and `npm run build` pass.
+
+

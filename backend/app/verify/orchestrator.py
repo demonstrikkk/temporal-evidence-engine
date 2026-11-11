@@ -26,7 +26,8 @@ from app.research.sources import (canonicalize_url, domain_of, find_existing_rev
                                   save_revision, save_source)
 from app.research.tavily import ResearchError, TavilyClient
 from app.verify.decision import EvidenceFact, decide
-from app.verify.extract import extract_claims
+from app.verify.coverage import apply_repair, audit as audit_coverage
+from app.verify.extract import extract_claims, extract_missing_claims
 from app.verify.freshness import freshness_index, next_check_at
 from app.verify.relationship import Proposal, propose
 from app.verify.schemas import (AnswerIn, ClaimDraft, ClaimStatus, ReasonCode,
@@ -191,6 +192,10 @@ class Verifier:
             #: that replayed everything spent nothing and touched no provider,
             #: and saying so is the difference between a snapshot and a live run.
             "replays": 0,
+            #: Proposals the extractor returned that did not become claims, and
+            #: claims recovered by the one focused coverage repair. Both exist so
+            #: a run cannot silently lose what the answer actually asserted.
+            "extraction_drops": 0, "coverage_recovered": 0,
         }
 
     # -- plumbing ---------------------------------------------------------
@@ -207,6 +212,173 @@ class Verifier:
         self.emit("run.failure", entry)
         log.warning("verification stage failed",
                     extra={"data": {"run_id": self.run_id, **entry}})
+
+    # -- coverage ---------------------------------------------------------
+    @staticmethod
+    def _claim_key(text: Any) -> str:
+        return re.sub(r"\W+", " ", str(text or "").casefold()).strip()
+
+    def _emit_drops(self, drops: list[dict[str, Any]], *, stage: str) -> None:
+        for drop in drops:
+            self.emit("claim.dropped", {"stage": stage, **drop})
+        self.counters["extraction_drops"] += len(drops)
+
+    def _store_claim(self, answer_id: Any, ordinal: int, draft: ClaimDraft,
+                     *, extracted_by: str) -> dict:
+        row = {
+            "id": new_id(), "answer_id": answer_id,
+            "run_id": self.run_id, "ordinal": ordinal,
+            "claim_text": draft.claim_text,
+            "span_start": draft.span_start, "span_end": draft.span_end,
+            "subject": draft.subject, "predicate": draft.predicate,
+            "object_raw": draft.object_raw,
+            "object_normalized": draft.object_normalized,
+            "qualifiers": draft.qualifiers,
+            "claim_type": draft.claim_type.value,
+            "time_sensitive": draft.time_sensitive,
+            "volatility_class": draft.volatility_class.value,
+            "temporal_scope": draft.temporal_scope,
+            "extraction_confidence": draft.extraction_confidence,
+            "status": ClaimStatus.PENDING.value, "reason_code": None,
+            "extracted_by": extracted_by,
+        }
+        return self.store.add_claim(row)
+
+    def _audit_and_repair(self, answer_id: str, answer_text: str,
+                          stored: list[tuple[dict, ClaimDraft]], *,
+                          budget_mode: str) -> Any:
+        try:
+            report = audit_coverage(answer_text, [row for row, _ in stored])
+        except Exception as exc:  # noqa: BLE001 — coverage must never break a run
+            self.emit("coverage.failed", {
+                "error": str(exc)[:400],
+                "trace": traceback.format_exc()[-1200:],
+                "detail": "the answer was not audited; claims still verify"})
+            return None
+        self.emit("coverage.audited", {
+            "run_id": self.run_id,
+            "summary": report.summary(),
+            "coverage": round(report.coverage, 4),
+            "material_coverage": round(report.material_coverage, 4),
+            "total_assertions": report.total_assertions,
+            "checked": report.checked,
+            "uncovered": report.uncovered,
+            "dispositions": dict(report.dispositions),
+            "repair_targets": len(report.repair_targets),
+        })
+        if (report.repair_targets
+                and settings.COVERAGE_MAX_REPAIR_CALLS > 0
+                and budget_mode != "offline"):
+            report = self._repair_coverage(answer_id, answer_text, stored,
+                                           report)
+        self._store_coverage(answer_id, report)
+        return report
+
+    def _repair_coverage(self, answer_id: str, answer_text: str,
+                         stored: list[tuple[dict, ClaimDraft]],
+                         report: Any) -> Any:
+        """One focused call over the sentences no claim covered.
+
+        The call is capped by `COVERAGE_MAX_REPAIR_CALLS` (the caller checks it)
+        and its proposals are filtered three ways before storage: they must be
+        locatable in the answer, they must intersect a repair target, and they
+        must not duplicate a claim the run already holds. A failure is an event,
+        never a silently improved number.
+        """
+        targets = report.repair_targets[:settings.COVERAGE_MAX_TARGETS]
+        drops: list[dict[str, Any]] = []
+        try:
+            claims, _texts, receipt = extract_missing_claims(
+                self.bifrost, answer=answer_text, targets=targets, drops=drops)
+        except BifrostError as exc:
+            report.repair_calls += 1
+            self.counters["failed_calls"] += 1
+            self.emit("coverage.repair_failed",
+                      {"kind": exc.kind, "error": str(exc)[:400]})
+            return report
+        except ValueError as exc:
+            report.repair_calls += 1
+            self.emit("coverage.repair_failed",
+                      {"kind": "bad_json", "error": str(exc)[:400]})
+            return report
+        except Exception as exc:  # noqa: BLE001 — the audit is advisory
+            report.repair_calls += 1
+            self.counters["failed_calls"] += 1
+            self.emit("coverage.repair_failed",
+                      {"kind": "unexpected", "error": str(exc)[:400]})
+            return report
+
+        self._emit_drops(drops, stage="repair_coverage")
+        if receipt.get("status") == "snapshot":
+            self.counters["replays"] += 1
+            self.emit("model.snapshot", {
+                "stage": "repair_coverage",
+                "request_id": receipt.get("request_id"),
+                "created_at": receipt.get("created_at")})
+
+        known_keys = {self._claim_key(row.get("claim_text")) for row, _ in stored}
+        known_spans = [(int(row.get("span_start") or -1),
+                        int(row.get("span_end") or -1)) for row, _ in stored]
+        accepted: list[ClaimDraft] = []
+        for draft in claims:
+            key = self._claim_key(draft.claim_text)
+            if key in known_keys:
+                self.emit("claim.dropped", {"stage": "repair_coverage",
+                                            "reason": "duplicate_existing",
+                                            "claim_text": draft.claim_text[:300]})
+                continue
+            if any(start <= draft.span_start and draft.span_end <= end
+                   for start, end in known_spans):
+                self.emit("claim.dropped", {"stage": "repair_coverage",
+                                            "reason": "already_covered",
+                                            "claim_text": draft.claim_text[:300]})
+                continue
+            if len(stored) + len(accepted) >= settings.CLAIM_MAX_PER_ANSWER:
+                self.emit("claim.dropped", {"stage": "repair_coverage",
+                                            "reason": "claim_limit",
+                                            "claim_text": draft.claim_text[:300]})
+                break
+            known_keys.add(key)
+            known_spans.append((draft.span_start, draft.span_end))
+            accepted.append(draft)
+
+        for draft in accepted:
+            row = self._store_claim(answer_id, len(stored), draft,
+                                    extracted_by="coverage_repair")
+            stored.append((row, draft))
+            self.emit("claim.recovered", {
+                "claim_id": row["id"], "claim": draft.claim_text,
+                "value": draft.object_raw,
+                "span_start": draft.span_start, "span_end": draft.span_end})
+        self.counters["coverage_recovered"] += len(accepted)
+
+        fresh = apply_repair(report, answer_text, [row for row, _ in stored],
+                             calls=1)
+        fresh.repaired_claims = len(accepted)
+        self.emit("coverage.repaired", {
+            "targets": len(targets), "proposed": len(claims),
+            "stored": len(accepted),
+            "summary": fresh.summary()})
+        return fresh
+
+    def _store_coverage(self, answer_id: str, report: Any) -> None:
+        stamp = iso(now())
+        rows: list[dict] = []
+        for item in report.items:
+            row = item.as_row(run_id=self.run_id, answer_id=answer_id)
+            row["id"] = new_id()
+            row["created_at"] = stamp
+            rows.append(row)
+        try:
+            self.store.replace_assertion_spans(self.run_id, rows)
+            self.store.put_coverage_audit({
+                "run_id": self.run_id, "answer_id": answer_id,
+                **report.as_dict(),
+                "created_at": stamp, "updated_at": stamp})
+        except Exception as exc:  # noqa: BLE001 — a store failure is reported
+            self.emit("coverage.store_failed", {"error": str(exc)[:300]})
+        self.emit("coverage.recorded", {"summary": report.summary(),
+                                        "spans": len(rows)})
 
     # -- entry point ------------------------------------------------------
     def execute(self) -> None:
@@ -226,11 +398,13 @@ class Verifier:
         self.store.update_run(self.run_id, status="running", stage="extract")
 
         # 1. claims
+        drops: list[dict[str, Any]] = []
         try:
             claims, receipt = extract_claims(
                 self.bifrost, answer=answer_text,
                 original_prompt=str(answer.get("prompt") or ""),
-                skip_non_factual=bool(answer.get("skip_non_factual") or False))
+                skip_non_factual=bool(answer.get("skip_non_factual") or False),
+                drops=drops)
         except BifrostError as exc:
             self.counters["failed_calls"] += 1
             self.emit("model.failed", {"stage": "extract_claims",
@@ -247,6 +421,7 @@ class Verifier:
 
         self.emit("claims.extracted", {"count": len(claims),
                                        "model_call": receipt})
+        self._emit_drops(drops, stage="extract_claims")
         if receipt.get("status") == "snapshot":
             # A replayed extraction is not a fresh one. The event rail says so,
             # because a run whose gateway panel shows zero calls would otherwise
@@ -267,23 +442,17 @@ class Verifier:
         # 2. store claims in order
         stored: list[tuple[dict, ClaimDraft]] = []
         for ordinal, draft in enumerate(claims):
-            row = {
-                "id": new_id(), "answer_id": run["answer_id"],
-                "run_id": self.run_id, "ordinal": ordinal,
-                "claim_text": draft.claim_text,
-                "span_start": draft.span_start, "span_end": draft.span_end,
-                "subject": draft.subject, "predicate": draft.predicate,
-                "object_raw": draft.object_raw,
-                "object_normalized": draft.object_normalized,
-                "qualifiers": draft.qualifiers,
-                "claim_type": draft.claim_type.value,
-                "time_sensitive": draft.time_sensitive,
-                "volatility_class": draft.volatility_class.value,
-                "temporal_scope": draft.temporal_scope,
-                "extraction_confidence": draft.extraction_confidence,
-                "status": ClaimStatus.PENDING.value, "reason_code": None,
-            }
-            stored.append((self.store.add_claim(row), draft))
+            stored.append((self._store_claim(run["answer_id"], ordinal, draft,
+                                             extracted_by="extractor"), draft))
+        self.counters["claims"] = len(stored)
+
+        # 2b. coverage: every material assertion gets a record or a reason.
+        # The audit runs before research so the gap is durable even when the
+        # research stage later fails; the single repair pass is capped and its
+        # claims are settled exactly like the first pass's.
+        coverage = self._audit_and_repair(
+            str(run["answer_id"]), answer_text, stored,
+            budget_mode=str(run.get("budget_mode") or "balanced"))
         self.counters["claims"] = len(stored)
 
         # 3. research + settle, one claim at a time
@@ -802,6 +971,21 @@ class Verifier:
         # identical to one that merely lost a source.
         if error:
             payload["error"] = error
+        try:
+            coverage = self.store.get_coverage_audit(self.run_id)
+        except Exception:  # noqa: BLE001 — a report field must not fail a run
+            coverage = None
+        if coverage:
+            payload["coverage"] = {
+                "total_assertions": coverage.get("total_assertions"),
+                "checked": coverage.get("checked"),
+                "coverage": coverage.get("coverage"),
+                "material_coverage": coverage.get("material_coverage"),
+                "uncovered": (coverage.get("dispositions") or {}).get(
+                    "not_checked", 0),
+                "repair_calls": coverage.get("repair_calls"),
+                "repaired_claims": coverage.get("repaired_claims"),
+            }
         if status == "completed":
             self.emit("run.completed", payload)
         elif status == "failed":

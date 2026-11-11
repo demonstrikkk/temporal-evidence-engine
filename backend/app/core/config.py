@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     TAVILY_TIMEOUT_S: int = Field(default=45, ge=5, le=180)
 
     CLAIM_MAX_PER_ANSWER: int = Field(default=40, ge=1, le=200)
+    #: Coverage repair is one focused call, not a second pipeline. 0 disables it
+    #: entirely; the audit still runs and still reports the gap.
+    COVERAGE_MAX_REPAIR_CALLS: int = Field(default=1, ge=0, le=3)
+    COVERAGE_MAX_TARGETS: int = Field(default=12, ge=1, le=50)
     RESEARCH_MAX_QUERIES_PER_CLAIM: int = Field(default=3, ge=1, le=6)
     #: read-write | read-only (snapshot/demo) | off
     CACHE_MODE: Literal["read-write", "read-only", "off"] = "read-write"

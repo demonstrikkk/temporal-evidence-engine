@@ -86,6 +86,7 @@ class ModelRegistry:
         """Task-aware routing: assigns the configured model profile for the requested stage."""
         stage_map = {
             "extract_claims": getattr(settings, "BIFROST_MODEL_EXTRACTOR", "groq/openai/gpt-oss-20b"),
+            "repair_coverage": getattr(settings, "BIFROST_MODEL_EXTRACTOR", "groq/openai/gpt-oss-20b"),
             "plan_research": getattr(settings, "BIFROST_MODEL_EXTRACTOR", "groq/openai/gpt-oss-20b"),
             "propose_relationship": getattr(settings, "BIFROST_MODEL_JUDGE", "groq/openai/gpt-oss-20b"),
             "replacement_value": getattr(settings, "BIFROST_MODEL_JUDGE", "groq/openai/gpt-oss-20b"),

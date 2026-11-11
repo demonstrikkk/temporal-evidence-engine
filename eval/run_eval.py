@@ -107,6 +107,11 @@ class ScriptedGateway:
         self.calls.append(stage)
         if stage == "extract_claims":
             payload: dict[str, Any] = {"claims": self.claims}
+        elif stage == "repair_coverage":
+            # Hermetic mode holds extraction constant: the gold file defines
+            # the claims, so a repair pass must propose nothing. It is still a
+            # real call on the rail, and still costs nothing here.
+            payload = {"claims": []}
         else:
             claim_text = self._claimed(prompt)["claim"]
             payload = {"relationship": "silent", "quote": "",

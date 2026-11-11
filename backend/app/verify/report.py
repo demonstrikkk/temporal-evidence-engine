@@ -76,6 +76,42 @@ def evidence_view(row: dict[str, Any], store: VerifyStore) -> dict[str, Any]:
     }
 
 
+def _coverage_lines(coverage: dict[str, Any], spans: list[dict[str, Any]],
+                    answer_text: str) -> list[str]:
+    lines = ["## Coverage", ""]
+    total = int(coverage.get("total_assertions") or 0)
+    checked = int(coverage.get("checked") or 0)
+    ratio = float(coverage.get("coverage") or 0.0)
+    material = float(coverage.get("material_coverage") or 0.0)
+    lines.append(f"- Assertions: {checked} of {total} checked "
+                 f"({ratio * 100:.1f}%)")
+    lines.append(f"- Material coverage: {material * 100:.1f}% "
+                 f"(opinions and predictions excluded)")
+    lines.append(f"- Sentences: {coverage.get('sentences') or 0}")
+    dispositions = coverage.get("dispositions") or {}
+    if dispositions:
+        lines.append("- Dispositions: " + ", ".join(
+            f"`{name}` {count}" for name, count in sorted(dispositions.items())))
+    if coverage.get("repair_calls"):
+        lines.append(f"- Coverage repair: {coverage.get('repair_calls')} call(s), "
+                     f"{coverage.get('repaired_claims') or 0} claim(s) recovered")
+    uncovered = [span for span in spans
+                 if span.get("disposition") == "not_checked"]
+    if uncovered:
+        lines.append("")
+        lines.append(f"### Not checked ({len(uncovered)})")
+        lines.append("")
+        for span in uncovered[:20]:
+            start = int(span.get("start_char") or 0)
+            end = int(span.get("end_char") or 0)
+            sentence = answer_text[start:end].strip() or str(span.get("text") or "")
+            lines.append(f"- `{span.get('text')}` — “{sentence[:180]}”")
+        if len(uncovered) > 20:
+            lines.append(f"- …and {len(uncovered) - 20} more")
+    lines.append("")
+    return lines
+
+
 def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
     run = store.get_run(run_id)
     if not run:
@@ -83,6 +119,8 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
     answer = store.get_answer(str(run["answer_id"])) or {}
     claims = store.list_claims(run_id)
     events = store.list_events(run_id)
+    coverage = store.get_coverage_audit(run_id)
+    spans = store.list_assertion_spans(run_id)
 
     claim_views = []
     for claim in claims:
@@ -101,6 +139,7 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
             "volatility_class": claim.get("volatility_class"),
             "status": claim.get("status"),
             "reason_code": claim.get("reason_code"),
+            "extracted_by": claim.get("extracted_by") or "extractor",
             "span_start": claim.get("span_start"),
             "span_end": claim.get("span_end"),
             "last_verified_at": claim.get("last_verified_at"),
@@ -124,15 +163,32 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
             "generated_at_source": answer.get("generated_at_source"),
         },
         "claims": claim_views,
+        "coverage": {
+            **(coverage or {}),
+            "spans": [
+                {
+                    "kind": row.get("kind"),
+                    "text": row.get("text"),
+                    "start_char": row.get("start_char"),
+                    "end_char": row.get("end_char"),
+                    "disposition": row.get("disposition"),
+                    "claim_id": row.get("claim_id"),
+                }
+                for row in spans
+            ],
+        },
         "events": events,
         "gateway": store.gateway_stats(run_id),
         "markdown": render_markdown(run, answer, claim_views,
-                                    store.gateway_stats(run_id)),
+                                    store.gateway_stats(run_id),
+                                    coverage=coverage, spans=spans),
     }
 
 
 def render_markdown(run: dict[str, Any], answer: dict[str, Any],
-                    claims: list[dict[str, Any]], gateway: dict[str, Any]) -> str:
+                    claims: list[dict[str, Any]], gateway: dict[str, Any],
+                    *, coverage: dict[str, Any] | None = None,
+                    spans: list[dict[str, Any]] | None = None) -> str:
     lines: list[str] = []
     lines.append("# Claim verification report")
     lines.append("")
@@ -157,6 +213,10 @@ def render_markdown(run: dict[str, Any], answer: dict[str, Any],
         if key in counts:
             lines.append(f"- {_STATUS_LABEL.get(key, key)}: {counts[key]}")
     lines.append("")
+
+    if coverage:
+        lines.extend(_coverage_lines(coverage, spans or [],
+                                     str(answer.get("answer_text") or "")))
 
     lines.append("## Claims")
     lines.append("")

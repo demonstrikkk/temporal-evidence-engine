@@ -24,6 +24,10 @@ class FakeGateway:
     """`responses` maps a URL (found in the prompt) to a proposal payload."""
 
     claims: list[dict[str, Any]] = field(default_factory=list)
+    #: Proposals for the one coverage-repair call. Empty by default, which is
+    #: also the honest answer: a run whose first pass covered every assertion
+    #: makes no repair call at all.
+    repair_claims: list[dict[str, Any]] = field(default_factory=list)
     responses: dict[str, dict[str, Any]] = field(default_factory=dict)
     fail_stage: str = ""
     calls: list[str] = field(default_factory=list)
@@ -42,6 +46,8 @@ class FakeGateway:
             raise BifrostError("fatal", "the fake gateway was told to fail here")
         if stage == "extract_claims":
             payload = {"claims": self.claims}
+        elif stage == "repair_coverage":
+            payload = {"claims": self.repair_claims}
         else:
             payload = {"relationship": "silent", "quote": "",
                        "candidate_value": "", "reasoning": "no rule matched"}
@@ -85,8 +91,10 @@ class FakeTavily:
 
 @pytest.fixture
 def make_gateway():
-    def _make(*, claims=None, responses=None, fail_stage="", status="live"):
+    def _make(*, claims=None, repair_claims=None, responses=None,
+              fail_stage="", status="live"):
         return FakeGateway(claims=list(claims or []),
+                           repair_claims=list(repair_claims or []),
                            responses=dict(responses or {}),
                            fail_stage=fail_stage, status=status)
     return _make

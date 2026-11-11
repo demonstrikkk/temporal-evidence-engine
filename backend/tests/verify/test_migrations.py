@@ -130,12 +130,21 @@ def test_the_rule_version_default_is_dropped_on_the_tables_that_have_it():
     """The columns that carry the stamp are runs and status history, not claims."""
     created = _schema()
     carriers = {table for (table, column) in created if column == "rule_version"}
-    assert carriers == {"tev.verification_runs", "tev.claim_status_history"}, carriers
+    assert carriers == {
+        "tev.verification_runs", "tev.claim_status_history",
+        "tev.evaluation_runs", "tev.evaluation_results",
+    }, carriers
 
     sql = (MIGRATIONS / "021_ps05_rule_version_no_default.sql").read_text(encoding="utf-8")
     dropped = {(match.group(1).lower(), match.group(2).strip('"').lower())
                for match in ALTER.finditer(sql)}
-    assert dropped == {(table, "rule_version") for table in carriers}, dropped
+    # 021 was written before evaluation_runs/evaluation_results existed; those
+    # tables carry their defaults at creation (031). 021's job is the tables it
+    # was written for, which still have no default.
+    assert dropped == {
+        ("tev.verification_runs", "rule_version"),
+        ("tev.claim_status_history", "rule_version"),
+    }, dropped
 
 
 def _strip_comments(sql: str) -> str:

@@ -35,6 +35,7 @@ from app.cache.keys import model_kv_key
 from app.core.config import settings
 from app.core.logging import log
 from app.verify.store import VerifyStore, iso, new_id, now, parse_iso
+from app.verify.otel import headers_for_outgoing_call
 
 #: Stage -> the model routed for it, when the caller does not name one.
 _STAGE_MODEL = {
@@ -421,6 +422,11 @@ class BifrostClient:
         headers = {"Authorization": f"Bearer {self.virtual_key}",
                    "Content-Type": "application/json",
                    "x-bf-vk": self.virtual_key}
+        # W3C Trace Context: propagate the current run trace to the gateway so a
+        # verification appears as one trace across FastAPI, Bifrost and Tavily.
+        # Auth/key headers are deliberately not merged into OTLP attributes —
+        # only traceparent/tracestate travel here.
+        headers.update(headers_for_outgoing_call())
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 response = client.post(f"{self.base_url}/v1/chat/completions",

@@ -30,6 +30,7 @@ from app.cache.keys import source_snapshot_key, tavily_query_key
 from app.core.config import settings
 from app.core.logging import log
 from app.verify.store import VerifyStore, iso, now
+from app.verify.otel import headers_for_outgoing_call
 
 Kind = Literal["transient", "fatal", "cache_miss"]
 
@@ -132,6 +133,9 @@ class TavilyClient:
         body = {**payload, "api_key": self.api_key}
         headers = {"Authorization": f"Bearer {self.api_key}",
                    "Content-Type": "application/json"}
+        # W3C Trace Context: propagate the current run trace to Tavily so search
+        # and extraction belong to the same trace as the claim they research.
+        headers.update(headers_for_outgoing_call())
         started = time.perf_counter()
         try:
             with httpx.Client(timeout=self.timeout) as client:

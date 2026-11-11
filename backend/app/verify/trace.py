@@ -29,7 +29,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from app.core.logging import log
+from app.core.config import settings
 from app.verify.store import VerifyStore, iso, new_id, now
+from app.verify.otel import OtelExporter, config_from_settings
 
 #: Columns a caller may write. Anything else is a typo, and a typo in a trace is
 #: a column that stays empty forever while looking like "this did not happen".
@@ -132,12 +134,14 @@ class TraceRecorder:
     """
 
     def __init__(self, store: VerifyStore, run_id: str, *, emit: Callable[
-            [str, dict], dict | None], enabled: bool = True) -> None:
+            [str, dict], dict | None], enabled: bool = True,
+                 exporter: OtelExporter | None = None) -> None:
         self.store = store
         self.run_id = run_id
         self.trace_id = new_id()
         self._emit = emit
         self.enabled = enabled
+        self.exporter = exporter
         self.root: Span | None = None
         self.error = ""
         self._ordinal = 0
@@ -225,6 +229,13 @@ class TraceRecorder:
             self._degrade(exc)
             self._discard(span)
             return None
+        # Export to OTLP (non-blocking; failures are logged and swallowed).
+        if self.exporter is not None:
+            try:
+                self.exporter.emit(row)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("OTLP export emit failed",
+                            extra={"data": {"error": str(exc)[:200]}})
         self._discard(span)
         return row
 
@@ -260,6 +271,13 @@ class TraceRecorder:
                 root_span_id=(self.root.id if self.root else ""))
         except Exception as exc:  # noqa: BLE001
             self._degrade(exc)
+        # Flush OTLP export so a completed run's trace is exported before exit.
+        if self.exporter is not None:
+            try:
+                self.exporter.flush(timeout_s=10.0)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("OTLP export flush failed",
+                            extra={"data": {"error": str(exc)[:200]}})
 
     def _degrade(self, exc: Exception) -> None:
         """Report once, then keep going. A broken trace must not stop a verdict."""

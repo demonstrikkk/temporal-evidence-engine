@@ -395,6 +395,23 @@ class Settings(BaseSettings):
     LANGSMITH_PROJECT: str = "datagoblin"
     CORRELATION_HEADER: str = "X-Request-ID"
 
+    # --- OTLP / OpenTelemetry observability (WP-10) -------------------------
+    # Additive observability layer. Disabled by default; enabling it exports
+    # execution traces to an OTLP-compatible backend (Jaeger, Tempo, etc.).
+    # Never a dependency of verdicts, budgets, or research.
+    OTEL_ENABLED: bool = False
+    OTEL_SERVICE_NAME: str = "temporal-evidence-engine"
+    OTEL_SERVICE_VERSION: str = ""
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
+    OTEL_EXPORTER_OTLP_PROTOCOL: str = "http/protobuf"
+    OTEL_EXPORTER_OTLP_HEADERS: str = ""
+    OTEL_TRACES_SAMPLER: str = "parentbased_always_on"
+    OTEL_CAPTURE_CONTENT: bool = False
+    OTEL_BATCH_SIZE: int = Field(default=512, ge=1, le=4096)
+    OTEL_BATCH_TIMEOUT_S: float = Field(default=5.0, ge=0.5, le=60.0)
+    OTEL_EXPORT_TIMEOUT_S: float = Field(default=10.0, ge=1.0, le=120.0)
+    OTEL_MAX_QUEUE_SIZE: int = Field(default=2048, ge=64, le=16384)
+
     @field_validator("TAVILY_SEARCH_DEPTH")
     @classmethod
     def _depth(cls, v: str) -> str:

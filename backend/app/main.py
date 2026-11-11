@@ -61,12 +61,72 @@ from app.services import reputation as reputation_svc
 from app.services import runner as runner_svc
 from app.services import selector_learn as selector_learn_svc
 from app.services import sqlq as sqlq_svc
+from app.verify.otel import (
+    TRACEPARENT_HEADER, TRACESTATE_HEADER, extract_trace_context,
+    parse_traceparent, traceparent_from_trace,
+)
+from opentelemetry import trace as otel_trace
+from opentelemetry.trace.propagation import set_span_in_context
 
 set_level(settings.LOG_LEVEL)
 
 app = FastAPI(title="Temporal Evidence Engine API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list(),
                    allow_methods=["GET", "POST"], allow_headers=["*"])
+
+
+# -- W3C Trace Context middleware -------------------------------------------
+# Continues a trace started by the caller (`traceparent`/`tracestate` headers)
+# across the FastAPI request. The incoming trace id is stamped on verification
+# runs so the background worker thread can re-establish the same OTel context
+# and propagate it to Bifrost and Tavily calls. An absent or malformed header
+# starts a fresh trace — never a failure.
+class _TraceMiddleware:
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        request = Request(scope, receive)
+        headers = dict(request.headers.getlist("traceparent"))
+        traceparent = headers[0] if headers else None
+        tracestate = request.headers.get("tracestate")
+        ctx = None
+        if traceparent:
+            parsed = parse_traceparent(traceparent)
+            if parsed:
+                # Rebuild a valid OTel span context from the incoming ids so
+                # Bifrost/Tavily calls in the worker thread can continue it.
+                from opentelemetry.trace import INVALID_SPAN, SpanContext
+                try:
+                    ctx = SpanContext(
+                        trace_id=int(parsed["trace_id"], 16),
+                        span_id=int(parsed["span_id"], 16),
+                        is_remote=True,
+                        trace_flags=int(parsed.get("flags", "01"), 16),
+                    )
+                except (ValueError, TypeError):
+                    ctx = None
+        request.state.trace_context = {
+            "traceparent": traceparent,
+            "tracestate": tracestate,
+            "context": ctx,
+        }
+        # Create an OTel span for the request handling itself.
+        tracer = otel_trace.get_tracer(__name__)
+        parent_ctx = set_span_in_context(otel_trace.INVALID_SPAN, ctx) if ctx else None
+        with tracer.start_as_current_span(
+            f"http.{request.method} {request.url.path}",
+            context=parent_ctx or otel_trace.set_span_in_context(otel_trace.INVALID_SPAN),
+            attributes={"http.method": request.method,
+                        "http.route": request.url.path,
+                        "http.scheme": request.url.scheme},
+        ):
+            await self.app(scope, receive, send)
+
+
+app.add_middleware(_TraceMiddleware)
 
 #: The product surface. The dataset routes below remain mounted (they are tested
 #: upstream substrate) but the verifier is what this application is for.

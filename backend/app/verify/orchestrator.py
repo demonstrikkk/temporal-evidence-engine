@@ -38,6 +38,9 @@ from app.verify.schemas import (AnswerIn, ClaimDraft, ClaimStatus, ReasonCode,
 from app.verify.settlement import settle_assertion
 from app.verify.store import VerifyStore, build_store, iso, new_id, now, parse_iso
 from app.verify.temporal import event_date_from_quote
+from app.verify.otel import OtelExporter, config_from_settings, parse_traceparent
+from opentelemetry.trace.propagation import set_span_in_context
+from opentelemetry.trace import SpanContext, INVALID_SPAN, NonRecordingSpan
 from app.verify.trace import TraceRecorder, model_fields
 from app.cache.coordinator import CacheCoordinator
 
@@ -200,7 +203,8 @@ def _dedupe_hits(hits: list[Any], *, per_domain: int = 2) -> list[Any]:
 # run creation / execution
 # ---------------------------------------------------------------------------
 
-def create_run(store: VerifyStore, payload: AnswerIn) -> RunCreated:
+def create_run(store: VerifyStore, payload: AnswerIn,
+               traceparent: str | None = None) -> RunCreated:
     answer_id = new_id()
     run_id = new_id()
     stamp = now()
@@ -228,6 +232,7 @@ def create_run(store: VerifyStore, payload: AnswerIn) -> RunCreated:
         "stage": "queued", "rule_version": RULE_VERSION,
         "cache_mode": settings.CACHE_MODE, "budget_mode": budget_mode,
         "started_at": iso(stamp),
+        "traceparent": traceparent,
     })
     return RunCreated(run_id=run_id, answer_id=answer_id)
 
@@ -260,10 +265,36 @@ class Verifier:
         self.tavily = tavily or TavilyClient(store)
         self.cache = CacheCoordinator(store)
         self.failures: list[dict[str, Any]] = []
+        #: OTLP export of the execution trace — additive observability only.
+        #: A bad config or unavailable collector never reaches a verdict:
+        #: `OtelExporter` degrades to disabled and keeps swallowing failures.
+        self.otel = OtelExporter(config=config_from_settings(), store=store)
+        #: Re-establish the caller's W3C trace context on this worker thread so
+        #: Bifrost and Tavily calls continue the trace started by the HTTP
+        #: request. Absent or malformed `traceparent` starts a fresh trace.
+        self._incoming_traceparent: str | None = None
+        run = self.store.get_run(self.run_id) or {}
+        incoming = str(run.get("traceparent") or "")
+        if incoming:
+            parsed = parse_traceparent(incoming)
+            if parsed:
+                self._incoming_traceparent = incoming
+                try:
+                    ctx = SpanContext(
+                        trace_id=int(parsed["trace_id"], 16),
+                        span_id=int(parsed["span_id"], 16),
+                        is_remote=True,
+                        trace_flags=int(parsed.get("flags", "01"), 16),
+                    )
+                    non_rec = NonRecordingSpan(ctx)
+                    set_span_in_context(non_rec)
+                except (ValueError, TypeError, AttributeError):
+                    pass
         #: The run as a tree. Every span is closed by the same emit call that
         #: writes its rail row, so the trace cannot drift from the events.
         self.trace = TraceRecorder(store, run_id, emit=self.emit,
-                                   enabled=settings.TRACE_ENABLED)
+                                   enabled=settings.TRACE_ENABLED,
+                                   exporter=self.otel)
         self.counters: dict[str, int] = {
             "claims": 0, "queries": 0, "sources": 0, "evidence": 0,
             "settled": 0, "failed_sources": 0, "failed_calls": 0,

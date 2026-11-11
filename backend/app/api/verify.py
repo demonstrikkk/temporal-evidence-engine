@@ -112,11 +112,14 @@ async def gateway_status() -> dict[str, Any]:
 
 
 @router.post("/runs")
-async def create_verification(body: AnswerIn) -> dict[str, Any]:
+async def create_verification(body: AnswerIn, request: Request) -> dict[str, Any]:
     store = _store()
     if not body.answer.strip():
         raise validation("answer must not be empty")
-    created = await asyncio.to_thread(orchestrator.create_run, store, body)
+    trace_ctx = getattr(request.state, "trace_context", None) or {}
+    traceparent = trace_ctx.get("traceparent")
+    created = await asyncio.to_thread(orchestrator.create_run, store, body,
+                                      traceparent=traceparent)
     await asyncio.to_thread(orchestrator.launch, store, created.run_id)
     return {"run_id": created.run_id, "answer_id": created.answer_id,
             "status": "queued", "store": store.adapter,

@@ -26,6 +26,11 @@ A claim becomes `changed` only when a replacement value is **locatable**,
 answer was generated**. A newer article is not a change. A publication date is
 not an event date. A failed search is not a contradiction.
 
+How the pieces fit — Tavily as discovery only, Bifrost as the sole model path,
+the DataGoblin substrate, the five cache layers and the rule table — is mapped
+file by file in [`docs/INTEGRATION.md`](docs/INTEGRATION.md), including what is
+configured here but cannot actually run on this machine.
+
 ## Stack
 
 - Backend: Python 3.11+, FastAPI, psycopg 3, Postgres (schema `tev`)

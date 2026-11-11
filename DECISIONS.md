@@ -420,3 +420,37 @@ Now:
 - A budget mode still changes only how much research is purchased. It never
   lowers the evidence threshold: offline/conserve runs that cannot prove a claim
   abstain `unverifiable`, they do not promote it.
+
+## D-019 - The generated gold cases are instances, and the ablations share proposals (2026-11-11)
+
+The gold set was 18 hand-written cases. A hand set cannot be held out: every case
+was added because it shaped a rule, so scoring on it measures memory, not
+verification. D6-1 and D6-2 needed a split and an ablation, so the set had to
+grow. Two options: write 80 more cases by hand, or parameterise the rules the
+hand cases already encode.
+
+Parameterising won because it is honest about what it measures:
+
+- `eval/generate_cases.py` owns no rules. It re-parameterises the hand cases over
+  different entities, values and dates, and every expectation is the documented
+  outcome of a rule. If a template is wrong the hermetic gate fails; the template
+  does not become the answer key.
+- The held-out quarter is positional (every fourth generated case in a
+  fixed-order file), so the split is reproducible and was sealed before the final
+  run. The hand cases are `dev` by definition.
+- The generated number is therefore a reproduction check on new instances, not a
+  generalisation benchmark. Both documents say so where the number is quoted.
+
+For the ablations, every arm is given the same model proposals from the gold
+file. That is deliberate: it holds extraction and model quality constant and
+isolates the deterministic layer, which is what the project claims. It also means
+the ablation cannot say whether a real model would propose the same
+relationships, and §14.3 of the build plan states that limitation next to the
+numbers.
+
+Two baselines are reported, `baseline` and `baseline-collapsed`, because choosing
+only the variant that scores worse is how an ablation becomes a sales document.
+`baseline` reads the newest page first - what a search-plus-model pipeline
+actually does - and gets every `changed` case right. Its failures are the point:
+publication time read as event time, a differently scoped number read as a
+replacement, and two first-party pages read as agreement.

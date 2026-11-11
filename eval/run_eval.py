@@ -33,8 +33,14 @@ measuring the news. What live mode does gate is everything the product controls.
 Run:
 
     python eval/run_eval.py
+    python eval/run_eval.py --split heldout
     python eval/run_eval.py --json
     python eval/run_eval.py --live --cases eval/gold_live.jsonl
+
+Hermetic mode scores `eval/gold.jsonl` and `eval/gold_generated.jsonl` when both
+exist. `--split` narrows to `dev` or `heldout`; the hand-written cases are `dev`
+by definition because they shaped the rules, so the held-out number is measured
+on generated instances only.
 """
 from __future__ import annotations
 
@@ -166,6 +172,9 @@ class CaseResult:
     claims_total: int = 0
     rows: list[dict] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    #: `dev` or `heldout`. Reported separately so a final number cannot quietly
+    #: be measured on the cases that shaped the rules.
+    split: str = "dev"
     #: Failures that are the product's fault whatever the web said: a claim the
     #: extractor dropped, a run that ended `failed`, a stored quote that does not
     #: resolve. Live accuracy is reported separately because the world changes.
@@ -219,7 +228,8 @@ def run_hermetic_case(case: dict, base: Path) -> CaseResult:
     run = store.get_run(created.run_id) or {}
     observed = store.list_claims(created.run_id)
     result = CaseResult(case_id=case["id"], note=case.get("note", ""),
-                        run_status=str(run.get("status")), claims_total=len(observed))
+                        run_status=str(run.get("status")), claims_total=len(observed),
+                        split=str(case.get("split", "dev")))
     by_text = {row["claim_text"]: row for row in observed}
 
     for gold in case["claims"]:
@@ -322,7 +332,8 @@ def run_live_case(case: dict, base: Path) -> CaseResult:
     run = store.get_run(created.run_id) or {}
     observed = store.list_claims(created.run_id)
     result = CaseResult(case_id=case["id"], note=case.get("note", ""),
-                        run_status=str(run.get("status")), claims_total=len(observed))
+                        run_status=str(run.get("status")), claims_total=len(observed),
+                        split=str(case.get("split", "dev")))
     mapping = _match_claims(case["claims"], observed)
 
     for index, gold in enumerate(case["claims"]):
@@ -408,6 +419,8 @@ def summarise(results: list[CaseResult], mode: str = "hermetic") -> dict[str, An
     summary = {
         "cases": len(results),
         "claims": total,
+        "splits": {name: sum(1 for result in results if result.split == name)
+                   for name in ("dev", "heldout")},
         "status_correct": correct,
         "status_accuracy": correct / total if total else 0.0,
         "false_supported": false_supported,
@@ -466,6 +479,8 @@ def _print_markdown(results: list[CaseResult], summary: dict[str, Any],
               f"{quotes} | {events} | {note} |")
     print()
     print(f"- cases: {summary['cases']}")
+    print(f"- splits: {summary['splits']['dev']} dev / "
+          f"{summary['splits']['heldout']} held out")
     print(f"- claims: {summary['claims']}")
     print(f"- status accuracy: {summary['status_accuracy']:.1%}")
     print(f"- false supported: {summary['false_supported']}")
@@ -487,28 +502,35 @@ def _print_markdown(results: list[CaseResult], summary: dict[str, Any],
     print(f"**Gate: {'PASS' if summary['gate'] else 'FAIL'}**")
 
 
-def load_cases(path: Path, limit: int | None) -> list[dict]:
+def load_cases(path: Path, limit: int | None, split: str = "all") -> list[dict]:
     cases = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("//"):
             continue
         try:
-            cases.append(json.loads(line))
+            case = json.loads(line)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"{path}:{number}: invalid JSON: {exc}") from exc
+        if split != "all" and case.get("split", "dev") != split:
+            continue
+        cases.append(case)
     if limit:
         cases = cases[:limit]
-    if not cases:
-        raise SystemExit(f"{path}: no cases")
     return cases
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cases", default=str(ROOT / "eval" / "gold.jsonl"))
+    parser.add_argument("--cases", nargs="+", default=None,
+                        help="one or more JSONL case files; hermetic defaults to "
+                             "gold.jsonl + gold_generated.jsonl, live to "
+                             "gold_live.jsonl")
     parser.add_argument("--mode", choices=["hermetic", "live"], default="hermetic")
     parser.add_argument("--live", action="store_true", help="alias for --mode live")
+    parser.add_argument("--split", choices=["all", "dev", "heldout"],
+                        default="all",
+                        help="score only the dev or held-out cases")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--pause", type=float, default=0.0,
                         help="seconds between live cases; paced for a free-tier "
@@ -517,7 +539,27 @@ def main() -> int:
     args = parser.parse_args()
 
     mode = "live" if args.live else args.mode
-    cases = load_cases(Path(args.cases), args.limit)
+    if args.cases:
+        paths = [Path(item) for item in args.cases]
+    elif mode == "live":
+        paths = [ROOT / "eval" / "gold_live.jsonl"]
+    else:
+        paths = [ROOT / "eval" / "gold.jsonl"]
+        generated = ROOT / "eval" / "gold_generated.jsonl"
+        if generated.is_file():
+            paths.append(generated)
+
+    cases: list[dict] = []
+    for path in paths:
+        if not path.is_file():
+            print(f"case file not found: {path}", file=sys.stderr)
+            return 2
+        cases.extend(load_cases(path, None, args.split))
+    if args.limit:
+        cases = cases[:args.limit]
+    if not cases:
+        print("no cases selected", file=sys.stderr)
+        return 2
 
     if mode == "live":
         # Fail before spending anything, not halfway through a case.

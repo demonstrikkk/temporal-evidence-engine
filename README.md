@@ -84,7 +84,12 @@ be changed without changing a rule is not a rule version.
 
 ```powershell
 # hermetic: gold claims + gold evidence, no keys, no network, no database
+backend\.venv\Scripts\python.exe eval\generate_cases.py      # rebuild the generated half
 backend\.venv\Scripts\python.exe eval\run_eval.py
+backend\.venv\Scripts\python.exe eval\run_eval.py --split heldout
+
+# ablations: same model proposals, four different pipelines
+backend\.venv\Scripts\python.exe eval\ablate.py
 
 # live: real Bifrost + Tavily against eval\gold_live.jsonl; costs credits
 backend\.venv\Scripts\python.exe eval\run_eval.py --live --cases eval\gold_live.jsonl --pause 20
@@ -105,10 +110,20 @@ printed as evidence, not used as a switch, because the web is not deterministic.
 Reports include abstention recall, over-abstention and recorded model cost.
 See `docs/BUILD-PLAN.md` §14 and `DECISIONS.md` D-014.
 
-Latest recorded runs (2026-11-10):
+Latest recorded runs (2026-11-11):
 
-- hermetic: 18 cases / 19 claims, status accuracy 100%, 26 quotes valid, event
-  dates 8/8, `$0.0000` recorded model cost, **Gate: PASS**.
+- hermetic, all cases: 106 cases / 107 claims (84 dev / 22 held out), status
+  accuracy 100%, zero false `supported`, zero false `changed`, 138/138 quotes
+  valid, event dates 44/44, `$0.0000` recorded model cost, **Gate: PASS**.
+- hermetic, held-out quarter only: 22 cases / 22 claims, status accuracy 100%,
+  28/28 quotes, event dates 8/8, **Gate: PASS**. The 18 hand-written cases are
+  `dev` and are never counted as held out: they shaped the rules.
+- ablation on the same 106 cases, with identical model proposals in every arm:
+  `full` 100.0%; `evidence-gated` 65.4% (6 false `supported`, 16 false
+  `changed`); `baseline` 57.9% (14, 16); `baseline-collapsed` 53.3% (14, 0).
+  The baseline gets every `changed` case right, which is why the comparison is
+  worth printing: it fails on publication read as event time, on scope, and on
+  two first-party pages disagreeing.
 - live: 3 cases / 3 claims against Groq + Tavily, status accuracy 100%, 11/11
   quotes valid, zero false `supported`/`changed`, `$0.0000` (free tier),
   **Gate: PASS**.

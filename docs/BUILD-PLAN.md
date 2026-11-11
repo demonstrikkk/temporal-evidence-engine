@@ -776,16 +776,26 @@ Distribution: supported 25, changed 25, contradicted 20, unverifiable-no-source
 Domains: API/versions, pricing/plans, leadership, law/policy, statistics,
 stable historical controls. Hold out ~20% (fixed, untouched until the final run).
 
-**As built (2026-11-10): 18 cases / 19 claims in `eval/gold.jsonl`, plus 3
-real-entity cases in `eval/gold_live.jsonl`.** The set is built case-by-case
-from the edge cases in §14.4 rather than padded to a count: every mandatory edge
-case is a case, and the hermetic gate is 100% status accuracy on those, with zero
-false `supported`, zero false `changed`, 100% quote validity and 100% event-date
-accuracy where the case states dates. It is honest about what it is — a
-regression gate for the decision table, not yet a measurement of generalisation.
-The held-out split and the 80-claim floor are still open, and the number is not
-quoted anywhere else in this repository. Do not describe this as a benchmark
-until the set is big enough to be one.
+**As built (2026-11-11): 106 cases / 107 claims.** `eval/gold.jsonl` holds 18
+hand-written cases / 19 claims, added one at a time because a defect or a rule
+boundary needed a permanent witness. `eval/gold_generated.jsonl` holds 88
+generated cases in eleven families — changed after generation, stable facts,
+support plus an undated refutation, scope mismatch with and without support,
+two first-party sources disagreeing, republication of an old fact, no source, an
+invented quote, mention only, and negation without a replacement value.
+
+The generator (`eval/generate_cases.py`) is deterministic and owns no rules: it
+re-parameterises the hand cases over different entities, values and dates, and
+every expectation is the documented outcome of a rule. It cannot invent a new
+rule, and a wrong template fails the gate — it does not become the answer key.
+Saying what this number is matters: 100% on these cases means the product
+reproduces its documented decisions on new *instances*. It is not evidence of
+generalisation to text the rules have never seen, and it is not a benchmark.
+
+Splits: the held-out quarter is a property of position in a fixed-order file
+(every fourth generated case), so it is reproducible and was sealed before the
+final run. The 18 hand cases are `dev` by definition — they are the cases that
+shaped the rules — so the held-out number is measured on generated cases only.
 
 The live set is deliberately small and names real, checkable entities (Notion's
 founding year, Python's creator, and one product that does not exist). It runs
@@ -797,7 +807,9 @@ gold describes the world at authoring time and a gate that fails when a price
 moves would be measuring the news (D-014).
 
 ```powershell
-backend\.venv\Scripts\python.exe eval\run_eval.py                                  # hermetic gate
+backend\.venv\Scripts\python.exe eval\generate_cases.py            # rebuild the generated half
+backend\.venv\Scripts\python.exe eval\run_eval.py                  # hermetic gate, all cases
+backend\.venv\Scripts\python.exe eval\run_eval.py --split heldout  # the sealed quarter
 backend\.venv\Scripts\python.exe eval\run_eval.py --live --cases eval\gold_live.jsonl
 ```
 
@@ -815,19 +827,67 @@ backend\.venv\Scripts\python.exe eval\run_eval.py --live --cases eval\gold_live.
 
 ### 14.3 Ablations
 
+The gold set is fixed and the model's proposals come from the gold file, so the
+only thing that changes between arms is the code between a proposal and a
+verdict. Model quality is held constant on purpose: this measures the
+deterministic layer, not the model.
+
 | Pipeline | Includes |
 |---|---|
-| Baseline | one LLM verdict from search results |
-| Evidence-gated | + extraction, quote location, settlement |
-| Full PS05 | + value normalization, event dates, decision table |
+| `baseline` | the newest page that mentions the claim is the answer; a contradicts proposal that names a different value becomes `changed` |
+| `baseline-collapsed` | the same reading with no `changed` status: every refutation is `contradicted` |
+| `evidence-gated` | + the quote must be a literal substring of the stored page and its numbers must appear in it; still no event dates |
+| `full` | + settlement, event dates, decision table |
 
-Run the baseline on a 40-claim subset if the token budget is tight; the full
-pipeline runs on all 120 from cache.
+Both baseline variants are reported because choosing only the version that
+scores worse is how an ablation becomes a sales document. `baseline` is the
+charitable one: reading the newest result first is what a search-plus-model
+baseline actually does, and it is right often enough that the comparison is
+worth making.
 
-**Status on 2026-11-10: not run.** The ablation needs a baseline verifier (one
-prompt, no settlement) and the gold set is still 19 claims, so an ablation
-number today would compare two things nobody should quote. It is sequenced after
-the held-out split, and until then this section describes intent, not results.
+`python eval/ablate.py` on 106 cases / 107 claims, printed 2026-11-11:
+
+| pipeline | status accuracy | false supported | false changed | abstention recall |
+|---|---|---|---|---|
+| `baseline` | 57.9% | 14 | 16 | 31.1% |
+| `baseline-collapsed` | 53.3% | 14 | 0 | 31.1% |
+| `evidence-gated` | 65.4% | 6 | 16 | 48.9% |
+| `full` | 100.0% | 0 | 0 | 100.0% |
+
+Where each arm breaks, by expected status (correct / total):
+
+| expected | claims | `baseline` | `baseline-collapsed` | `evidence-gated` | `full` |
+|---|---|---|---|---|---|
+| supported | 26 | 23 | 23 | 23 | 26 |
+| changed | 16 | 16 | 0 | 16 | 16 |
+| contradicted | 20 | 9 | 20 | 9 | 20 |
+| unverifiable | 45 | 14 | 14 | 22 | 45 |
+
+The interesting part is not that the full pipeline scores 100% — it is *which*
+errors the layers remove:
+
+- Quote location removes 8 of the baseline's 14 false `supported`: the 6 invented
+  quotes, a quote that is not in the stored page, and a quote that names the
+  subject but never the value. The other 6 survive it: two first-party pages
+  disagreeing, which needs the decision table (R7), not a substring check.
+- Event dates and the decision table remove all 16 false `changed`. Nine are a
+  refutation with no event date, where the honest verdict is `contradicted`
+  (the change happened but we cannot place it); three are a differently scoped
+  number (`$45 per year` against `$45 per month`); one is a contradiction with
+  no support, which is not a change however new the value looks; one is an
+  unknown generation time; one is two primary sources disagreeing; and one is a
+  newer article restating an older fact.
+- Abstention is where the gap is widest: the baseline abstains correctly in
+  14 of 45 cases that should abstain, quote location raises that to 22, and the
+  full pipeline to 45.
+- `baseline` gets all 16 `changed` cases right, which is the honest reason this
+  ablation is worth running: the naive pipeline is not wrong about the common
+  case, it is wrong exactly where publication time, event time, scope and
+  conflicting sources are involved.
+
+What the ablation cannot say: whether a real model would have proposed the same
+relationships. It is given the same proposals as the full pipeline, so it
+isolates the gates and says nothing about extraction or model recall.
 
 ### 14.4 Mandatory edge cases (each a test)
 
@@ -999,7 +1059,9 @@ Verified by command, not by memory:
 | `pytest backend\tests\verify -q` | 181 passed |
 | `npm test` | 33 tests in 3 TAP suites, 0 failures |
 | `npm run build` | exit 0; 62 modules; `dist` JS 264.57 kB (82.17 kB gzip) |
-| `eval\run_eval.py` (hermetic) | 18 cases / 19 claims; status 100%; false supported 0; false changed 0; 26 quotes valid; event dates 8/8; `$0.0000`; **Gate: PASS** |
+| `eval\run_eval.py` (hermetic, all) | 106 cases / 107 claims; 84 dev / 22 held out; status 100%; false supported 0; false changed 0; abstention recall 100%; 138/138 quotes valid; event dates 44/44; `$0.0000`; **Gate: PASS** |
+| `eval\run_eval.py --split heldout` | 22 cases / 22 claims; status 100%; false supported 0; false changed 0; 28/28 quotes; event dates 8/8; **Gate: PASS** |
+| `eval\ablate.py` | full 100.0% (0/0 false); `evidence-gated` 65.4% (6 false supported, 16 false changed); `baseline` 57.9% (14, 16); `baseline-collapsed` 53.3% (14, 0) |
 | `eval\run_eval.py --live --cases eval\gold_live.jsonl --pause 20` | 3 cases / 3 claims; status accuracy 100%; 11/11 quotes valid; false supported 0; false changed 0; `$0.0000`; **Gate: PASS** |
 
 Postgres, verified on a throwaway scratch cluster (port 5545, schema `tev`, not
@@ -1007,7 +1069,9 @@ the shared DataGoblin database): migrations 001–026 applied in filename order,
 and `create_run(budget_mode="conserve")` persisted and read back `conserve`
 through `PgStore`. The cluster was stopped afterwards; it is proof, not hosting.
 
-Live end-to-end evidence, both runs on the local API:- `1f64a7f8-52de-400a-831d-294dd160a93c`, `CACHE_MODE=off`: ended `partial`
+Live end-to-end evidence, both runs on the local API:
+
+- `1f64a7f8-52de-400a-831d-294dd160a93c`, `CACHE_MODE=off`: ended `partial`
   after Groq rate-limited real calls. It still recorded 8 audit rows (`ok` and
   `error`), 0 replays, and one honest `supported` verdict; a failed model call
   never became a verdict.
@@ -1027,14 +1091,18 @@ Live end-to-end evidence, both runs on the local API:- `1f64a7f8-52de-400a-831d-
   and recorded as `model.failed`. The run ended `partial`, 1/1 stored quote
   resolved, and the true claim was not called supported on evidence nobody read.
 
-Not yet done, in order: a dedicated `DATABASE_URL`, so the Postgres adapter and
-migration 021 can be exercised (the shared DataGoblin database is deliberately
-untouched); the held-out split and the three ablations (§14.3); a larger gold set
-(the current 18 hermetic + 3 live cases are a working gate, not the 105–120 in the
-plan); the recorded demo (§15). Live evaluation is paced with `--pause 20`
-because the Groq free tier answers 429 on bursts and Bifrost then falls back to
-the 1B local model at 30–60 s per call. The product records the fallback or the
-failure; it does not hide either.
+Not yet done, in order: a dedicated `DATABASE_URL`, so the Postgres adapter is
+hosted rather than proven on a throwaway cluster (the shared DataGoblin database
+is deliberately untouched); and the recorded demo (§15). Live evaluation is paced
+with `--pause 20` because the Groq free tier answers 429 on bursts and Bifrost
+then falls back to the 1B local model at 30–60 s per call. The product records
+the fallback or the failure; it does not hide either.
+
+The gold set, the held-out split and the ablations are done (§14.1, §14.3). The
+held-out number is measured on 22 generated cases, not on the 18 hand-written
+ones: those shaped the rules, so counting them as held out would be a lie told
+with a spreadsheet. An ablation that gave every arm the same model proposals
+measures the gates; it says nothing about extraction quality, and §14.3 says so.
 
 ---
 

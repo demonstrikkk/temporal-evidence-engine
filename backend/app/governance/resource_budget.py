@@ -6,7 +6,9 @@ the deterministic evidence settlement standard.
 from __future__ import annotations
 
 import threading
-from typing import Literal
+from typing import Any, Literal
+
+from app.core.config import settings
 
 BudgetMode = Literal["balanced", "conserve", "deep", "offline"]
 
@@ -43,10 +45,13 @@ class BudgetManager:
         elif target == "deep":
             return {
                 "mode": "deep",
-                "max_queries_per_claim": 3,
+                # Deeper than the default, but bounded by the same ceiling the
+                # settings allow so "deep" cannot become an unbounded spend.
+                "max_queries_per_claim": min(
+                    6, settings.RESEARCH_MAX_QUERIES_PER_CLAIM + 3),
                 "allow_live_search": True,
                 "prefer_cached_evidence": False,
-                "search_depth": "basic",
+                "search_depth": "advanced",
                 "description": "Deep research: conducts multiple targeted queries and independent corroboration.",
             }
         elif target == "offline":
@@ -61,7 +66,7 @@ class BudgetManager:
         else:
             return {
                 "mode": "balanced",
-                "max_queries_per_claim": 2,
+                "max_queries_per_claim": settings.RESEARCH_MAX_QUERIES_PER_CLAIM,
                 "allow_live_search": True,
                 "prefer_cached_evidence": True,
                 "search_depth": "basic",

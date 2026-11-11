@@ -8,16 +8,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.cache.coordinator import cache_coordinator
+from app.cache.coordinator import aggregate_stats
 
 
 class CacheMetrics:
-    """Read-only cache metrics aggregated from the CacheCoordinator."""
+    """Read-only cache metrics aggregated from every coordinator instance."""
 
     @staticmethod
     def snapshot() -> dict[str, Any]:
         """Return a point-in-time snapshot of all cache metrics."""
-        stats = cache_coordinator.stats()
+        stats = aggregate_stats()
 
         total_hits = sum(v for k, v in stats.items()
                          if k.endswith("_hits"))

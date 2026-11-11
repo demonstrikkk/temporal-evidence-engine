@@ -17,6 +17,9 @@ import ClaimRegister, { StatusSummary } from './ClaimRegister.jsx';
 import EventRail from './EventRail.jsx';
 import GatewayPanel from './GatewayPanel.jsx';
 import { Empty, RunStatePill, SectionHeading, SkeletonBlock } from './ui.jsx';
+import QuotaRail from './QuotaRail.jsx';
+import BudgetModeSelector from './BudgetModeSelector.jsx';
+import DiagnosticsPanel from './DiagnosticsPanel.jsx';
 
 const STAGE_COPY = {
   queued: 'Queued',
@@ -201,6 +204,7 @@ export default function RunView() {
 
         <div className="flex flex-col items-end gap-2">
           <StatusSummary counts={counts} />
+          <BudgetModeSelector mode={run?.budget_mode || 'balanced'} />
           <div className="flex flex-wrap justify-end gap-1.5">
             <button
               type="button"
@@ -230,6 +234,7 @@ export default function RunView() {
       </div>
 
       <PartialBanner run={run} events={events} />
+      <QuotaRail />
 
       {live ? (
         <div className="flex items-center gap-3 rounded-md border border-rule bg-paper-2 px-3.5 py-2.5">
@@ -312,6 +317,8 @@ export default function RunView() {
           </div>
         </aside>
       </div>
+
+      <DiagnosticsPanel />
     </div>
   );
 }

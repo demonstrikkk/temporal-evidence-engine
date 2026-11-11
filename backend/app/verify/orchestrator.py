@@ -35,7 +35,6 @@ from app.verify.settlement import settle_assertion
 from app.verify.store import VerifyStore, build_store, iso, new_id, now, parse_iso
 from app.verify.temporal import event_date_from_quote
 from app.cache.coordinator import CacheCoordinator
-from app.cache.keys import claim_fingerprint
 
 #: Negation cues that can contradict a claim without naming a replacement value.
 _NEGATIONS = ("no longer", "not available", "no longer available",
@@ -129,6 +128,13 @@ def create_run(store: VerifyStore, payload: AnswerIn) -> RunCreated:
     answer_id = new_id()
     run_id = new_id()
     stamp = now()
+    # The operator's selected mode is the default; an explicit per-request mode
+    # wins. `model_fields_set` distinguishes "balanced because that is the
+    # default" from "balanced because the caller asked for it".
+    budget_mode = payload.budget_mode
+    if "budget_mode" not in getattr(payload, "model_fields_set", set()):
+        from app.governance.resource_budget import budget_manager
+        budget_mode = budget_manager.current_mode
     store.create_answer({
         "id": answer_id,
         "prompt": payload.prompt,
@@ -144,7 +150,8 @@ def create_run(store: VerifyStore, payload: AnswerIn) -> RunCreated:
     store.create_run({
         "id": run_id, "answer_id": answer_id, "status": "queued",
         "stage": "queued", "rule_version": RULE_VERSION,
-        "cache_mode": settings.CACHE_MODE, "started_at": iso(stamp),
+        "cache_mode": settings.CACHE_MODE, "budget_mode": budget_mode,
+        "started_at": iso(stamp),
     })
     return RunCreated(run_id=run_id, answer_id=answer_id)
 
@@ -316,101 +323,80 @@ class Verifier:
 
         run_meta = self.store.get_run(self.run_id) or {}
         budget_mode = run_meta.get("budget_mode") or "balanced"
-        queries = plan_queries(draft, budget_mode=budget_mode)
-        if not queries:
-            self._settle_empty(claim_row, draft,
-                               ReasonCode.NO_SOURCE,
-                               "No search query could be derived from this claim.")
-            return
-
-        # L5: Check claim-evidence reuse cache before Tavily search
         value_scope = draft.object_raw or ""
-        fp_key = claim_fingerprint(
-            subject=draft.subject,
-            predicate=draft.predicate,
-            qualifiers=draft.qualifiers,
-            value_scope=value_scope)
+        facts: list[EvidenceFact] = []
+        settled_revisions: set[str] = set()
+
+        # L5: reuse research we already paid for. Only the locatable evidence
+        # rows are copied onto this claim; the *verdict* is always recomputed
+        # against this answer's generated_at, because a fact that was true in
+        # September can be stale in November. Without the copy the new claim
+        # would carry a verdict and no evidence trail.
         cached_evidence = self.cache.get_l5(
             subject=draft.subject,
             predicate=draft.predicate,
             qualifiers=draft.qualifiers,
             value_scope=value_scope)
-        revision_ids: list[str] = []
-        facts: list[EvidenceFact] = []
-        if cached_evidence:
-            # Reuse cached evidence; recompute temporal verdict for this generated_at
-            for ev in cached_evidence:
-                try:
-                    ev_date = None
-                    if ev.get("event_date"):
-                        ev_date = parse_iso(ev["event_date"])
-                    pub_date = None
-                    if ev.get("publication_date"):
-                        pub_date = parse_iso(ev["publication_date"])
-                    facts.append(EvidenceFact(
-                        evidence_id=str(ev["evidence_id"]),
-                        relationship=Relationship.parse(ev.get("relationship")),
-                        quote_located=bool(ev.get("quote_located")),
-                        settled=bool(ev.get("settled")),
-                        event_date=ev_date,
-                        event_date_status=str(ev.get("event_date_status", "missing")),
-                        candidate_value=ev.get("candidate_value"),
-                        publication_date=pub_date,
-                        credibility=str(ev.get("credibility", "secondary")),
-                        retrieved_at=parse_iso(ev.get("retrieved_at")),
-                    ))
-                    revision_ids.append(str(ev["evidence_id"]))
-                except Exception:
-                    continue
-            self.emit("claim.evidence_reused", {"claim_id": claim_id,
-                                                "evidence_count": len(facts)})
-            self.counters["evidence"] += len(facts)
+        reused = self._reuse_evidence(claim_id, cached_evidence or [])
+        if reused:
+            facts.extend(reused)
+            self.counters["evidence"] += len(reused)
+            self.counters["settled"] += sum(1 for f in reused if f.settled)
+            self.emit("claim.evidence_reused", {
+                "claim_id": claim_id, "evidence_count": len(reused),
+                "evidence_ids": [f.evidence_id for f in reused],
+                "reason": "the same claim was researched before; evidence rows "
+                          "were copied and the temporal verdict recomputed"})
             decision = decide(claim_value=draft.object_raw,
                               answer_generated_at=generated_at, facts=facts)
             self._record(claim_row, draft, decision, facts, generated_at)
             return
 
-        revision_ids: list[str] = []
-        facts: list[EvidenceFact] = []
+        queries = plan_queries(draft, budget_mode=budget_mode)
 
-        # Existing-source discovery: before spending Tavily credits, check if
-        # we already extracted a page that mentions this claim's subject and
-        # predicate. Reuse it instead of searching again.
+        # Existing-source discovery: settle pages we already hold before
+        # spending a Tavily credit. This is the first rung of the escalation
+        # ladder; search happens only when stored text cannot answer. It runs
+        # even in offline mode, where no query is allowed at all.
         existing = find_existing_revisions(
             self.store,
             subject=draft.subject,
             predicate=draft.predicate,
-            value_scope=draft.object_raw or "",
+            value_scope=value_scope,
             limit=5)
-        for ev in existing:
-            try:
-                ev_date = None
-                if ev.get("published_date"):
-                    ev_date = parse_iso(ev["published_date"])
-                facts.append(EvidenceFact(
-                    evidence_id=str(ev["revision_id"]),
-                    relationship=Relationship.SILENT,
-                    quote_located=False,
-                    settled=False,
-                    event_date=ev_date,
-                    event_date_status="missing",
-                    candidate_value=None,
-                    publication_date=ev_date,
-                    credibility="secondary",
-                    retrieved_at=None,
-                ))
-                revision_ids.append(str(ev["revision_id"]))
-            except Exception:
-                continue
-        if facts:
+        existing_ids = [str(ev["revision_id"]) for ev in existing
+                        if str(ev["revision_id"]) not in settled_revisions]
+        if existing_ids:
             self.emit("claim.source_reused", {"claim_id": claim_id,
-                                              "sources": len(facts)})
-            self.counters["sources"] += len(facts)
+                                              "sources": len(existing_ids),
+                                              "stage": "existing_sources"})
+            self.counters["sources"] += len(existing_ids)
+            facts.extend(self._settle(claim_id, draft, existing_ids))
+            settled_revisions.update(existing_ids)
             decision = decide(claim_value=draft.object_raw,
                               answer_generated_at=generated_at, facts=facts)
-            self._record(claim_row, draft, decision, facts, generated_at)
+            if decision.status != ClaimStatus.UNVERIFIABLE:
+                # Stored evidence already decides it; escalation would spend
+                # credits to learn nothing.
+                self._record(claim_row, draft, decision, facts, generated_at)
+                return
+
+        if not queries:
+            # No research is permitted (offline, or the claim yields no query).
+            # If stored text was examined, report *that* outcome — "the sources
+            # we hold do not establish it" is not the same statement as "we
+            # never looked".
+            if existing_ids:
+                decision = decide(claim_value=draft.object_raw,
+                                  answer_generated_at=generated_at, facts=facts)
+                self._record(claim_row, draft, decision, facts, generated_at)
+            else:
+                self._settle_empty(claim_row, draft,
+                                   ReasonCode.NO_SOURCE,
+                                   "No search query could be derived from this claim.")
             return
 
+        revision_ids: list[str] = []
         for query in queries:
             self.counters["queries"] += 1
             try:
@@ -490,7 +476,9 @@ class Verifier:
                     "published_date": revision.revision.get("published_date"),
                     "status": extract.status})
 
-        facts = self._settle(claim_id, draft, revision_ids)
+        new_revisions = [rid for rid in revision_ids
+                         if rid not in settled_revisions]
+        facts.extend(self._settle(claim_id, draft, new_revisions))
         # L5: Store settled evidence for future claim-evidence reuse
         evidence_list = []
         for f in facts:
@@ -518,6 +506,72 @@ class Verifier:
         decision = decide(claim_value=draft.object_raw,
                           answer_generated_at=generated_at, facts=facts)
         self._record(claim_row, draft, decision, facts, generated_at)
+
+    def _reuse_evidence(self, claim_id: str,
+                        cached: list[dict]) -> list[EvidenceFact]:
+        """Copy previously settled evidence onto a new claim.
+
+        Reuse is not a shortcut around the gate: the copied rows keep the
+        offsets, quote and event date they were settled with, and the caller
+        still recomputes the verdict. `model_call_id` is NULL on the copy
+        because no model call produced this link in this run — writing the old
+        request id would claim a call that did not happen.
+        """
+        facts: list[EvidenceFact] = []
+        for ev in cached:
+            old = self.store.get_evidence(str(ev.get("evidence_id") or ""))
+            if not old:
+                # The referenced evidence is gone (different store, pruned
+                # cache). Fall through to live research rather than inventing
+                # a fact with no row behind it.
+                continue
+            relationship = Relationship.parse(ev.get("relationship"))
+            settled = bool(ev.get("settled"))
+            row = self.store.add_evidence({
+                "id": new_id(), "claim_id": claim_id,
+                "source_revision_id": old.get("source_revision_id"),
+                "quote_text": old.get("quote_text") or "",
+                "start_char": int(old.get("start_char")
+                                  if old.get("start_char") is not None else -1),
+                "end_char": int(old.get("end_char")
+                                if old.get("end_char") is not None else -1),
+                "event_date": old.get("event_date"),
+                "event_date_quote": old.get("event_date_quote"),
+                "event_date_status": old.get("event_date_status") or "missing",
+                "retrieved_at": old.get("retrieved_at") or iso(now()),
+            })
+            self.store.add_link({
+                "id": new_id(), "claim_id": claim_id,
+                "evidence_id": row["id"],
+                "relationship_proposed": relationship.value,
+                "relationship_settled": relationship.value if settled else None,
+                "settlement_status": "accepted" if settled else "rejected",
+                "settlement_reason": ("" if settled else
+                                      "reused from a prior verification where "
+                                      "this proposal was rejected"),
+                "settlement_start": old.get("start_char") if settled else None,
+                "settlement_end": old.get("end_char") if settled else None,
+                "candidate_value_raw": ev.get("candidate_value"),
+                "candidate_value_normalized": None,
+                "model_call_id": None,
+                "created_at": iso(now()),
+            })
+            event_dt = parse_iso(ev.get("event_date"))
+            publication_dt = parse_iso(ev.get("publication_date"))
+            facts.append(EvidenceFact(
+                evidence_id=str(row["id"]),
+                relationship=relationship,
+                quote_located=bool(ev.get("quote_located")),
+                settled=settled,
+                event_date=event_dt.date() if event_dt else None,
+                event_date_status=str(ev.get("event_date_status", "missing")),
+                candidate_value=ev.get("candidate_value"),
+                publication_date=(publication_dt.date()
+                                  if publication_dt else None),
+                credibility=str(ev.get("credibility", "secondary")),
+                retrieved_at=parse_iso(ev.get("retrieved_at")),
+            ))
+        return facts
 
     def _settle(self, claim_id: str, draft: ClaimDraft,
                 revision_ids: list[str]) -> list[EvidenceFact]:
@@ -709,6 +763,14 @@ class Verifier:
             "freshness_index": freshness_index(draft.volatility_class, stamp),
             "rule_version": RULE_VERSION,
         })
+        # Corroboration is reported, never decisive. A reader should know that
+        # three agreeing URLs are three copies of one press release before they
+        # read "supported" as three independent confirmations.
+        from app.verify.corroboration import assess_claim
+        corroboration = assess_claim(self.store, claim_id, draft.subject)
+        if corroboration["independence"]["source_count"]:
+            self.emit("claim.corroboration", {"claim_id": claim_id,
+                                              **corroboration})
 
     def _settle_empty(self, claim_row: dict, draft: ClaimDraft,
                       reason: ReasonCode, explanation: str) -> None:

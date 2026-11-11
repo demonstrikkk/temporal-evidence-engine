@@ -682,9 +682,10 @@ class PgStore:
     def create_run(self, row: dict) -> dict:
         return self._write(
             """INSERT INTO verification_runs (id, answer_id, status, stage,
-                   rule_version, cache_mode, started_at)
+                   rule_version, cache_mode, budget_mode, started_at)
                VALUES (%(id)s, %(answer_id)s, %(status)s, %(stage)s,
-                   %(rule_version)s, %(cache_mode)s, %(started_at)s)
+                   %(rule_version)s, %(cache_mode)s, %(budget_mode)s,
+                   %(started_at)s)
                RETURNING *""", row)
 
     def update_run(self, run_id: str, **fields: Any) -> dict | None:
@@ -1002,10 +1003,14 @@ class PgStore:
         return 1 if res else 0
 
     def purge_cache_by_prefix(self, prefix: str, metadata_contains: str = "") -> int:
-        """Purge cache entries whose cache_key starts with `prefix`."""
+        """Purge cache entries whose cache_key starts with `prefix`, optionally
+        requiring `metadata_contains` to appear in the entry's metadata."""
         res = self._write(
-            "DELETE FROM cache_entries WHERE cache_key LIKE %s RETURNING cache_key",
-            (prefix + "%",))
+            """DELETE FROM cache_entries
+               WHERE cache_key LIKE %s
+                 AND (%s = '' OR metadata::text LIKE %s)
+               RETURNING cache_key""",
+            (prefix + "%", metadata_contains, f"%{metadata_contains}%"))
         return len(res) if res else 0
 
     def purge_cache_by_version(self, cache_type: str,

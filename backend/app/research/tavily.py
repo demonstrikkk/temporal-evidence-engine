@@ -172,6 +172,12 @@ class TavilyClient:
         data["_latency_ms"] = latency_ms
         data["_fetched_at"] = iso(now())
         self._store(tool, payload, data)
+        # Only live responses reach this point; cache hits return earlier, so a
+        # snapshot replay never adds to the spend ledger.
+        from app.governance.quota_ledger import quota_ledger
+        quota_ledger.set_store(self.store)
+        quota_ledger.record_tavily_usage(
+            tool, int((data.get("usage") or {}).get("credits") or 1))
         log.info("tavily call", extra={"data": {
             "tool": tool, "latency_ms": latency_ms,
             "request_id": data.get("request_id") or "",

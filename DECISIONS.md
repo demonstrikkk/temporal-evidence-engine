@@ -399,3 +399,24 @@ this decision keep the words they were written with.
 The regression is pinned where the values are produced:
 `test_pipeline.py` asserts an accepted row carries its relationship and a
 rejected row carries `NULL`.
+
+## D-018 - Budget mode is stored on the run and has one source of truth (2026-11-11)
+
+The mode a run was created under was previously invisible after the fact, and the
+query caps lived in two places: `planner.plan_queries` hard-coded 1/3/3 while
+`resource_budget.get_policy` advertised 1/3/2. A UI that promised conserve would
+starve research could therefore spend as much as balanced.
+
+Now:
+
+- `create_run` resolves an explicit per-request mode first, then the operator's
+  current mode, and stores it in `tev.verification_runs.budget_mode` (migration
+  `026`, additive, default `balanced`). A replay or an audit can see why a claim
+  abstained.
+- `planner` reads `budget_manager.get_policy(mode)["max_queries_per_claim"]` and
+  `allow_live_search`, so the settings panel and the research path cannot drift.
+  `deep` buys more than `balanced` (bounded by 6), `conserve` buys one query, and
+  `offline` buys none.
+- A budget mode still changes only how much research is purchased. It never
+  lowers the evidence threshold: offline/conserve runs that cannot prove a claim
+  abstain `unverifiable`, they do not promote it.

@@ -32,7 +32,7 @@ class ConfigVersionIn(BaseModel):
 @router.get("/quota")
 async def get_quota() -> dict[str, Any]:
     summary = quota_ledger.get_summary()
-    cache_stats = cache_coordinator.stats()
+    cache_stats = cache_metrics.snapshot()
     return {
         "quota": summary,
         "cache_savings": cache_stats,

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-from app.core.config import settings
+from app.governance.resource_budget import budget_manager
 from app.verify.schemas import ClaimDraft
 
 _LEADING = re.compile(r"^(?:the|a|an|in|on|as|at|it|this|that)\s+", re.I)
@@ -24,16 +24,18 @@ def _tidy(text: str, limit: int = 220) -> str:
 
 
 def plan_queries(claim: ClaimDraft, budget_mode: str = "balanced") -> list[str]:
-    if budget_mode == "offline":
+    # The policy is the single source of truth for how much research a mode may
+    # buy. Duplicating the numbers here is how "conserve" once searched as much
+    # as "balanced" while the settings panel claimed otherwise.
+    policy = budget_manager.get_policy(budget_mode)  # type: ignore[arg-type]
+    max_queries = int(policy.get("max_queries_per_claim") or 0)
+    if max_queries <= 0 or not policy.get("allow_live_search", True):
         return []
 
     subject = _tidy(claim.subject or "", 100)
     predicate = _tidy(claim.predicate or "", 100)
     value = _tidy(claim.object_raw or "", 80)
     text = _tidy(claim.claim_text, 220)
-
-    # In conserve mode: at most 1 query; deep mode: up to 3 queries
-    max_queries = 1 if budget_mode == "conserve" else (3 if budget_mode == "deep" else settings.RESEARCH_MAX_QUERIES_PER_CLAIM)
 
     candidates: list[str] = []
     if subject and predicate:

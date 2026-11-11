@@ -18,6 +18,7 @@ import {
   TabPanel,
   Tabs,
 } from './ui.jsx';
+import ProofGraph from './ProofGraph.jsx';
 
 function eventStatusLabel(status) {
   if (status === 'explicit') return 'stated in source';
@@ -160,6 +161,75 @@ function EvidenceCard({ item, index, answerGeneratedAt }) {
   );
 }
 
+function Corroboration({ data }) {
+  if (!data) return null;
+  const independence = data.independence || {};
+  const quality = data.quality || {};
+  if (!independence.source_count) return null;
+
+  const syndicated = Number(independence.syndicated_groups || 0) > 0;
+  const tiers = quality.tiers || {};
+  const tierRows = [
+    ['high', 'text-ok border-ok/35 bg-ok-soft'],
+    ['medium', 'text-warn border-warn/35 bg-warn-soft'],
+    ['low', 'text-muted border-rule-2 bg-warm/60'],
+  ].filter(([tier]) => Number(tiers[tier] || 0) > 0);
+
+  return (
+    <section className="surface-inset p-3" aria-label="Source corroboration">
+      <div className="flex items-center justify-between gap-2">
+        <p className="eyebrow">Corroboration</p>
+        <span className={`font-mono text-[10px] ${syndicated ? 'text-warn' : 'text-ok'}`}>
+          {independence.independent_origins}{' '}
+          {independence.independent_origins === 1 ? 'independent origin' : 'independent origins'}
+        </span>
+      </div>
+      <p className="mt-1 text-[11px] leading-snug text-ink-2">
+        {independence.source_count}{' '}
+        {independence.source_count === 1 ? 'source' : 'sources'} · effective corroboration{' '}
+        <span className="font-mono">{independence.effective_corroboration}</span>
+        {syndicated
+          ? ` · ${independence.syndicated_groups} syndicated ${
+              independence.syndicated_groups === 1 ? 'group' : 'groups'
+            }`
+          : ''}
+      </p>
+      {syndicated ? (
+        <p className="mt-1 text-[10.5px] leading-snug text-warn">
+          {independence.note}
+        </p>
+      ) : null}
+      {tierRows.length ? (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <span className="text-[10px] text-muted">Authority</span>
+          {tierRows.map(([tier, cls]) => (
+            <span
+              key={tier}
+              className={`rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
+              title={quality.sources
+                ?.filter((row) => row.authority_tier === tier)
+                .flatMap((row) => row.signals || [])
+                .join(', ')}
+            >
+              {tiers[tier]} {tier}
+            </span>
+          ))}
+          {Number(quality.official_sources || 0) > 0 ? (
+            <span className="text-[10px] text-muted">
+              {quality.official_sources} official
+            </span>
+          ) : null}
+          {Number(quality.first_party_sources || 0) > 0 ? (
+            <span className="text-[10px] text-muted">
+              {quality.first_party_sources} first-party
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export default function ClaimInspector({ runId, claimId, answerGeneratedAt, version }) {
   const { claim, error, loading } = useClaim(runId, claimId, version);
   const [tab, setTab] = useState('evidence');
@@ -239,6 +309,8 @@ export default function ClaimInspector({ runId, claimId, answerGeneratedAt, vers
 
         {claim.status === 'changed' ? <ValueChange claim={claim} /> : null}
 
+        <Corroboration data={claim.corroboration} />
+
         <div>
           <Tabs
             label="Claim detail"
@@ -246,6 +318,7 @@ export default function ClaimInspector({ runId, claimId, answerGeneratedAt, vers
             onChange={setTab}
             tabs={[
               { id: 'evidence', label: 'Evidence', count: evidence.length },
+              { id: 'proof', label: 'Proof Graph', count: evidence.length },
               { id: 'history', label: 'History', count: (claim.timeline || []).length },
             ]}
           />
@@ -269,6 +342,9 @@ export default function ClaimInspector({ runId, claimId, answerGeneratedAt, vers
                     : 'No evidence row exists for this claim. The verdict explains why.'}
                 </Empty>
               )}
+            </TabPanel>
+            <TabPanel id="proof" active={tab === 'proof'}>
+              <ProofGraph claim={claim} evidence={evidence} />
             </TabPanel>
 
             <TabPanel id="history" active={tab === 'history'}>

@@ -964,6 +964,12 @@ Built and exercised:
   model interface; `backend/app/research/{tavily,sources,planner}.py` the only
   research path. Migrations 014–020 create schema `tev`; 021 removes the
   rule-version column default.
+- `backend/tests/verify/test_resilience.py` — quota exhaustion, offline mode,
+  duplicate launch, stale-revision cache invalidation, numeric hallucination and
+  invented-citation rejection. Each case asserts the product abstains (or
+  reports) rather than inventing a verdict. Budget modes now have one source of
+  truth: `resource_budget.get_policy()`; the planner no longer keeps its own copy
+  of the query caps, so `conserve` cannot silently search as much as `balanced`.
 - `backend/app/api/verify.py` — create/list/get run, claim detail, events, SSE,
   report (md/json), watchlist, health, and `/gateway`. A run detail now also
   reports `gateway.replays`, counted from the rail, because a replayed run writes
@@ -989,16 +995,19 @@ Verified by command, not by memory:
 
 | command | last output |
 |---|---|
-| `pytest backend\tests -q` | 2320 passed, 8 skipped |
-| `pytest backend\tests\verify -q` | 140 passed |
-| `npm test` | 33 tests in 3 suites, 0 failures |
-| `npm run build` | exit 0; 58 modules; `dist` JS 248.18 kB (78.21 kB gzip) |
+| `pytest backend\tests -q` | 2454 passed, 8 skipped |
+| `pytest backend\tests\verify -q` | 181 passed |
+| `npm test` | 33 tests in 3 TAP suites, 0 failures |
+| `npm run build` | exit 0; 62 modules; `dist` JS 264.57 kB (82.17 kB gzip) |
 | `eval\run_eval.py` (hermetic) | 18 cases / 19 claims; status 100%; false supported 0; false changed 0; 26 quotes valid; event dates 8/8; `$0.0000`; **Gate: PASS** |
 | `eval\run_eval.py --live --cases eval\gold_live.jsonl --pause 20` | 3 cases / 3 claims; status accuracy 100%; 11/11 quotes valid; false supported 0; false changed 0; `$0.0000`; **Gate: PASS** |
 
-Live end-to-end evidence, both runs on the local API:
+Postgres, verified on a throwaway scratch cluster (port 5545, schema `tev`, not
+the shared DataGoblin database): migrations 001–026 applied in filename order,
+and `create_run(budget_mode="conserve")` persisted and read back `conserve`
+through `PgStore`. The cluster was stopped afterwards; it is proof, not hosting.
 
-- `1f64a7f8-52de-400a-831d-294dd160a93c`, `CACHE_MODE=off`: ended `partial`
+Live end-to-end evidence, both runs on the local API:- `1f64a7f8-52de-400a-831d-294dd160a93c`, `CACHE_MODE=off`: ended `partial`
   after Groq rate-limited real calls. It still recorded 8 audit rows (`ok` and
   `error`), 0 replays, and one honest `supported` verdict; a failed model call
   never became a verdict.

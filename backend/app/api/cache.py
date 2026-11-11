@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from app.api.deps import require_api_key
-from app.cache.coordinator import cache_coordinator
+from app.cache.metrics import cache_metrics
 from app.verify.runtime import get_store
 
 router = APIRouter(prefix="/api/cache", tags=["cache"],
@@ -21,9 +21,8 @@ class PurgeIn(BaseModel):
 
 @router.get("/stats")
 async def cache_stats() -> dict[str, Any]:
-    return {
-        "stats": cache_coordinator.stats(),
-    }
+    """The shape the quota rail reads: hit rates, layer counts, saved calls."""
+    return cache_metrics.snapshot()
 
 
 @router.post("/purge")

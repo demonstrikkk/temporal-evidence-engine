@@ -24,6 +24,37 @@ from app.core.config import RULE_VERSION, settings
 from app.core.logging import log
 
 
+#: Per-instance coordinators are the right shape for tests and for request
+#: isolation, but the quota rail reads one process-wide number. Without an
+#: aggregate, every component's hits lived in its own object and the dashboard
+#: reported a permanent 0% hit rate.
+_AGGREGATE_LOCK = threading.Lock()
+_AGGREGATE: dict[str, int] = {
+    "l0_hits": 0, "l0_misses": 0,
+    "l1_hits": 0, "l1_misses": 0,
+    "l2_hits": 0, "l2_misses": 0,
+    "l3_hits": 0, "l3_misses": 0,
+    "l4_hits": 0, "l4_misses": 0,
+    "l5_hits": 0, "l5_misses": 0,
+    "saved_model_calls": 0,
+    "saved_tavily_searches": 0,
+    "saved_tavily_extracts": 0,
+}
+
+
+def aggregate_stats() -> dict[str, int]:
+    """Process-wide cache counters, summed across every coordinator instance."""
+    with _AGGREGATE_LOCK:
+        return dict(_AGGREGATE)
+
+
+def reset_aggregate_stats() -> None:
+    with _AGGREGATE_LOCK:
+        for key in _AGGREGATE:
+            _AGGREGATE[key] = 0
+
+
+
 class CacheCoordinator:
     """Central manager for multi-tier caching across the intelligence engine."""
 
@@ -60,6 +91,25 @@ class CacheCoordinator:
             return self._store
         from app.verify.runtime import get_store
         return get_store()
+
+    # -- metrics -----------------------------------------------------------
+    def _hit(self, layer: str, saved: str | None = None) -> None:
+        key = f"{layer}_hits"
+        with self._lock:
+            self._stats[key] += 1
+            if saved:
+                self._stats[saved] += 1
+        with _AGGREGATE_LOCK:
+            _AGGREGATE[key] += 1
+            if saved:
+                _AGGREGATE[saved] += 1
+
+    def _miss(self, layer: str) -> None:
+        key = f"{layer}_misses"
+        with self._lock:
+            self._stats[key] += 1
+        with _AGGREGATE_LOCK:
+            _AGGREGATE[key] += 1
 
     # -- Single-flight coordination (L0) ----------------------------------
     def single_flight(self, key: str, action: Callable[[], Any]) -> Any:
@@ -108,21 +158,26 @@ class CacheCoordinator:
             if key in self._l1_mem_cache:
                 val, exp = self._l1_mem_cache[key]
                 if exp == 0.0 or time.time() < exp:
-                    self._stats["l1_hits"] += 1
-                    return val
-                self._l1_mem_cache.pop(key, None)
+                    pass
+                else:
+                    self._l1_mem_cache.pop(key, None)
+                    val = None
+            else:
+                val = None
+        if val is not None:
+            self._hit("l1")
+            return val
 
         # Fallback to persistent store
         entry = self.store.get_cache_entry(key)
         if entry and not CachePolicy.is_expired(entry.get("expires_at")):
             with self._lock:
-                self._stats["l1_hits"] += 1
                 self._l1_mem_cache[key] = (entry.get("payload"), time.time() + 3600.0)
             self.store.touch_cache_entry(key)
+            self._hit("l1")
             return entry.get("payload")
 
-        with self._lock:
-            self._stats["l1_misses"] += 1
+        self._miss("l1")
         return None
 
     def put_l1(self, op_name: str, input_data: Any, result: Any, version: str = "v1", ttl_seconds: int = 86400) -> None:
@@ -151,14 +206,11 @@ class CacheCoordinator:
         key = model_kv_key(model, stage, system, user, temperature, max_tokens, json_mode)
         entry = self.store.get_cache_entry(key)
         if entry and not CachePolicy.is_expired(entry.get("expires_at")):
-            with self._lock:
-                self._stats["l2_hits"] += 1
-                self._stats["saved_model_calls"] += 1
+            self._hit("l2", saved="saved_model_calls")
             self.store.touch_cache_entry(key)
             return entry.get("payload")
 
-        with self._lock:
-            self._stats["l2_misses"] += 1
+        self._miss("l2")
         return None
 
     def put_l2(self, model: str, stage: str, system: str, user: str,
@@ -185,14 +237,11 @@ class CacheCoordinator:
         key = tavily_query_key(query, search_depth, time_range, include_domains, max_results=max_results)
         entry = self.store.get_cache_entry(key)
         if entry and not CachePolicy.is_expired(entry.get("expires_at")):
-            with self._lock:
-                self._stats["l3_hits"] += 1
-                self._stats["saved_tavily_searches"] += 1
+            self._hit("l3", saved="saved_tavily_searches")
             self.store.touch_cache_entry(key)
             return entry.get("payload")
 
-        with self._lock:
-            self._stats["l3_misses"] += 1
+        self._miss("l3")
         return None
 
     def put_l3(self, query: str, payload: dict[str, Any], search_depth: str = "basic",
@@ -213,12 +262,10 @@ class CacheCoordinator:
     # -- L4: Source revision reuse ----------------------------------------
     def find_source_revision(self, canonical_url: str, content_hash: str) -> dict[str, Any] | None:
         rev = self.store.find_revision_by_hash(canonical_url, content_hash)
-        with self._lock:
-            if rev:
-                self._stats["l4_hits"] += 1
-                self._stats["saved_tavily_extracts"] += 1
-            else:
-                self._stats["l4_misses"] += 1
+        if rev:
+            self._hit("l4", saved="saved_tavily_extracts")
+        else:
+            self._miss("l4")
         return rev
 
     # -- L5: Claim evidence reuse -----------------------------------------
@@ -230,13 +277,11 @@ class CacheCoordinator:
         key = claim_fingerprint(subject, predicate, qualifiers, value_scope)
         entry = self.store.get_cache_entry(key)
         if entry and not CachePolicy.is_expired(entry.get("expires_at")):
-            with self._lock:
-                self._stats["l5_hits"] += 1
+            self._hit("l5")
             self.store.touch_cache_entry(key)
             return entry.get("payload")
 
-        with self._lock:
-            self._stats["l5_misses"] += 1
+        self._miss("l5")
         return None
 
     def put_l5(self, subject: str, predicate: str, evidence_list: list[dict[str, Any]],
@@ -246,13 +291,38 @@ class CacheCoordinator:
             return
         key = claim_fingerprint(subject, predicate, qualifiers, value_scope)
         ttl = CachePolicy.ttl_for_claim(claim_type, volatility_class)
+        # Provenance is what makes invalidation possible: without the canonical
+        # URLs behind this evidence, a changed page cannot find the entries that
+        # depend on it and either purges everything or nothing.
+        canonical_urls: set[str] = set()
+        revision_ids: set[str] = set()
+        for ev in evidence_list:
+            try:
+                row = self.store.get_evidence(str(ev.get("evidence_id") or ""))
+            except Exception:  # noqa: BLE001 — provenance is best-effort
+                row = None
+            if not row:
+                continue
+            revision_id = str(row.get("source_revision_id") or "")
+            if not revision_id:
+                continue
+            revision_ids.add(revision_id)
+            revision = self.store.get_revision(revision_id) or {}
+            source = self.store.get_source(str(revision.get("source_id") or ""))
+            if source and source.get("canonical_url"):
+                canonical_urls.add(str(source["canonical_url"]))
         self.store.put_cache_entry({
             "cache_key": key,
             "cache_type": "l5_evidence",
             "cache_version": RULE_VERSION,
             "payload": evidence_list,
             "expires_at": CachePolicy.calculate_expiry(ttl).isoformat() if ttl else None,
-            "metadata": {"subject": subject, "predicate": predicate, "claim_type": claim_type},
+            "metadata": {
+                "subject": subject, "predicate": predicate,
+                "claim_type": claim_type,
+                "source_revision_ids": sorted(revision_ids),
+                "canonical_urls": sorted(canonical_urls),
+            },
         })
 
     def stats(self) -> dict[str, Any]:

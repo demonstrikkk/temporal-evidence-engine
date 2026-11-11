@@ -38,7 +38,12 @@ def test_governance_budget_mode_endpoint(client):
 def test_cache_stats_and_purge_endpoint(client):
     res = client.get("/api/cache/stats")
     assert res.status_code == 200
-    assert "stats" in res.json()
+    stats = res.json()
+    # The quota rail reads this shape; assert the contract, not just 200.
+    assert "overall_hit_rate" in stats
+    assert "layer_counts" in stats
+    assert "external_calls_saved" in stats
+    assert set(stats["layer_counts"]) == {"l0", "l1", "l2", "l3", "l4", "l5"}
 
     purge_res = client.post("/api/cache/purge", json={"cache_type": "l1_calc"})
     assert purge_res.status_code == 200

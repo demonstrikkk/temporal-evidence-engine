@@ -454,6 +454,12 @@ class BifrostClient:
             "request_id": request_id, "latency_ms": latency_ms,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens, "cost_usd": cost}})
+        # Quota accounting reads these rows through the ledger; without this
+        # call the quota rail was a permanently-zero panel.
+        from app.governance.quota_ledger import quota_ledger
+        quota_ledger.set_store(self.store)
+        quota_ledger.record_model_usage(
+            result.input_tokens + result.output_tokens, provider=provider)
         return result
 
     def _record_failure(self, error: BifrostError, *, stage: str,

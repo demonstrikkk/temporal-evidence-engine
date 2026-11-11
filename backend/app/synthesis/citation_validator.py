@@ -52,6 +52,20 @@ def _has_factual_content(sentence: str) -> bool:
     )
 
 
+def _numeric_tokens(text: str) -> set[str]:
+    """Numbers as written, with currency and thousands separators removed.
+
+    Substring matching (`"99" in "$199"`) is how a hallucinated price passes a
+    check that was supposed to catch it, so tokens are compared exactly.
+    """
+    tokens: set[str] = set()
+    for match in _NUMERIC_RE.findall(text or ""):
+        cleaned = match.replace(",", "").strip(" $€£")
+        if cleaned:
+            tokens.add(cleaned)
+    return tokens
+
+
 def validate_citations(
     answer_text: str,
     evidence_context: dict[str, Any],
@@ -74,13 +88,14 @@ def validate_citations(
 
     # 2. Validate numeric consistency
     # Ensure numerical values from verified claims are not mangled
+    answer_numbers = _numeric_tokens(answer_text)
+    numeric_mismatches: list[str] = []
     for claim in verified_claims:
         raw_val = claim.get("value_raw") or ""
-        numbers = _NUMERIC_RE.findall(raw_val)
-        for num in numbers:
-            clean_num = num.strip(" $€£,")
-            if clean_num and clean_num not in answer_text:
+        for num in _numeric_tokens(raw_val):
+            if num not in answer_numbers:
                 # Value from verified claim missing from answer
+                numeric_mismatches.append(num)
                 errors.append(f"Expected numerical value '{num}' from claim '{claim['text']}' not found in answer.")
 
     # 3. Detect unsupported assertions: factual sentences without citations
@@ -116,7 +131,7 @@ def validate_citations(
     addressed = covered_claims
     completeness_score = round(addressed / material_claims, 3) if material_claims > 0 else 1.0
 
-    is_valid = len(invalid_citations) == 0
+    is_valid = len(invalid_citations) == 0 and not numeric_mismatches
 
     return ValidationResult(
         is_valid=is_valid,
@@ -132,6 +147,7 @@ def validate_citations(
             "total_citations": total_citations,
             "valid_citations": valid_citations,
             "invalid_citations": invalid_citations,
+            "numeric_mismatches": numeric_mismatches,
             "verified_claims_count": total_claims,
             "covered_claims_count": covered_claims,
             "unverified_claims_count": len(unverified_claims),

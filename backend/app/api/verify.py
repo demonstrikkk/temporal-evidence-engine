@@ -169,6 +169,7 @@ async def get_run(run_id: str) -> dict[str, Any]:
         "stage": run.get("stage"),
         "rule_version": run.get("rule_version"),
         "cache_mode": run.get("cache_mode"),
+        "budget_mode": run.get("budget_mode") or "balanced",
         "started_at": run.get("started_at"),
         "completed_at": run.get("completed_at"),
         "error": run.get("error"),
@@ -202,6 +203,9 @@ async def get_claim(run_id: str, claim_id: str) -> dict[str, Any]:
 
     from app.verify.report import evidence_view
     views = [evidence_view(row, store) for row in evidence]
+    from app.verify.corroboration import assess_claim
+    corroboration = assess_claim(store, claim_id,
+                                 str(claim.get("subject") or ""))
     replacement = next((v for v in views
                         if v.get("candidate_value_raw")
                         and str(claim.get("status")) == "changed"), None)
@@ -219,6 +223,7 @@ async def get_claim(run_id: str, claim_id: str) -> dict[str, Any]:
         "freshness_index": last.get("freshness_index"),
         "value_diff": diff,
         "evidence": views,
+        "corroboration": corroboration,
         "timeline": [
             {
                 "status": row.get("new_status"),

@@ -38,7 +38,7 @@ COLLECTIONS = (
     "answers", "runs", "claims", "sources", "revisions", "evidence", "links",
     "assertions", "history", "events", "calls", "queries", "cache",
     "cache_entries", "conversations", "messages", "quota_ledger",
-    "assertion_spans", "coverage_audits",
+    "assertion_spans", "coverage_audits", "execution_traces", "trace_spans",
 )
 
 
@@ -114,6 +114,13 @@ class VerifyStore(Protocol):
     # events
     def append_event(self, run_id: str, event_type: str, payload: dict) -> dict: ...
     def list_events(self, run_id: str, after: int = 0) -> list[dict]: ...
+
+    # execution trace: the run as a tree, projected from the events
+    def put_execution_trace(self, row: dict) -> dict: ...
+    def update_execution_trace(self, run_id: str, **fields: Any) -> dict | None: ...
+    def get_execution_trace(self, run_id: str) -> dict | None: ...
+    def add_trace_span(self, row: dict) -> dict: ...
+    def list_trace_spans(self, trace_id: str) -> list[dict]: ...
 
     # model calls / research cache
     def add_model_call(self, row: dict) -> dict: ...
@@ -408,6 +415,33 @@ class LocalStore:
                 if r.get("run_id") == run_id and int(r.get("sequence", 0)) > after]
         return sorted(rows, key=lambda r: int(r["sequence"]))
 
+    # -- execution trace --------------------------------------------------
+    def put_execution_trace(self, row: dict) -> dict:
+        """One trace per run. Re-opening a run replaces its header, not appends."""
+        with self._lock:
+            existing = self._find("execution_traces", run_id=row.get("run_id"))
+            if existing:
+                existing.update(row)
+                self._save()
+                return existing
+            return self._insert("execution_traces", row)
+
+    def update_execution_trace(self, run_id: str, **fields: Any) -> dict | None:
+        allowed = {"status", "completed_at", "root_span_id"}
+        return self._update("execution_traces", "run_id", run_id,
+                            {k: v for k, v in fields.items() if k in allowed})
+
+    def get_execution_trace(self, run_id: str) -> dict | None:
+        return self._find("execution_traces", run_id=run_id)
+
+    def add_trace_span(self, row: dict) -> dict:
+        return self._insert("trace_spans", row)
+
+    def list_trace_spans(self, trace_id: str) -> list[dict]:
+        rows = [r for r in self._data["trace_spans"]
+                if r.get("trace_id") == trace_id]
+        return sorted(rows, key=lambda r: int(r.get("ordinal") or 0))
+
     # -- calls / cache ----------------------------------------------------
     def add_model_call(self, row: dict) -> dict:
         with self._lock:
@@ -675,6 +709,26 @@ def _jsonb(value: Any) -> Any:
 
     return Jsonb(value, dumps=lambda obj: json.dumps(obj, default=encode,
                                                      ensure_ascii=False))
+
+
+def _trace_defaults(row: dict) -> dict:
+    """Every trace column, so an omitted field is a stored default, not a NULL.
+
+    The local store has no schema; without this, a span written by one adapter
+    would read back with empty strings and by the other with NULLs, and the two
+    trees would not be the same tree.
+    """
+    return {
+        "event_id": None, "parent_span_id": None, "claim_id": "",
+        "ordinal": 0, "stage": "", "operation": "", "attempt": 1,
+        "requested_model": "", "resolved_model": "", "provider": "",
+        "prompt_version": "", "prompt_hash": "", "input_hash": "",
+        "output_hash": "", "tool_name": "", "tool_result_ref": "",
+        "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+        "cost_source": "none", "latency_ms": 0, "cache_status": "",
+        "error_type": "", "decision_rule": "", "decision_result": "",
+        "started_at": now(), "ended_at": None, **row,
+    }
 
 
 class PgStore:
@@ -1027,6 +1081,70 @@ class PgStore:
             """SELECT * FROM verification_events
                WHERE run_id = %s AND sequence > %s ORDER BY sequence""",
             (run_id, after))
+
+    # -- execution trace --------------------------------------------------
+    def put_execution_trace(self, row: dict) -> dict:
+        return self._write(
+            """INSERT INTO execution_traces (id, run_id, trace_id, root_span_id,
+                   status, started_at, completed_at)
+               VALUES (%(id)s, %(run_id)s, %(trace_id)s, %(root_span_id)s,
+                   %(status)s, %(started_at)s, %(completed_at)s)
+               ON CONFLICT (run_id) DO UPDATE SET
+                   trace_id = EXCLUDED.trace_id,
+                   root_span_id = EXCLUDED.root_span_id,
+                   status = EXCLUDED.status,
+                   started_at = EXCLUDED.started_at,
+                   completed_at = EXCLUDED.completed_at
+               RETURNING *""",
+            {"id": row.get("id"), "run_id": row.get("run_id"),
+             "trace_id": row.get("trace_id"),
+             "root_span_id": row.get("root_span_id"),
+             "status": row.get("status") or "running",
+             "started_at": row.get("started_at") or now(),
+             "completed_at": row.get("completed_at")})
+
+    def update_execution_trace(self, run_id: str, **fields: Any) -> dict | None:
+        allowed = {"status", "completed_at", "root_span_id"}
+        clean = {k: v for k, v in fields.items() if k in allowed}
+        if not clean:
+            return self.get_execution_trace(run_id)
+        sets = ", ".join(f"{k} = %({k})s" for k in clean)
+        return self._write(
+            f"UPDATE execution_traces SET {sets} WHERE run_id = %(run_id)s "
+            f"RETURNING *",
+            {**clean, "run_id": run_id}) or self.get_execution_trace(run_id)
+
+    def get_execution_trace(self, run_id: str) -> dict | None:
+        return self._one("SELECT * FROM execution_traces WHERE run_id = %s",
+                         (run_id,))
+
+    def add_trace_span(self, row: dict) -> dict:
+        return self._write(
+            """INSERT INTO trace_spans (id, trace_id, parent_span_id, event_id,
+                   claim_id, ordinal, stage, operation, attempt, requested_model,
+                   resolved_model, provider, prompt_version, prompt_hash,
+                   input_hash, output_hash, tool_name, tool_arguments,
+                   tool_result_ref, input_tokens, output_tokens, cost_usd,
+                   cost_source, latency_ms, cache_status, error_type,
+                   decision_rule, decision_result, started_at, ended_at)
+               VALUES (%(id)s, %(trace_id)s, %(parent_span_id)s, %(event_id)s,
+                   %(claim_id)s, %(ordinal)s, %(stage)s, %(operation)s,
+                   %(attempt)s, %(requested_model)s, %(resolved_model)s,
+                   %(provider)s, %(prompt_version)s, %(prompt_hash)s,
+                   %(input_hash)s, %(output_hash)s, %(tool_name)s,
+                   %(tool_arguments)s, %(tool_result_ref)s, %(input_tokens)s,
+                   %(output_tokens)s, %(cost_usd)s, %(cost_source)s,
+                   %(latency_ms)s, %(cache_status)s, %(error_type)s,
+                   %(decision_rule)s, %(decision_result)s, %(started_at)s,
+                   %(ended_at)s)
+               RETURNING *""",
+            {**_trace_defaults(row),
+             "tool_arguments": _jsonb(row.get("tool_arguments") or {})})
+
+    def list_trace_spans(self, trace_id: str) -> list[dict]:
+        return self._all(
+            """SELECT * FROM trace_spans WHERE trace_id = %s ORDER BY ordinal""",
+            (trace_id,))
 
     # -- calls / cache ----------------------------------------------------
     def add_model_call(self, row: dict) -> dict:

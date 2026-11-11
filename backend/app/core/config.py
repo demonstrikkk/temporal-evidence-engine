@@ -156,6 +156,10 @@ class Settings(BaseSettings):
     #: entirely; the audit still runs and still reports the gap.
     COVERAGE_MAX_REPAIR_CALLS: int = Field(default=1, ge=0, le=3)
     COVERAGE_MAX_TARGETS: int = Field(default=12, ge=1, le=50)
+    #: The execution trace is not optional in the product; the switch exists so a
+    #: bulk harness can skip the writes it will not read. A run with tracing off
+    #: has no tree at all - it never has a partial one.
+    TRACE_ENABLED: bool = True
     RESEARCH_MAX_QUERIES_PER_CLAIM: int = Field(default=3, ge=1, le=6)
     #: read-write | read-only (snapshot/demo) | off
     CACHE_MODE: Literal["read-write", "read-only", "off"] = "read-write"

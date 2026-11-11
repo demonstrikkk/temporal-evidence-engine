@@ -615,4 +615,92 @@ Measured after the change:
   supported, 0 false changed, 138/138 quotes, 44/44 event dates, **Gate PASS**;
 - `frontend npm test` and `npm run build` pass.
 
+## D-025 - The trace is a projection of the audit rail, not a second account of the run (2026-11-11)
+
+`verification_events` answers "what happened, in order". It cannot answer
+"which stage spent the money": a rail row has no parent, no duration and no
+price. Adding those to the rail would change what the rail is, so they live in
+`tev.execution_traces` (one header per run) and `tev.trace_spans` (one row per
+operation) — the same run, seen as a tree.
+
+The risk of two tables describing one run is that they diverge. Five rules
+close that, and each of them is a choice rather than an accident:
+
+- **One writer.** A span is closed only by `TraceRecorder.end(span, event, …)`,
+  and `event` is the row `Verifier.emit` returned. `trace_spans.event_id` is
+  that row's id. A span cannot be written without being closed, and a span with
+  no rail row stores NULL rather than borrowing someone else's id.
+- **`event_id` is `text` with no foreign key.** The local store ids events with
+  a UUID; the Postgres store uses a `bigserial`. A foreign key would force one
+  adapter to misdescribe its own identifiers. What the column promises — that
+  the id names a row the rail actually holds — is enforced by
+  `test_every_span_names_a_real_audit_event`, which compares against the run's
+  events rather than against a type.
+- **`ordinal` is the order spans were begun in, not a timestamp.** Clock
+  resolution and UUID ordering cannot reproduce a tree; an integer can.
+- **`claim_id` is on the span.** "What did this claim cost" is then a query.
+  Reconstructing it from the event payload's jsonb is precisely the by-hand work
+  this work package exists to remove.
+- **`attempt` is our attempt number.** A provider fallback inside Bifrost stays
+  on `model_calls.fallback_attempts`; turning one request into several spans
+  would multiply a single call into a fan-out that never happened.
+
+Two failure modes are handled as defects rather than as gaps. `end` is
+idempotent per span, so closing twice cannot write two rows and double a cost;
+`finish` closes any span still open as `error_type='unclosed'`, because an
+operation that began and never reported is exactly the silence this repository
+exists to remove. A trace write that raises emits `trace.failed` once and the
+verification continues: losing the trace is bad, losing the verdict because the
+trace failed is worse.
+
+**Replay determinism is structural.** `fingerprint()` compares each span's
+ordinal, its parent's ordinal, stage, operation, attempt, tool, prompt version,
+error type and cache state. Ids, timings and token counts are excluded because
+they are measurements of one execution, not the shape of the run. A second run
+against a warm store is *expected* to differ — `reuse_evidence` replaces
+`search` — and the test pins that difference instead of pretending the two
+trees are identical.
+
+**Cost is split, never summed.** `cost_source` already distinguishes a gateway
+bill from a catalogue estimate from no price at all (migration 027), so
+`summarise()` reports `gateway_usd`, `estimated_usd` and `unpriced_spans`
+separately, plus the span counts that make the distinction meaningful: a
+gateway that reports `0.0` did price its calls, and that zero is a fact; a span
+with `cost_source='none'` has no price, and printing `$0` for it would make an
+unpriced run look free. Stage latency is summed and must never be read as
+elapsed time — nested spans overlap by construction.
+
+`TRACE_ENABLED` defaults to true. The switch exists for bulk harnesses that will
+not read the tree; a run with tracing off has no tree at all, and the API says
+so rather than returning an empty one.
+
+The UI keeps the event rail as the spine and renders the tree beneath it. The
+filter that shows model calls keys off `prompt_version` rather than an operation
+name, so the next stage that calls a model is included without anyone
+remembering to add it, and a filtered view keeps the ancestors of what it
+matched — marked as context — so a row is never shown under a parent that is
+not on screen.
+
+## D-026 - A prompt version is a claim about text, so the text is registered (2026-11-11)
+
+`trace_spans.prompt_version` exists because a hash can tell you two calls differ
+but never that one is the *second* version of the same instruction. A
+hand-written version label has exactly one failure mode: someone edits the
+prompt and does not bump it, and every span afterwards vouches for text it never
+ran.
+
+So the prompts are module constants (`_SYSTEM`, `_TEMPLATE`) rather than
+f-strings built at the call site, and `app/verify/prompts.py` records the
+SHA-256 prefix of each version's exact text. `test_trace.py` recomputes the
+digest for every registered version and compares. Editing a prompt without
+bumping its version fails, and bumping a version without registering its text
+fails in the other direction — a missing entry is the same failure as a stale
+one. A second test reads the orchestrator's `prompt_version=` sites and requires
+every one of them to name a registered version, so a new call site cannot
+quietly run unlabelled.
+
+The digest covers the system instruction and the message template. It does not
+cover the interpolated answer, the claim or the document windows: that is data,
+and it is what `trace_spans.prompt_hash` records separately.
+
 

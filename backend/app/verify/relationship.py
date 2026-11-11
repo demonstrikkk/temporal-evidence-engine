@@ -10,6 +10,7 @@ proposal is discarded. This is the difference between "the model said so" and
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,6 +47,16 @@ Never judge whether the claim is true in general. Only report what this
 document says.
 """
 
+#: The user message, as a constant so its digest can be recorded against the
+#: prompt version. The claim and the windows are data and are hashed separately
+#: by `trace_spans.prompt_hash`.
+_TEMPLATE = (
+    "CLAIM:\n{claim_json}\n\n"
+    "SOURCE: {title}\n{url}\n\n"
+    "DOCUMENT WINDOWS:\n{windows}\n\n"
+    "What does this document say about the claim?"
+)
+
 
 @dataclass(frozen=True)
 class Proposal:
@@ -61,7 +72,6 @@ class Proposal:
 
 
 def _prompt(claim: ClaimDraft, content: str, url: str, title: str) -> str:
-    import json
     claim_json = json.dumps({
         "claim": claim.claim_text,
         "subject": claim.subject,
@@ -70,10 +80,8 @@ def _prompt(claim: ClaimDraft, content: str, url: str, title: str) -> str:
         "claim_type": claim.claim_type.value,
     }, ensure_ascii=False)
     windows = render_windows(content, claim.claim_text, max_chars=6000)
-    return (f"CLAIM:\n{claim_json}\n\n"
-            f"SOURCE: {title or url}\n{url}\n\n"
-            f"DOCUMENT WINDOWS:\n{windows}\n\n"
-            f"What does this document say about the claim?")
+    return _TEMPLATE.format(claim_json=claim_json, title=title or url,
+                            url=url, windows=windows)
 
 
 def _strip_quote(quote: str) -> str:
@@ -118,7 +126,8 @@ def propose(client: BifrostClient, *, claim: ClaimDraft, content: str,
                "input_tokens": result.input_tokens,
                "output_tokens": result.output_tokens,
                "cost_usd": result.cost_usd, "latency_ms": result.latency_ms,
-               "fallback_attempts": result.fallback_attempts}
+               "fallback_attempts": result.fallback_attempts,
+               "cost_source": getattr(result, "cost_source", "gateway")}
 
     try:
         payload = result.json()

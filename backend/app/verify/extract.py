@@ -48,12 +48,22 @@ Never return prose, never return a verdict, never judge the claim.
 """
 
 
+#: The user message. A module constant rather than an f-string inside `_prompt`
+#: so `prompts.fingerprint` can hash the instruction a version names; the
+#: interpolated answer is data, and data is not part of a prompt's identity.
+_TEMPLATE = (
+    "ORIGINAL USER QUESTION (context only):\n{original_prompt}\n\n"
+    "ANSWER TO EXTRACT FROM:\n{answer}\n\n"
+    "Return at most {max_claims} claims. Prefer the claims a reader would check "
+    "against a live source."
+)
+
+
 def _prompt(answer: str, original_prompt: str) -> str:
-    return (
-        f"ORIGINAL USER QUESTION (context only):\n{original_prompt or '(not provided)'}\n\n"
-        f"ANSWER TO EXTRACT FROM:\n{answer}\n\n"
-        f"Return at most {settings.CLAIM_MAX_PER_ANSWER} claims. Prefer the "
-        f"claims a reader would check against a live source."
+    return _TEMPLATE.format(
+        original_prompt=original_prompt or "(not provided)",
+        answer=answer,
+        max_claims=settings.CLAIM_MAX_PER_ANSWER,
     )
 
 
@@ -236,6 +246,10 @@ def _receipt(result: Any) -> dict[str, Any]:
         "input_tokens": result.input_tokens, "output_tokens": result.output_tokens,
         "cost_usd": result.cost_usd, "latency_ms": result.latency_ms,
         "fallback_attempts": result.fallback_attempts,
+        # Where the price came from: a bill, a published catalogue, or nowhere.
+        # A trace that adds `gateway` and `catalogue` costs into one number makes
+        # an estimate look like an invoice.
+        "cost_source": getattr(result, "cost_source", "gateway"),
     }
 
 
@@ -273,6 +287,15 @@ Never return prose, never return a verdict, never judge the claim.
 """
 
 
+_REPAIR_TEMPLATE = (
+    "ANSWER (for locating exact substrings; only the excerpts below are in "
+    "scope):\n{answer}\n\n"
+    "EXCERPTS THAT NO CLAIM COVERED:\n{excerpts}\n\n"
+    "Return at most one claim per uncovered value. Values the audit did not "
+    "see a claim for: {values}"
+)
+
+
 def extract_missing_claims(client: BifrostClient, *, answer: str,
                            targets: list[dict[str, Any]],
                            drops: list[dict[str, Any]] | None = None
@@ -288,14 +311,11 @@ def extract_missing_claims(client: BifrostClient, *, answer: str,
     for index, target in enumerate(targets):
         start, end = int(target["start"]), int(target["end"])
         excerpts.append(f"[{index}] {answer[start:end].strip()}")
-    prompt = (
-        "ANSWER (for locating exact substrings; only the excerpts below are in "
-        f"scope):\n{answer}\n\n"
-        "EXCERPTS THAT NO CLAIM COVERED:\n" + "\n\n".join(excerpts) + "\n\n"
-        "Return at most one claim per uncovered value. Values the audit did not "
-        "see a claim for: "
-        + "; ".join(value for target in targets
-                    for value in target.get("candidates") or [])
+    prompt = _REPAIR_TEMPLATE.format(
+        answer=answer,
+        excerpts="\n\n".join(excerpts),
+        values="; ".join(value for target in targets
+                         for value in target.get("candidates") or []),
     )
     result = client.complete(prompt, stage="repair_coverage",
                              system=_REPAIR_SYSTEM, max_tokens=1800)

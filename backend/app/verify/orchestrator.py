@@ -29,12 +29,15 @@ from app.verify.decision import EvidenceFact, decide
 from app.verify.coverage import apply_repair, audit as audit_coverage
 from app.verify.extract import extract_claims, extract_missing_claims
 from app.verify.freshness import freshness_index, next_check_at
+from app.verify.prompts import (EXTRACT_PROMPT_VERSION, PROPOSE_PROMPT_VERSION,
+                                REPAIR_PROMPT_VERSION)
 from app.verify.relationship import Proposal, propose
 from app.verify.schemas import (AnswerIn, ClaimDraft, ClaimStatus, ReasonCode,
                                 Relationship, RunCreated)
 from app.verify.settlement import settle_assertion
 from app.verify.store import VerifyStore, build_store, iso, new_id, now, parse_iso
 from app.verify.temporal import event_date_from_quote
+from app.verify.trace import TraceRecorder, model_fields
 from app.cache.coordinator import CacheCoordinator
 
 #: Negation cues that can contradict a claim without naming a replacement value.
@@ -185,6 +188,10 @@ class Verifier:
         self.tavily = tavily or TavilyClient(store)
         self.cache = CacheCoordinator(store)
         self.failures: list[dict[str, Any]] = []
+        #: The run as a tree. Every span is closed by the same emit call that
+        #: writes its rail row, so the trace cannot drift from the events.
+        self.trace = TraceRecorder(store, run_id, emit=self.emit,
+                                   enabled=settings.TRACE_ENABLED)
         self.counters: dict[str, int] = {
             "claims": 0, "queries": 0, "sources": 0, "evidence": 0,
             "settled": 0, "failed_sources": 0, "failed_calls": 0,
@@ -199,12 +206,19 @@ class Verifier:
         }
 
     # -- plumbing ---------------------------------------------------------
-    def emit(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
+    def emit(self, event_type: str, payload: dict[str, Any] | None = None
+             ) -> dict[str, Any] | None:
+        """Append one rail row and hand it back.
+
+        The row is returned so a trace span can record *which* event reports it.
+        A span that cannot name its own event is a second account of the run.
+        """
         try:
-            self.store.append_event(self.run_id, event_type, payload or {})
+            return self.store.append_event(self.run_id, event_type, payload or {})
         except Exception as exc:  # noqa: BLE001 — an event failure is logged, not thrown
             log.warning("could not append run event",
                         extra={"data": {"event": event_type, "error": str(exc)[:200]}})
+            return None
 
     def fail(self, stage: str, message: str, **detail: Any) -> None:
         entry = {"stage": stage, "message": message, **detail}
@@ -247,15 +261,17 @@ class Verifier:
     def _audit_and_repair(self, answer_id: str, answer_text: str,
                           stored: list[tuple[dict, ClaimDraft]], *,
                           budget_mode: str) -> Any:
+        span = self.trace.begin("coverage", "audit")
         try:
             report = audit_coverage(answer_text, [row for row, _ in stored])
         except Exception as exc:  # noqa: BLE001 — coverage must never break a run
-            self.emit("coverage.failed", {
+            self.trace.end(span, self.emit("coverage.failed", {
                 "error": str(exc)[:400],
                 "trace": traceback.format_exc()[-1200:],
-                "detail": "the answer was not audited; claims still verify"})
+                "detail": "the answer was not audited; claims still verify"}),
+                error_type="audit_failed")
             return None
-        self.emit("coverage.audited", {
+        event = self.emit("coverage.audited", {
             "run_id": self.run_id,
             "summary": report.summary(),
             "coverage": round(report.coverage, 4),
@@ -270,13 +286,17 @@ class Verifier:
                 and settings.COVERAGE_MAX_REPAIR_CALLS > 0
                 and budget_mode != "offline"):
             report = self._repair_coverage(answer_id, answer_text, stored,
-                                           report)
+                                           report, parent=span)
         self._store_coverage(answer_id, report)
+        self.trace.end(span, event,
+                       decision_rule="coverage_audit",
+                       decision_result=(f"checked {report.checked}/"
+                                        f"{report.total_assertions}"))
         return report
 
     def _repair_coverage(self, answer_id: str, answer_text: str,
                          stored: list[tuple[dict, ClaimDraft]],
-                         report: Any) -> Any:
+                         report: Any, *, parent: Any = None) -> Any:
         """One focused call over the sentences no claim covered.
 
         The call is capped by `COVERAGE_MAX_REPAIR_CALLS` (the caller checks it)
@@ -286,6 +306,11 @@ class Verifier:
         never a silently improved number.
         """
         targets = report.repair_targets[:settings.COVERAGE_MAX_TARGETS]
+        span = self.trace.begin(
+            "coverage", "repair", parent=parent,
+            prompt_version=REPAIR_PROMPT_VERSION,
+            requested_model=settings.BIFROST_MODEL_EXTRACTOR,
+            tool_arguments={"targets": len(targets)})
         drops: list[dict[str, Any]] = []
         try:
             claims, _texts, receipt = extract_missing_claims(
@@ -293,19 +318,25 @@ class Verifier:
         except BifrostError as exc:
             report.repair_calls += 1
             self.counters["failed_calls"] += 1
-            self.emit("coverage.repair_failed",
-                      {"kind": exc.kind, "error": str(exc)[:400]})
+            self.trace.end(span, self.emit("coverage.repair_failed",
+                                           {"kind": exc.kind,
+                                            "error": str(exc)[:400]}),
+                           error_type=exc.kind)
             return report
         except ValueError as exc:
             report.repair_calls += 1
-            self.emit("coverage.repair_failed",
-                      {"kind": "bad_json", "error": str(exc)[:400]})
+            self.trace.end(span, self.emit("coverage.repair_failed",
+                                           {"kind": "bad_json",
+                                            "error": str(exc)[:400]}),
+                           error_type="bad_json")
             return report
         except Exception as exc:  # noqa: BLE001 — the audit is advisory
             report.repair_calls += 1
             self.counters["failed_calls"] += 1
-            self.emit("coverage.repair_failed",
-                      {"kind": "unexpected", "error": str(exc)[:400]})
+            self.trace.end(span, self.emit("coverage.repair_failed",
+                                           {"kind": "unexpected",
+                                            "error": str(exc)[:400]}),
+                           error_type="unexpected")
             return report
 
         self._emit_drops(drops, stage="repair_coverage")
@@ -355,10 +386,10 @@ class Verifier:
         fresh = apply_repair(report, answer_text, [row for row, _ in stored],
                              calls=1)
         fresh.repaired_claims = len(accepted)
-        self.emit("coverage.repaired", {
+        self.trace.end(span, self.emit("coverage.repaired", {
             "targets": len(targets), "proposed": len(claims),
             "stored": len(accepted),
-            "summary": fresh.summary()})
+            "summary": fresh.summary()}), **model_fields(receipt))
         return fresh
 
     def _store_coverage(self, answer_id: str, report: Any) -> None:
@@ -388,17 +419,22 @@ class Verifier:
         answer = self.store.get_answer(str(run["answer_id"])) or {}
         answer_text = str(answer.get("answer_text") or "")
         generated_at = parse_iso(answer.get("generated_at"))
-        self.emit("run.started", {
+        started = self.emit("run.started", {
             "run_id": self.run_id, "answer_id": run["answer_id"],
             "rule_version": RULE_VERSION,
             "cache_mode": settings.CACHE_MODE,
             "generated_at": iso(generated_at),
             "gateway": self.bifrost.base_url,
         })
+        self.trace.open(event=started, started_at=run.get("started_at"))
         self.store.update_run(self.run_id, status="running", stage="extract")
 
         # 1. claims
         drops: list[dict[str, Any]] = []
+        span = self.trace.begin(
+            "extract", "model_call",
+            prompt_version=EXTRACT_PROMPT_VERSION,
+            requested_model=settings.BIFROST_MODEL_EXTRACTOR)
         try:
             claims, receipt = extract_claims(
                 self.bifrost, answer=answer_text,
@@ -407,20 +443,29 @@ class Verifier:
                 drops=drops)
         except BifrostError as exc:
             self.counters["failed_calls"] += 1
-            self.emit("model.failed", {"stage": "extract_claims",
-                                       "kind": exc.kind, "error": str(exc)[:400]})
+            self.trace.end(span, self.emit("model.failed",
+                                           {"stage": "extract_claims",
+                                            "kind": exc.kind,
+                                            "error": str(exc)[:400]}),
+                           error_type=exc.kind)
             self._finish("failed", stage="extract",
                          error={"code": "extraction_failed",
                                 "message": str(exc)[:400], "kind": exc.kind})
             return
         except ValueError as exc:
+            self.trace.end(span, self.emit("model.failed",
+                                           {"stage": "extract_claims",
+                                            "kind": "bad_json",
+                                            "error": str(exc)[:400]}),
+                           error_type="bad_json")
             self._finish("failed", stage="extract",
                          error={"code": "extraction_failed",
                                 "message": f"model returned unusable JSON: {exc}"})
             return
 
-        self.emit("claims.extracted", {"count": len(claims),
-                                       "model_call": receipt})
+        extracted_event = self.emit("claims.extracted", {"count": len(claims),
+                                                         "model_call": receipt})
+        self.trace.end(span, extracted_event, **model_fields(receipt))
         self._emit_drops(drops, stage="extract_claims")
         if receipt.get("status") == "snapshot":
             # A replayed extraction is not a fresh one. The event rail says so,
@@ -459,15 +504,20 @@ class Verifier:
         self.store.update_run(self.run_id, stage="research")
         extracted: dict[str, Any] = {}
         for claim_row, draft in stored:
+            claim_span = self.trace.begin("claim", "verify_claim",
+                                          claim_id=str(claim_row["id"]))
             try:
-                self._verify_claim(claim_row, draft, generated_at, extracted)
+                self._verify_claim(claim_row, draft, generated_at, extracted,
+                                   claim_span)
             except Exception as exc:  # noqa: BLE001 — one claim must not end the run
                 log.warning("claim verification crashed",
                             extra={"data": {"claim_id": claim_row["id"],
                                             "error": str(exc)[:300]}})
-                self.emit("claim.failed", {"claim_id": claim_row["id"],
-                                           "error": str(exc)[:400],
-                                           "trace": traceback.format_exc()[-1200:]})
+                self.trace.end(claim_span, self.emit("claim.failed", {
+                    "claim_id": claim_row["id"],
+                    "error": str(exc)[:400],
+                    "trace": traceback.format_exc()[-1200:]}),
+                    error_type=type(exc).__name__)
                 self.store.update_claim(
                     claim_row["id"], status=ClaimStatus.UNVERIFIABLE.value,
                     reason_code=ReasonCode.EXTRACTION_FAILED.value,
@@ -484,7 +534,8 @@ class Verifier:
     # -- one claim --------------------------------------------------------
     def _verify_claim(self, claim_row: dict, draft: ClaimDraft,
                       generated_at: datetime | None,
-                      extracted: dict[str, Any]) -> None:
+                      extracted: dict[str, Any],
+                      span: Any = None) -> None:
         claim_id = str(claim_row["id"])
         self.store.update_run(self.run_id, stage="research")
         self.emit("claim.started", {"claim_id": claim_id,
@@ -506,20 +557,32 @@ class Verifier:
             predicate=draft.predicate,
             qualifiers=draft.qualifiers,
             value_scope=value_scope)
-        reused = self._reuse_evidence(claim_id, cached_evidence or [])
+        reuse_span = None
+        reused: list[EvidenceFact] = []
+        if cached_evidence:
+            reuse_span = self.trace.begin("research", "reuse_evidence",
+                                          parent=span, claim_id=claim_id)
+            reused = self._reuse_evidence(claim_id, cached_evidence)
         if reused:
             facts.extend(reused)
             self.counters["evidence"] += len(reused)
             self.counters["settled"] += sum(1 for f in reused if f.settled)
-            self.emit("claim.evidence_reused", {
+            self.trace.end(reuse_span, self.emit("claim.evidence_reused", {
                 "claim_id": claim_id, "evidence_count": len(reused),
                 "evidence_ids": [f.evidence_id for f in reused],
                 "reason": "the same claim was researched before; evidence rows "
-                          "were copied and the temporal verdict recomputed"})
+                          "were copied and the temporal verdict recomputed"}),
+                cache_status="cached",
+                tool_result_ref=",".join(f.evidence_id for f in reused)[:200])
             decision = decide(claim_value=draft.object_raw,
                               answer_generated_at=generated_at, facts=facts)
-            self._record(claim_row, draft, decision, facts, generated_at)
+            self._record(claim_row, draft, decision, facts, generated_at,
+                         span=span)
             return
+        # A cache entry whose evidence rows are gone is not a hit. The miss is
+        # written down, because "we looked and there was nothing" and "we never
+        # looked" are different claims about the run.
+        self.trace.end(reuse_span, None, cache_status="miss")
 
         queries = plan_queries(draft, budget_mode=budget_mode)
 
@@ -536,18 +599,23 @@ class Verifier:
         existing_ids = [str(ev["revision_id"]) for ev in existing
                         if str(ev["revision_id"]) not in settled_revisions]
         if existing_ids:
-            self.emit("claim.source_reused", {"claim_id": claim_id,
-                                              "sources": len(existing_ids),
-                                              "stage": "existing_sources"})
+            stored_span = self.trace.begin("research", "existing_sources",
+                                           parent=span, claim_id=claim_id,
+                                           tool_result_ref=",".join(
+                                               existing_ids)[:200])
+            self.trace.end(stored_span, self.emit("claim.source_reused", {
+                "claim_id": claim_id, "sources": len(existing_ids),
+                "stage": "existing_sources"}))
             self.counters["sources"] += len(existing_ids)
-            facts.extend(self._settle(claim_id, draft, existing_ids))
+            facts.extend(self._settle(claim_id, draft, existing_ids, span))
             settled_revisions.update(existing_ids)
             decision = decide(claim_value=draft.object_raw,
                               answer_generated_at=generated_at, facts=facts)
             if decision.status != ClaimStatus.UNVERIFIABLE:
                 # Stored evidence already decides it; escalation would spend
                 # credits to learn nothing.
-                self._record(claim_row, draft, decision, facts, generated_at)
+                self._record(claim_row, draft, decision, facts, generated_at,
+                             span=span)
                 return
 
         if not queries:
@@ -558,28 +626,37 @@ class Verifier:
             if existing_ids:
                 decision = decide(claim_value=draft.object_raw,
                                   answer_generated_at=generated_at, facts=facts)
-                self._record(claim_row, draft, decision, facts, generated_at)
+                self._record(claim_row, draft, decision, facts, generated_at,
+                             span=span)
             else:
                 self._settle_empty(claim_row, draft,
                                    ReasonCode.NO_SOURCE,
-                                   "No search query could be derived from this claim.")
+                                   "No search query could be derived from this claim.",
+                                   span=span)
             return
 
         revision_ids: list[str] = []
         for query in queries:
             self.counters["queries"] += 1
+            search_span = self.trace.begin(
+                "research", "search", parent=span, claim_id=claim_id,
+                tool_name="tavily_search", tool_arguments={"query": query})
             try:
                 outcome = self.tavily.search(query)
             except ResearchError as exc:
                 self.counters["failed_calls" if exc.kind != "cache_miss" else "failed_sources"] += 1
-                self.emit("search.failed", {"claim_id": claim_id, "query": query,
-                                            "kind": exc.kind, "error": str(exc)[:300]})
+                self.trace.end(search_span, self.emit("search.failed", {
+                    "claim_id": claim_id, "query": query,
+                    "kind": exc.kind, "error": str(exc)[:300]}),
+                    error_type=exc.kind)
                 self.fail("research", f"search failed: {exc}", claim_id=claim_id)
                 continue
-            self.emit("search.done", {
+            self.trace.end(search_span, self.emit("search.done", {
                 "claim_id": claim_id, "query": query,
                 "status": outcome.status, "hits": len(outcome.hits),
-                "request_id": outcome.request_id, "credits": outcome.credits})
+                "request_id": outcome.request_id, "credits": outcome.credits}),
+                cache_status=outcome.status,
+                tool_result_ref=str(outcome.request_id or ""))
             for failed in outcome.failed:
                 self.counters["failed_sources"] += 1
                 self.emit("source.failed", {"claim_id": claim_id,
@@ -591,14 +668,18 @@ class Verifier:
                 if canonical in extracted:
                     revision_ids.append(extracted[canonical].revision_id)
                     continue
+                extract_span = self.trace.begin(
+                    "research", "extract", parent=span, claim_id=claim_id,
+                    tool_name="tavily_extract",
+                    tool_arguments={"url": hit.url})
                 try:
                     extract = self.tavily.extract([hit.url])
                 except ResearchError as exc:
                     self.counters["failed_sources"] += 1
-                    self.emit("source.failed", {"claim_id": claim_id,
-                                                "url": hit.url,
-                                                "stage": "extract",
-                                                "error": str(exc)[:300]})
+                    self.trace.end(extract_span, self.emit("source.failed", {
+                        "claim_id": claim_id, "url": hit.url,
+                        "stage": "extract", "error": str(exc)[:300]}),
+                        error_type=exc.kind)
                     self.fail("research", f"extraction failed: {exc}",
                               claim_id=claim_id)
                     continue
@@ -611,11 +692,11 @@ class Verifier:
                 content = extract.pages.get(hit.url) or next(
                     iter(extract.pages.values()), "")
                 if not content.strip():
-                    self.emit("source.failed", {"claim_id": claim_id,
-                                                "url": hit.url,
-                                                "stage": "extract",
-                                                "error": "no text returned"})
                     self.counters["failed_sources"] += 1
+                    self.trace.end(extract_span, self.emit("source.failed", {
+                        "claim_id": claim_id, "url": hit.url,
+                        "stage": "extract", "error": "no text returned"}),
+                        error_type="empty_document")
                     continue
                 source = save_source(self.store, hit.url, hit.title)
                 revision = save_revision(
@@ -638,16 +719,20 @@ class Verifier:
                 extracted[canonical] = revision
                 revision_ids.append(revision.revision_id)
                 self.counters["sources"] += 1
-                self.emit("source.stored", {
-                    "claim_id": claim_id, "url": revision.source["canonical_url"],
+                self.trace.end(extract_span, self.emit("source.stored", {
+                    "claim_id": claim_id,
+                    "url": revision.source["canonical_url"],
                     "revision_id": revision.revision_id,
                     "chars": len(revision.content),
                     "published_date": revision.revision.get("published_date"),
-                    "status": extract.status})
+                    "status": extract.status}),
+                    cache_status=extract.status,
+                    tool_result_ref=revision.revision_id,
+                    input_hash=revision.content_hash)
 
         new_revisions = [rid for rid in revision_ids
                          if rid not in settled_revisions]
-        facts.extend(self._settle(claim_id, draft, new_revisions))
+        facts.extend(self._settle(claim_id, draft, new_revisions, span))
         # L5: Store settled evidence for future claim-evidence reuse
         evidence_list = []
         for f in facts:
@@ -674,7 +759,7 @@ class Verifier:
         )
         decision = decide(claim_value=draft.object_raw,
                           answer_generated_at=generated_at, facts=facts)
-        self._record(claim_row, draft, decision, facts, generated_at)
+        self._record(claim_row, draft, decision, facts, generated_at, span=span)
 
     def _reuse_evidence(self, claim_id: str,
                         cached: list[dict]) -> list[EvidenceFact]:
@@ -743,7 +828,7 @@ class Verifier:
         return facts
 
     def _settle(self, claim_id: str, draft: ClaimDraft,
-                revision_ids: list[str]) -> list[EvidenceFact]:
+                revision_ids: list[str], parent: Any = None) -> list[EvidenceFact]:
         facts: list[EvidenceFact] = []
         seen: set[str] = set()
         for revision_id in revision_ids:
@@ -756,6 +841,12 @@ class Verifier:
             source = self.store.get_source(str(revision["source_id"])) or {}
             content = str(revision.get("content") or "")
             url = str(source.get("canonical_url") or "")
+            span = self.trace.begin(
+                "research", "judge_evidence", parent=parent, claim_id=claim_id,
+                prompt_version=PROPOSE_PROMPT_VERSION,
+                requested_model=settings.BIFROST_MODEL_JUDGE,
+                tool_name="stored_revision", tool_result_ref=revision_id,
+                input_hash=str(revision.get("content_hash") or ""))
             proposal = propose(self.bifrost, claim=draft, content=content,
                                url=url, title=str(source.get("title") or ""),
                                claim_id=claim_id)
@@ -772,15 +863,17 @@ class Verifier:
                     "request_id": proposal.model_call.get("request_id")})
             if proposal.error.startswith("model_failed"):
                 self.counters["failed_calls"] += 1
-                self.emit("model.failed", {"claim_id": claim_id,
-                                           "stage": "propose_relationship",
-                                           "error": proposal.error[:300]})
+                self.trace.end(span, self.emit("model.failed", {
+                    "claim_id": claim_id, "stage": "propose_relationship",
+                    "error": proposal.error[:300]}), error_type="model_failed")
                 self.fail("settle", proposal.error, claim_id=claim_id)
 
             if proposal.relationship == Relationship.SILENT:
-                self.emit("evidence.skipped", {
+                self.trace.end(span, self.emit("evidence.skipped", {
                     "claim_id": claim_id, "url": url,
-                    "reason": proposal.error or "the document does not address it"})
+                    "reason": proposal.error or "the document does not address it"}),
+                    **model_fields(proposal.model_call),
+                    error_type=(proposal.error or "")[:80])
                 continue
 
             settlement = None
@@ -859,7 +952,7 @@ class Verifier:
             })
             self.counters["evidence"] += 1
             self.counters["settled"] += int(settled)
-            self.emit("evidence.settled", {
+            self.trace.end(span, self.emit("evidence.settled", {
                 "claim_id": claim_id, "evidence_id": evidence["id"],
                 "url": url,
                 "relationship": proposal.relationship.value,
@@ -868,7 +961,12 @@ class Verifier:
                                               else "not established"),
                 "event_date": event.value.isoformat() if event.value else None,
                 "event_date_status": event.status,
-                "quote": quote_text[:280]})
+                "quote": quote_text[:280]}),
+                **model_fields(proposal.model_call),
+                decision_rule=("gate" if settled else "gate_refused"),
+                decision_result=proposal.relationship.value if settled else
+                (settlement.reason if settlement else proposal.error or
+                 "not_established")[:120])
             facts.append(EvidenceFact(
                 evidence_id=str(evidence["id"]),
                 relationship=proposal.relationship,
@@ -887,7 +985,8 @@ class Verifier:
 
     # -- recording --------------------------------------------------------
     def _record(self, claim_row: dict, draft: ClaimDraft, decision: Any,
-                facts: list[EvidenceFact], generated_at: datetime | None) -> None:
+                facts: list[EvidenceFact], generated_at: datetime | None,
+                *, span: Any = None) -> None:
         claim_id = str(claim_row["id"])
         stamp = now()
         status = decision.status.value
@@ -923,7 +1022,7 @@ class Verifier:
                     "evidence_id": replacement.evidence_id,
                     "is_original": False,
                 })
-        self.emit("claim.settled", {
+        settled_event = self.emit("claim.settled", {
             "claim_id": claim_id, "status": status,
             "reason_code": decision.reason.value, "rule": decision.rule,
             "explanation": decision.explanation,
@@ -945,12 +1044,18 @@ class Verifier:
         if corroboration["independence"]["source_count"]:
             self.emit("claim.corroboration", {"claim_id": claim_id,
                                               **corroboration})
+        # The claim's span closes last, so its cost includes the corroboration
+        # read and its `decision_rule` is the rule that actually produced the
+        # status rather than the rule that was considered.
+        self.trace.end(span, settled_event, decision_rule=decision.rule,
+                       decision_result=status)
 
     def _settle_empty(self, claim_row: dict, draft: ClaimDraft,
-                      reason: ReasonCode, explanation: str) -> None:
+                      reason: ReasonCode, explanation: str,
+                      *, span: Any = None) -> None:
         from app.verify.decision import Decision
         decision = Decision(ClaimStatus.UNVERIFIABLE, reason, "R1", explanation)
-        self._record(claim_row, draft, decision, [], None)
+        self._record(claim_row, draft, decision, [], None, span=span)
 
     # -- completion -------------------------------------------------------
     def _finish(self, status: str, *, stage: str,
@@ -987,12 +1092,13 @@ class Verifier:
                 "repaired_claims": coverage.get("repaired_claims"),
             }
         if status == "completed":
-            self.emit("run.completed", payload)
+            terminal = self.emit("run.completed", payload)
         elif status == "failed":
             # A hard failure is not a partial run: nothing was verified at all.
-            self.emit("run.failed", payload)
+            terminal = self.emit("run.failed", payload)
         else:
-            self.emit("run.partial", payload)
+            terminal = self.emit("run.partial", payload)
+        self.trace.finish(status, event=terminal)
         log.info("verification run finished",
                  extra={"data": {"run_id": self.run_id, "status": status,
                                  **self.counters}})

@@ -23,6 +23,7 @@ from app.verify import orchestrator
 from app.verify.report import build_report
 from app.verify.runtime import get_store
 from app.verify.schemas import AnswerIn
+from app.verify.trace import build_tree, summarise
 from app.verify.value_normalizer import differing_fields
 
 router = APIRouter(prefix="/api/verify", tags=["verify"],
@@ -225,6 +226,40 @@ async def get_coverage(run_id: str) -> dict[str, Any]:
         "assertions": spans,
         "note": "A disposition describes the extraction, not the fact. "
                 "`not_checked` is a coverage gap, not a verdict.",
+    }
+
+
+@router.get("/runs/{run_id}/trace")
+async def get_trace(run_id: str) -> dict[str, Any]:
+    """The run as a tree: one span per operation, with its price and its event.
+
+    Three shapes of the same rows, because three readers want different things:
+    `tree` for the UI, `spans` for a table and a total, `summary` for the
+    question the table exists to answer - which stage cost what.
+    """
+    store = _store()
+    run = await asyncio.to_thread(store.get_run, run_id)
+    if not run:
+        raise not_found("run", run_id)
+    header = await asyncio.to_thread(store.get_execution_trace, run_id)
+    if not header:
+        return {
+            "run_id": run_id, "trace": None, "tree": None, "spans": [],
+            "summary": summarise([]),
+            "note": "This run was executed with tracing off, so it has no tree. "
+                    "It does not have an incomplete one.",
+        }
+    spans = await asyncio.to_thread(store.list_trace_spans,
+                                    str(header["trace_id"]))
+    return {
+        "run_id": run_id,
+        "trace": header,
+        "tree": build_tree(spans),
+        "spans": spans,
+        "summary": summarise(spans),
+        "note": "Every span names the audit event that reports it, or records "
+                "that it has none. Cost is split into billed and estimated; "
+                "they are not the same number.",
     }
 
 

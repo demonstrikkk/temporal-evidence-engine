@@ -373,3 +373,78 @@ def test_an_untraced_run_says_it_has_no_tree_rather_than_an_empty_one(
     assert body["tree"] is None
     assert body["spans"] == []
     assert "no tree" in body["note"]
+
+
+# ---------------------------------------------------------------------------
+# the report
+# ---------------------------------------------------------------------------
+
+def test_the_report_attributes_cost_to_the_stage_that_spent_it(
+        store, make_gateway, make_tavily, claim_payload):
+    from app.verify.report import build_report
+
+    run, _ = _run(store, make_gateway, make_tavily, claim_payload=claim_payload)
+    _, spans = _spans(store, run.run_id)
+    report = build_report(store, run.run_id)
+
+    cost = report["cost"]
+    assert cost["attributed"] is True, "a traced run can say where the money went"
+    assert cost["trace_status"] == "completed"
+    assert cost["totals"]["spans"] == len(spans)
+    stages = {bucket["stage"] for bucket in cost["stages"]}
+    assert {"run", "extract", "research"} <= stages, stages
+
+    markdown = report["markdown"]
+    assert "## Cost" in markdown
+    assert "| Stage | Spans | Tokens in | Tokens out | Billed | Estimated |" in markdown
+
+    # The root span is a container: no provider priced it, and an em dash says
+    # exactly that. `$0.0000` would turn "nobody priced this" into "free".
+    run_row = next(line for line in markdown.splitlines()
+                   if line.startswith("| run |"))
+    assert run_row.endswith("| — | — |"), run_row
+    # A stage that did call a model keeps its price, even when the gateways
+    # price is zero - a reported zero is a fact.
+    extract_row = next(line for line in markdown.splitlines()
+                       if line.startswith("| extract |"))
+    assert "$" in extract_row, extract_row
+
+
+def test_a_stage_with_no_priced_span_is_reported_as_unpriced(
+        store, make_gateway, make_tavily, claim_payload):
+    from app.verify.report import build_report
+
+    run, _ = _run(store, make_gateway, make_tavily, claim_payload=claim_payload)
+    cost = build_report(store, run.run_id)["cost"]
+    totals = cost["totals"]
+    stages = {bucket["stage"]: bucket for bucket in cost["stages"]}
+
+    # Search and extraction cost nothing in this fake, but they are not priced
+    # zero either: they carry no price at all. The two must not be conflated.
+    assert totals["unpriced_spans"] > 0
+    assert totals["priced_spans"] + totals["unpriced_spans"] == totals["spans"]
+    assert sum(b["unpriced_spans"] for b in stages.values()) == totals["unpriced_spans"]
+    assert sum(b["gateway_usd"] for b in stages.values()) == pytest.approx(
+        totals["gateway_usd"])
+
+    # No call in this run needed a catalogue estimate. Saying `$0.0000` there
+    # would invent an estimate nobody made.
+    markdown = build_report(store, run.run_id)["markdown"]
+    assert "Estimated from the catalogue: none" in markdown
+
+
+def test_an_untraced_run_says_where_the_cost_went_is_unknown(
+        store, make_gateway, make_tavily, claim_payload, monkeypatch):
+    from app.verify.report import build_report
+
+    monkeypatch.setattr(settings, "TRACE_ENABLED", False)
+    run, _ = _run(store, make_gateway, make_tavily, claim_payload=claim_payload)
+    report = build_report(store, run.run_id)
+
+    assert report["cost"]["attributed"] is False
+    assert report["cost"]["stages"] == []
+    markdown = report["markdown"]
+    assert "cannot be attributed by stage" in markdown
+    assert "| Stage |" not in markdown
+    # The gateway total still stands: it does not need the trace to exist.
+    assert "## Gateway" in markdown

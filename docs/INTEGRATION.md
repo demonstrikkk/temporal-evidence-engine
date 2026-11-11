@@ -219,15 +219,19 @@ while money was being spent (a real defect, fixed).
 
 API (`app/api/verify.py`): `POST /runs`, `GET /runs`, `GET /runs/{id}`,
 `GET /runs/{id}/claims/{claim_id}`, `GET /runs/{id}/events`,
-`GET /runs/{id}/stream` (SSE), `GET /runs/{id}/report?format=md|json`,
+`GET /runs/{id}/stream` (SSE), `GET /runs/{id}/coverage`,
+`GET /runs/{id}/trace`, `GET /runs/{id}/report?format=md|json`,
 `GET /watchlist`, `GET /gateway`, `GET /health`.
 Governance (`app/api/governance.py`): `GET /quota`, `GET /cache/metrics`,
 `POST /cache/invalidate-config`, `POST /budget-mode`,
 `GET /bifrost/diagnostic`.
 
 Frontend: `/runs`, `/runs/:runId` (answer spans / claim register / evidence
-inspector, event rail, gateway panel), `/watchlist`. The report is an export
-from the workspace, not a second page rendering the same data.
+inspector, coverage panel, event rail, execution trace, gateway panel),
+`/watchlist`. The report is an export from the workspace, not a second page
+rendering the same data; it carries the same coverage summary and the same
+billed / estimated / unpriced cost split, so the Markdown can be checked
+against the run rather than trusted.
 
 Every stage emits a durable `tev.verification_events` row with a sequence
 number, which is what the event rail streams and what makes `run.partial` a

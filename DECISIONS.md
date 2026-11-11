@@ -681,6 +681,14 @@ remembering to add it, and a filtered view keeps the ancestors of what it
 matched — marked as context — so a row is never shown under a parent that is
 not on screen.
 
+The run report prints the same split, because that is the document people quote
+afterwards. A stage with no priced span prints an em dash, never `$0.0000`:
+"nobody priced this" and "this was free" are different claims, and only the
+first is known. A run with no trace says cost cannot be attributed by stage and
+still prints the gateway total, which does not need the trace to exist. The
+stage table deliberately has no elapsed-time column: nested spans overlap, so a
+sum of their durations is not the time the run took.
+
 ## D-026 - A prompt version is a claim about text, so the text is registered (2026-11-11)
 
 `trace_spans.prompt_version` exists because a hash can tell you two calls differ

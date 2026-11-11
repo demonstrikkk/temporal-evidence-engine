@@ -1,9 +1,13 @@
 """The evidence pack: the same rows the UI shows, as JSON and Markdown.
 
 An export that re-asks a model to summarise the run is not an export. Everything
-here comes from `claims`, `evidence_spans`, `source_revisions` and
-`verification_events`, so the Markdown can be checked against the database line
-by line.
+here comes from `claims`, `evidence_spans`, `source_revisions`,
+`verification_events` and the execution trace, so the Markdown can be checked
+against the database line by line.
+
+Cost gets its own section because a single number cannot say what it is: a
+gateway bill, a catalogue estimate and an unpriced span are three different
+facts, and adding them produces a figure that is none of them.
 """
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from datetime import date, datetime
 from typing import Any
 
 from app.verify.store import VerifyStore, parse_iso
+from app.verify.trace import summarise
 
 _STATUS_LABEL = {
     "supported": "Supported",
@@ -112,6 +117,70 @@ def _coverage_lines(coverage: dict[str, Any], spans: list[dict[str, Any]],
     return lines
 
 
+def _cost_lines(cost: dict[str, Any]) -> list[str]:
+    """Where the money went, and what kind of number each total is.
+
+    A stage with no priced span prints an em dash. Writing `$0.0000` there would
+    claim the work was free, when all that is known is that nobody priced it.
+    """
+    lines = ["## Cost", ""]
+    totals = cost.get("totals") or {}
+    if not cost.get("attributed"):
+        lines.append("- No execution trace was recorded for this run, so cost "
+                     "cannot be attributed by stage. The gateway total below "
+                     "still applies.")
+        lines.append("")
+        return lines
+
+    billed = float(totals.get("gateway_usd") or 0.0)
+    estimated = float(totals.get("estimated_usd") or 0.0)
+    gateway_spans = int(totals.get("gateway_spans") or 0)
+    catalogue_spans = int(totals.get("catalogue_spans") or 0)
+    unpriced = int(totals.get("unpriced_spans") or 0)
+    if gateway_spans:
+        lines.append(f"- Billed by the gateway: ${billed:.4f} "
+                     f"({gateway_spans} priced span"
+                     f"{'' if gateway_spans == 1 else 's'})")
+    else:
+        lines.append("- Billed by the gateway: none — no call in this run was "
+                     "priced by a gateway")
+    if catalogue_spans:
+        lines.append(f"- Estimated from the catalogue: ${estimated:.4f} "
+                     f"({catalogue_spans} priced span"
+                     f"{'' if catalogue_spans == 1 else 's'})")
+    else:
+        lines.append("- Estimated from the catalogue: none — no call needed a "
+                     "catalogue estimate")
+    lines.append(f"- Unpriced spans: {unpriced} of "
+                 f"{int(totals.get('spans') or 0)} — no price was recorded, "
+                 f"which is not the same as free")
+    if totals.get("snapshots"):
+        lines.append(f"- Replayed from cache: {int(totals['snapshots'])}")
+    lines.append("")
+
+    stages = cost.get("stages") or []
+    if stages:
+        lines.append("| Stage | Spans | Tokens in | Tokens out | Billed | Estimated |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for bucket in stages:
+            billed_cell = (f"${float(bucket.get('gateway_usd') or 0.0):.4f}"
+                           if int(bucket.get("gateway_spans") or 0) else "—")
+            estimated_cell = (f"${float(bucket.get('estimated_usd') or 0.0):.4f}"
+                              if int(bucket.get("catalogue_spans") or 0) else "—")
+            lines.append(
+                f"| {bucket.get('stage')} | {int(bucket.get('spans') or 0)} | "
+                f"{int(bucket.get('input_tokens') or 0)} | "
+                f"{int(bucket.get('output_tokens') or 0)} | "
+                f"{billed_cell} | {estimated_cell} |")
+        lines.append("")
+    lines.append("Cost is attributed by the execution trace: each span carries the "
+                 "receipt of the model or tool call that caused it. Stage latency "
+                 "is not printed because nested spans overlap, and a sum of them "
+                 "is not the time the run took.")
+    lines.append("")
+    return lines
+
+
 def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
     run = store.get_run(run_id)
     if not run:
@@ -121,6 +190,16 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
     events = store.list_events(run_id)
     coverage = store.get_coverage_audit(run_id)
     spans = store.list_assertion_spans(run_id)
+    trace_header = store.get_execution_trace(run_id)
+    trace_spans = (store.list_trace_spans(str(trace_header["trace_id"]))
+                   if trace_header else [])
+    summary = summarise(trace_spans)
+    cost = {
+        "attributed": bool(trace_header),
+        "trace_status": (trace_header or {}).get("status"),
+        "totals": summary["totals"],
+        "stages": summary["stages"],
+    }
 
     claim_views = []
     for claim in claims:
@@ -179,16 +258,19 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
         },
         "events": events,
         "gateway": store.gateway_stats(run_id),
+        "cost": cost,
         "markdown": render_markdown(run, answer, claim_views,
                                     store.gateway_stats(run_id),
-                                    coverage=coverage, spans=spans),
+                                    coverage=coverage, spans=spans,
+                                    cost=cost),
     }
 
 
 def render_markdown(run: dict[str, Any], answer: dict[str, Any],
                     claims: list[dict[str, Any]], gateway: dict[str, Any],
                     *, coverage: dict[str, Any] | None = None,
-                    spans: list[dict[str, Any]] | None = None) -> str:
+                    spans: list[dict[str, Any]] | None = None,
+                    cost: dict[str, Any] | None = None) -> str:
     lines: list[str] = []
     lines.append("# Claim verification report")
     lines.append("")
@@ -260,12 +342,20 @@ def render_markdown(run: dict[str, Any], answer: dict[str, Any],
                 lines.append(f"> {quote}")
             lines.append("")
 
+    if cost is not None:
+        lines.extend(_cost_lines(cost))
+
     lines.append("## Gateway")
     lines.append("")
     lines.append(f"- Calls: {gateway.get('calls', 0)}")
     lines.append(f"- Input tokens: {gateway.get('input_tokens', 0)}")
     lines.append(f"- Output tokens: {gateway.get('output_tokens', 0)}")
-    lines.append(f"- Cost: ${float(gateway.get('cost_usd') or 0):.4f}")
+    cost_line = f"- Cost: ${float(gateway.get('cost_usd') or 0):.4f}"
+    if gateway.get("estimated_calls"):
+        cost_line += (f" (includes {int(gateway['estimated_calls'])} call(s) "
+                      f"priced from the model catalogue, which is an estimate "
+                      f"rather than a bill)")
+    lines.append(cost_line)
     lines.append(f"- Fallback attempts: {gateway.get('fallback_attempts', 0)}")
     providers = gateway.get("providers") or []
     lines.append(f"- Providers: {', '.join(providers) if providers else '—'}")

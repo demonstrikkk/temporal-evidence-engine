@@ -91,12 +91,13 @@ class Volatility(str, Enum):
 
 
 #: Hours until freshness halves. Product heuristics, not measured constants.
+#: Stable 30 d, low 7 d, moderate 24 h, high 6 h, ephemeral 15 min (WP-5b).
 HALF_LIFE_HOURS: dict[Volatility, float] = {
-    Volatility.EPHEMERAL: 6,
-    Volatility.HIGH: 24,
-    Volatility.MODERATE: 7 * 24,
-    Volatility.LOW: 30 * 24,
-    Volatility.STABLE: 180 * 24,
+    Volatility.EPHEMERAL: 0.25,
+    Volatility.HIGH: 6,
+    Volatility.MODERATE: 24,
+    Volatility.LOW: 7 * 24,
+    Volatility.STABLE: 30 * 24,
 }
 
 #: Claim types that are never turned into a verification verdict. An opinion is

@@ -25,21 +25,24 @@ def test_never_verified_is_zero_and_has_no_due_date():
 
 
 def test_next_check_is_half_a_half_life_out():
+    # HIGH half-life is 6 h; half of that is 3 h.
     last = NOW - timedelta(hours=2)
     due = next_check_at(Volatility.HIGH, last, now=NOW)
-    assert due == last + timedelta(hours=12)
+    assert due == last + timedelta(hours=3)
 
 
 def test_ephemeral_claims_are_not_scheduled_more_often_than_an_hour():
+    # Ephemeral half-life is 15 min; half is 7.5 min, clamped to MIN_RECHECK (1 h).
     last = NOW
     due = next_check_at(Volatility.EPHEMERAL, last, now=NOW)
-    assert due == last + timedelta(hours=3)
+    assert due == last + timedelta(hours=1)
     assert due >= last + timedelta(hours=1)
 
 
 def test_naive_timestamps_are_treated_as_utc():
     naive = datetime(2026, 11, 9, 11, 0)
-    assert freshness_index(Volatility.HIGH, naive, now=NOW) > 90
+    # MODERATE half-life is 24 h; 1 h old stays above 90.
+    assert freshness_index(Volatility.MODERATE, naive, now=NOW) > 90
 
 
 def test_confidence_is_a_label_not_a_percentage():

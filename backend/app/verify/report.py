@@ -16,6 +16,7 @@ from typing import Any
 
 from app.verify.store import VerifyStore, parse_iso
 from app.verify.trace import summarise
+from app.verify.freshness import freshness_index, next_check_at as _next_check_at
 
 _STATUS_LABEL = {
     "supported": "Supported",
@@ -224,6 +225,52 @@ def _research_lines(research: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _freshness_lines(claims: list[dict[str, Any]],
+                     now: datetime | None = None) -> list[str]:
+    """Per-claim freshness: index, next check, and staleness disclosure.
+
+    Freshness is not a verdict — it says how old the evidence is relative to
+    the claim's volatility class. A stale claim is not wrong; it is due for a
+    recheck. The `now` parameter is injected so the report is reproducible.
+    """
+    from datetime import timezone
+    now = now or datetime.now(timezone.utc)
+    lines = ["## Freshness", ""]
+    if not claims:
+        lines.append("- No claims to assess.")
+        lines.append("")
+        return lines
+
+    lines.append("| Claim | Volatility | Freshness | Next check | Due for recheck |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    due_count = 0
+    for claim in claims:
+        claim_id = str(claim.get("id") or "")
+        volatility = str(claim.get("volatility_class") or "moderate")
+        last_verified_raw = claim.get("last_verified_at")
+        last_verified = parse_iso(last_verified_raw) if last_verified_raw else None
+        next_check = claim.get("next_check_at")
+
+        index = freshness_index(volatility, last_verified, now=now)
+        index_text = f"{index}" if index is not None else "never checked"
+        due = (next_check and parse_iso(next_check) <= now) if next_check else False
+        if due:
+            due_count += 1
+        lines.append(
+            f"| {claim_id[:8]}… | {volatility} | {index_text} | "
+            f"{_date_text(next_check) if next_check else '—'} | "
+            f"{'yes' if due else 'no'} |")
+
+    if due_count:
+        lines.append("")
+        lines.append(f"- {due_count} claim(s) are due for a recheck: their evidence "
+                     f"age has passed the next-check time for their volatility "
+                     f"class. A stale claim is not wrong — it is due for a "
+                     f"reverify.")
+    lines.append("")
+    return lines
+
+
 def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
     run = store.get_run(run_id)
     if not run:
@@ -252,7 +299,6 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
         "pairs_examined": sum(int(p.get("pairs_examined") or 0) for p in plans),
         "pairs_skipped": sum(int(p.get("pairs_skipped") or 0) for p in plans),
     }
-
     claim_views = []
     for claim in claims:
         evidence = [evidence_view(row, store)
@@ -277,6 +323,10 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
             "next_check_at": claim.get("next_check_at"),
             "evidence": evidence,
         })
+
+    freshness = {
+        "claims": claim_views,
+    }
 
     return {
         "run": {
@@ -312,10 +362,12 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
         "gateway": store.gateway_stats(run_id),
         "cost": cost,
         "research": research,
+        "freshness": freshness,
         "markdown": render_markdown(run, answer, claim_views,
                                     store.gateway_stats(run_id),
                                     coverage=coverage, spans=spans,
-                                    cost=cost, research=research),
+                                    cost=cost, research=research,
+                                    freshness=freshness),
     }
 
 
@@ -324,7 +376,8 @@ def render_markdown(run: dict[str, Any], answer: dict[str, Any],
                     *, coverage: dict[str, Any] | None = None,
                     spans: list[dict[str, Any]] | None = None,
                     cost: dict[str, Any] | None = None,
-                    research: dict[str, Any] | None = None) -> str:
+                    research: dict[str, Any] | None = None,
+                    freshness: dict[str, Any] | None = None) -> str:
     lines: list[str] = []
     lines.append("# Claim verification report")
     lines.append("")
@@ -401,6 +454,9 @@ def render_markdown(run: dict[str, Any], answer: dict[str, Any],
 
     if research is not None:
         lines.extend(_research_lines(research))
+
+    if freshness is not None:
+        lines.extend(_freshness_lines(freshness.get("claims") or []))
 
     lines.append("## Gateway")
     lines.append("")

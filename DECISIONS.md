@@ -769,3 +769,22 @@ truncation is never silent. The report prints examined / skipped per group and
 the planned / asked split.
 
 
+## D-028 - Freshness half-life per volatility class (2026-11-11)
+
+`HALF_LIFE_HOURS` in `app/verify/schemas.py` sets the decay clock for
+`freshness_index`: how long a claim's evidence stays "fresh" before a recheck is
+due. The previous values (stable 180 d, low 30 d, moderate 7 d, high 24 h,
+ephemeral 6 h) let an ephemeral claim decay in under a day, which contradicted
+the class name, and let stable claims stay fresh for half a year.
+
+WP-5b sets them to stable 30 d, low 7 d, moderate 24 h, high 6 h, ephemeral 15
+min (`0.25` h). `MIN_RECHECK` (1 h) is unchanged, so ephemeral claims are still
+never scheduled more often than once an hour even though half a half-life is 7.5
+min. Freshness is not a verdict and never changes `claims.status`; it only feeds
+the report's next-check disclosure and any future reverify scheduler.
+
+`app/verify/freshness.py` is unchanged; only the table in `schemas.py` moved.
+`test_freshness.py` pins the new values: HIGH halves at 6 h, MODERATE at 24 h,
+EPHEMERAL at 15 min clamped to the 1 h floor.
+
+

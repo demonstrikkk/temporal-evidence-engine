@@ -143,8 +143,13 @@ class ScriptedTavily:
 
     def __init__(self, sources: list[dict]) -> None:
         self.sources = sources
+        #: URLs handed to `extract`, in call order (WP-4 research suite).
+        self.extracts: list[dict[str, Any]] = []
+        #: Queries handed to `search`, in call order (WP-4 research suite).
+        self.searches: list[str] = []
 
     def search(self, query: str, **_: Any) -> SearchOutcome:
+        self.searches.append(query)
         hits = [
             SearchHit(title=source.get("title") or source["url"],
                       url=source["url"], snippet="", score=0.9,
@@ -156,6 +161,7 @@ class ScriptedTavily:
                              status="live", raw={})
 
     def extract(self, urls: list[str], **_: Any) -> ExtractOutcome:
+        self.extracts.append({"urls": list(urls)})
         pages = {source["url"]: source["content"] for source in self.sources
                  if source["url"] in urls}
         failed = [FailedUrl(url, "not in the gold set") for url in urls

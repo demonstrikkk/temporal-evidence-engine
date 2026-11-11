@@ -34,7 +34,7 @@ _PATTERNS: tuple[tuple[str, int, re.Pattern[str]], ...] = (
         r"|\bQ[1-4]\s+\d{4}\b", re.I)),
     ("money", 90, re.compile(
         r"(?:US\$|USD\s?|\$|\u20ac|\u00a3|\u20b9)\s?\d[\d,]*(?:\.\d+)?"
-        r"(?:\s*(?:/|per)\s*[A-Za-z][\w -]{0,20})?")),
+        r"(?:\s*(?:/|per)\s*[A-Za-z][\w-]{0,12})?")),
     ("percent", 80, re.compile(
         r"\b\d[\d,]*(?:\.\d+)?\s?(?:%|percent\b)")),
     ("measure", 70, re.compile(

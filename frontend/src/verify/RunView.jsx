@@ -20,6 +20,7 @@ import { Empty, RunStatePill, SectionHeading, SkeletonBlock } from './ui.jsx';
 import QuotaRail from './QuotaRail.jsx';
 import BudgetModeSelector from './BudgetModeSelector.jsx';
 import DiagnosticsPanel from './DiagnosticsPanel.jsx';
+import CoveragePanel from './CoveragePanel.jsx';
 
 const STAGE_COPY = {
   queued: 'Queued',
@@ -271,6 +272,13 @@ export default function RunView() {
               )}
             </div>
           </section>
+
+          <CoveragePanel
+            runId={runId}
+            summary={run.coverage}
+            answerText={answer.answer_text}
+            live={live}
+          />
 
           <section className="surface p-4" aria-label="Claim register">
             <SectionHeading

@@ -466,6 +466,8 @@ export const api = {
     events: (id, after = 0, o) =>
       request(`/verify/runs/${encodeURIComponent(id)}/events?after=${Number(after) || 0}`, o),
     report: (id, o) => request(`/verify/runs/${encodeURIComponent(id)}/report`, o),
+    coverage: (id, o) =>
+      request(`/verify/runs/${encodeURIComponent(id)}/coverage`, o),
     watchlist: (o) => request('/verify/watchlist', o),
   },
 

@@ -454,3 +454,84 @@ only the variant that scores worse is how an ablation becomes a sales document.
 actually does - and gets every `changed` case right. Its failures are the point:
 publication time read as event time, a differently scoped number read as a
 replacement, and two first-party pages read as agreement.
+
+## D-020 - The scope gate is a filter in front of every rule, not a guard on R2b (2026-11-11)
+
+Two live runs produced two false refutations of claims that four sources
+supported. Each was a different defect, and neither was a settlement defect:
+
+- **The compound candidate.** A source wrote "Notion Plus costs $8 per user per
+  month (annual billing) or $10 per user per month (monthly billing)". The
+  model's `candidate_value` was that whole sentence, `normalize_value` called it
+  a `string`, and `compare` answered `type_mismatch`. The old gate demanded a
+  comparable type on *both* sides, so it declined to act - and R5 read the
+  passage as a replacement price and answered `changed`.
+- **The different property.** "The Notion free plan lets an individual store
+  unlimited pages and blocks" was "refuted" by "Free plans have a 5 MB file
+  upload limit per file". Both values are text, the subject ("free plan") is
+  named, the quote resolves at its offsets, so `settle` accepted it. `compare`
+  could only say `different_text`, which is exactly what a genuine textual
+  refutation looks like.
+
+The rule changes:
+
+1. **The gate filters, it does not guard one branch.** A contradiction the gate
+   blocks leaves the contradiction set *before* any rule runs, so R3, R5, R6 and
+   R7 cannot be reached by it. Previously only R2b consulted the block list, so a
+   blocked contradiction still drove R5 to `changed`. This is the change that
+   made R2b's `scope_mismatch` abstention unreachable for a supported claim: the
+   claim is now `supported`, and the blocked passage is disclosed in
+   `Decision.material["scope_blocked"]` and in the `claim.settled` event. R2b
+   still fires when a scoped contradiction exists and nothing settles the claim.
+2. **A compound candidate is judged clause by clause.** `_comparable_clauses`
+   splits on `or`, `;` and `/`, strips parentheticals (which the normalizer treats
+   as text, so `$8 per user per month (annual billing)` does not normalise), and
+   keeps the clauses that are comparable. The gate blocks only when *every*
+   comparable clause is incomparable; one genuinely different clause still
+   refutes.
+3. **A textual claim needs a shared property term.** `object_terms_named` in
+   `settlement.py`, reached through `settle_assertion(object_text=...)` from both
+   contradiction branches in the orchestrator. It applies **only** when the
+   claim's own value normalises to `string`. A money, quantity, period or version
+   is compared field by field, and this check would reject a real refutation
+   phrased differently ("headquartered in Munich" for "located in Berlin").
+
+`RULE_VERSION` is `tev-1.2.0`.
+
+Measured, in this order:
+
+- Replay of run `9d98e100` (read-only, same store copy): "Notion Plus costs $10
+  per member per month" moved from `contradicted/temporal_ambiguity` to
+  `supported/supported_by_source`.
+- A fresh live run with an empty store, `CACHE_MODE=read-write`, rule
+  `tev-1.2.0`, run `86ccc5d3-0bf5-4263-b1ab-dc97e16dc7ea`: `completed` in 83.8 s,
+  15 gateway calls, 37,669 input / 1,318 output tokens, 0 model failures, 0
+  search failures, 0 `run.partial`, and **both** claims
+  `supported/supported_by_source`.
+- Hermetic gold set: 106 cases, 107 claims, 100.0% status accuracy, 0 false
+  `supported`, 0 false `changed`, 100% abstention recall, 138/138 quotes,
+  44/44 event dates.
+- Ablations unchanged at 100.0 / 65.4 / 57.9 / 53.3.
+
+Consequences that are deliberate, not accidental:
+
+- Nine gold expectations moved from `unverifiable/scope_mismatch` to
+  `supported/supported_by_source` (`scope-support-*`, plus the hand-written
+  `scope-mismatch`). They were written for the old rule; under this one a source
+  settles the claim and a differently-scoped passage cannot veto it. The reason
+  code keeps coverage through `scope-only-*`, which has no support to settle with.
+  This is a recorded rule change, not a test loosened to get a green run: the
+  expectations were regenerated from the decision table, across dev **and**
+  held-out instances alike.
+- The hand-written `scope-mismatch` case also held a double-encoded euro (UTF-8
+  bytes read as cp1252 and re-encoded), so the normalizer saw text rather than
+  money and the gate could not fire at all. The data was repaired; the case now
+  exercises the rule rather than the corruption.
+
+What this does not claim: `object_terms_named` is a term-overlap heuristic, not
+an entailment check. It refuses a contradiction that shares no distinctive word
+with the claim's stated property; it cannot tell whether a passage that *does*
+share a word actually addresses the property. It is a floor on absurd
+refutations, and the reason it is confined to textual values is that numbers do
+not need it.
+

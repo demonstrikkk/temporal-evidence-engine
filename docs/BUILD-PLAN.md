@@ -453,7 +453,7 @@ Notes:
 
 ---
 
-## 8. Verifier rules (frozen as `RULE_VERSION=tev-1.1.0`; see D-013)
+## 8. Verifier rules (frozen as `RULE_VERSION=tev-1.2.0`; see D-013, D-020)
 
 ### 8.1 Decision precedence
 
@@ -463,18 +463,31 @@ the settlement gate's verdict on the proposal; `relationship_settled` is which
 relationship survived it (D-017 - the columns used to hold `'settled'` in both,
 which answered neither question). A settled row also has to be a statement (three
 words minimum) and, for a contradiction, has to name the claim's own qualifier;
-both are enforced in `app/verify/settlement.py` (D-013).
+both are enforced in `app/verify/settlement.py` (D-013). A contradiction of a
+claim whose value is *text* must also share a distinctive term with that value
+(D-020).
+
+**The scope gate runs first, and it filters.** A contradiction whose comparable
+value differs in currency, period or per-unit basis is removed from the
+contradiction set before rule 1 is evaluated, so rules 3, 5, 6 and 7 cannot be
+reached by it. A compound candidate is split into clauses first and blocks only
+when *every* comparable clause is incomparable (D-020).
 
 | # | Condition | Status | Reason |
 |---|---|---|---|
 | 1 | No evidence with a locatable quote | `unverifiable` | `no_source` |
 | 2 | Evidence exists; nothing settles as support; no valid contradiction | `unverifiable` | `no_entailment` |
-| 2b | The only contradiction states a different currency, period or per-unit basis (and no support exists) | `unverifiable` | `scope_mismatch` |
+| 2b | Every contradiction is scope-blocked and no support settles the claim | `unverifiable` | `scope_mismatch` |
 | 3 | Valid contradiction refutes the claim; no support | `contradicted` | `contradicted_by_source` |
 | 4 | Support exists and any contradiction is older than the supporting evidence | `supported` | `supported_by_source` |
 | 5 | Support exists **and** a newer source settles a replacement value with `event_date > answer_generated_at` | `changed` | `value_changed_after_generation` |
 | 6 | Support and contradiction coexist, either relevant `event_date` unknown | `contradicted` | `temporal_ambiguity` |
 | 7 | Two credible, directly relevant sources conflict at the same effective time | `unverifiable` | `conflicting_evidence` |
+
+A scope-blocked contradiction never changes the status by itself: when a support
+settles the claim the answer is `supported` (rule 4), and the blocked passage is
+disclosed in `Decision.material["scope_blocked"]` and in the `claim.settled`
+event, so the reader sees what disagreed without it deciding.
 
 **`changed` requires all eight** (and each is a unit test):
 
@@ -542,8 +555,10 @@ Rules (each tested):
 - `10%` != `10 percentage points`.
 - `v2.1.0` != `v2.2.0`; `2.1` == `v2.1` only if scheme matches.
 - Ambiguous `$` (no currency, no locale) → `ambiguous_currency`, **not** USD.
-- No currency conversion without a dated rate. If a rate is needed and absent →
-  `unverifiable/scope_mismatch`.
+- No currency conversion without a dated rate. If a rate is needed and absent the
+  passage cannot refute the claim: it is scope-blocked, so the claim is
+  `supported` when a support settles it and `unverifiable/scope_mismatch` (rule
+  2b) when none does (D-020).
 
 ### 8.4 Freshness (separate from confidence)
 
@@ -799,7 +814,7 @@ shaped the rules — so the held-out number is measured on generated cases only.
 
 The live set is deliberately small and names real, checkable entities (Notion's
 founding year, Python's creator, and one product that does not exist). It runs
-the full path — real Groq through Bifrost, real Tavily — and is gated on the
+the full path — real Mistral through Bifrost, real Tavily — and is gated on the
 things the product controls: every stored quote resolves, every claim is
 extracted, every run finishes, and no claim is called `supported` or `changed`
 against the gold. Live status accuracy is printed but not gated, because the
@@ -849,19 +864,19 @@ worth making.
 
 | pipeline | status accuracy | false supported | false changed | abstention recall |
 |---|---|---|---|---|
-| `baseline` | 57.9% | 14 | 16 | 31.1% |
-| `baseline-collapsed` | 53.3% | 14 | 0 | 31.1% |
-| `evidence-gated` | 65.4% | 6 | 16 | 48.9% |
+| `baseline` | 57.9% | 14 | 16 | 38.9% |
+| `baseline-collapsed` | 53.3% | 14 | 0 | 38.9% |
+| `evidence-gated` | 65.4% | 6 | 16 | 61.1% |
 | `full` | 100.0% | 0 | 0 | 100.0% |
 
 Where each arm breaks, by expected status (correct / total):
 
 | expected | claims | `baseline` | `baseline-collapsed` | `evidence-gated` | `full` |
 |---|---|---|---|---|---|
-| supported | 26 | 23 | 23 | 23 | 26 |
+| supported | 35 | 23 | 23 | 23 | 35 |
 | changed | 16 | 16 | 0 | 16 | 16 |
 | contradicted | 20 | 9 | 20 | 9 | 20 |
-| unverifiable | 45 | 14 | 14 | 22 | 45 |
+| unverifiable | 36 | 14 | 14 | 22 | 36 |
 
 The interesting part is not that the full pipeline scores 100% — it is *which*
 errors the layers remove:
@@ -870,16 +885,18 @@ errors the layers remove:
   quotes, a quote that is not in the stored page, and a quote that names the
   subject but never the value. The other 6 survive it: two first-party pages
   disagreeing, which needs the decision table (R7), not a substring check.
-- Event dates and the decision table remove all 16 false `changed`. Nine are a
-  refutation with no event date, where the honest verdict is `contradicted`
-  (the change happened but we cannot place it); three are a differently scoped
-  number (`$45 per year` against `$45 per month`); one is a contradiction with
-  no support, which is not a change however new the value looks; one is an
-  unknown generation time; one is two primary sources disagreeing; and one is a
-  newer article restating an older fact.
+- Event dates and the decision table remove all 16 false `changed`. Eleven are
+  contradictions the naive reading promoted: 8 refutations with no event date,
+  where the honest verdict is `contradicted` (the change happened but cannot be
+  placed); a refutation with no support to change from; a contradiction whose
+  effective date is unknown; and a claim whose generation time is unknown. Three
+  are `supported` cases the baseline calls changed: a refutation about a
+  different plan, a differently scoped currency, and a newer article restating an
+  older event. Two are claims that should abstain: a scoped contradiction with no
+  support, and two primary sources disagreeing.
 - Abstention is where the gap is widest: the baseline abstains correctly in
-  14 of 45 cases that should abstain, quote location raises that to 22, and the
-  full pipeline to 45.
+  14 of 36 claims that should abstain, quote location raises that to 22, and the
+  full pipeline to 36.
 - `baseline` gets all 16 `changed` cases right, which is the honest reason this
   ablation is worth running: the naive pipeline is not wrong about the common
   case, it is wrong exactly where publication time, event time, scope and
@@ -1048,8 +1065,9 @@ that fails on the old code (D-013): a citation marker cannot refute; a
 contradiction must name the claim's subject; `$10 per member per month` parses;
 settlement shares the parser's vocabulary tables; R7 is reachable and a
 scope-incompatible contradiction without support abstains; a transient Windows
-file lock is not a model failure. `RULE_VERSION` is `tev-1.1.0` and is a module
-constant, not an environment variable (D-015).
+file lock is not a model failure. `RULE_VERSION` is `tev-1.2.0` and is a module
+constant, not an environment variable (D-015); D-020 raised it from `tev-1.1.0`
+when the scope gate became a filter in front of every rule.
 
 Verified by command, not by memory:
 

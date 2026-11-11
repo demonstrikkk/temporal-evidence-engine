@@ -257,6 +257,15 @@ D_ENTITIES = [
 
 
 def scope_mismatch_with_support() -> list[dict]:
+    """A support settles the claim; a differently-scoped passage cannot refute it.
+
+    The expectation here was `unverifiable / scope_mismatch` while the scope gate
+    guarded R2b alone. D-020 made the gate a filter in front of every rule, so a
+    passage that states the price per year is removed from the contradiction set
+    and the settled monthly support decides. That is the honest outcome: the
+    annual figure is not evidence that a monthly price is wrong. The reason code
+    is still exercised by `scope_only_*`, which has no support to settle with.
+    """
     cases = []
     for index, (name, slug, old, period) in enumerate(D_ENTITIES):
         old_date = f"2026-{1 + index % 4:02d}-08"
@@ -264,13 +273,14 @@ def scope_mismatch_with_support() -> list[dict]:
         other_value = f"${old} {period}"
         cases.append(_case(
             f"scope-support-{slug}",
-            "A different billing period is a different scope, not a replacement.",
+            "A different billing period cannot refute a claim that a source "
+            "settles.",
             prompt=f"What does {name} cost?",
             claim=_claim(
                 f"{name} costs ${old} per month.", name, "price",
                 f"${old}/month",
-                expect={"status": "unverifiable",
-                        "reason_code": "scope_mismatch"}),
+                expect={"status": "supported",
+                        "reason_code": "supported_by_source"}),
             sources=[
                 _source(f"https://{slug}.example/history",
                         f"{name} price history", old_date,

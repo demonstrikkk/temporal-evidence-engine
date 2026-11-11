@@ -626,7 +626,7 @@ class Verifier:
                         subject=draft.subject, predicate=draft.predicate,
                         value_raw=proposal.candidate_value_raw,
                         quote=proposal.quote, source_text=content,
-                        must_name_subject=True)
+                        must_name_subject=True, object_text=draft.object_raw or "")
                 else:
                     # Contradiction by explicit negation: settle the negation
                     # itself, so the contradiction is still evidence-backed.
@@ -636,7 +636,8 @@ class Verifier:
                         settlement = settle_assertion(
                             subject=draft.subject, predicate=draft.predicate,
                             value_raw=cue, quote=proposal.quote,
-                            source_text=content, must_name_subject=True)
+                            source_text=content, must_name_subject=True,
+                            object_text=draft.object_raw or "")
                     else:
                         settlement = None
 
@@ -759,6 +760,10 @@ class Verifier:
             "explanation": decision.explanation,
             "supporting": list(decision.supporting),
             "contradicting": list(decision.contradicting),
+            # A contradiction dropped at the scope gate is still worth telling
+            # the operator about: it is why a claim with a disagreeing passage
+            # can legitimately read `supported`.
+            "scope_blocked": list(decision.material.get("scope_blocked") or []),
             "replacement_evidence_id": decision.replacement_id,
             "freshness_index": freshness_index(draft.volatility_class, stamp),
             "rule_version": RULE_VERSION,

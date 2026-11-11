@@ -2,14 +2,22 @@
 
 Precedence, exactly as specified (BUILD-PLAN §8.1):
 
+  (gate) a contradiction in an incomparable scope is not a contradiction at all
   R1 no locatable evidence            -> unverifiable / no_source
   R2 evidence, nothing entails it     -> unverifiable / no_entailment
-  R2b only contradiction is out of scope -> unverifiable / scope_mismatch
+  R2b a contradiction is out of scope -> unverifiable / scope_mismatch
   R3 contradiction, no support        -> contradicted
   R7 two primary sources disagree     -> unverifiable / conflicting_evidence
   R6 an event date involved is unknown-> contradicted / temporal_ambiguity
   R5 newer settled replacement        -> changed
   R4 contradiction older than support -> supported
+
+The scope gate is a filter, not a rule: `$99 per month` is not refuted by `€129
+per month` or `$99 per month per seat`, so those passages are removed from the
+contradiction set *before* any rule looks at it. It used to guard R2b alone,
+which meant the same incomparable value became a decisive `contradicted` the
+moment a support was also found (R6) or was not (R3). Both were observed on a
+live run against Mistral; see D-020.
 
 `changed` has eight preconditions; every one is a test in
 `backend/tests/verify/test_decision.py`. The two that are easiest to lose:
@@ -21,6 +29,7 @@ A newer article is not a change. A publication date is not an event date.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -36,6 +45,29 @@ from app.verify.value_normalizer import normalize_value
 SCOPED_KINDS = {"money", "quantity", "number", "percent", "duration", "version"}
 
 
+def _comparable_clauses(candidate: Any) -> list[str]:
+    """The parts of a compound candidate that state a value we can compare.
+
+    The model answers with a sentence when the source states more than one
+    price: "$8 per user per month (annual billing) or $10 per user per month
+    (monthly billing)". Comparing that whole string with "$10 per member per
+    month" yields `type_mismatch`, and the gate used to ignore it because the
+    right-hand side had no normalisable type - so a passage that names the
+    claim's own value on the monthly basis was read as a refutation. Split on
+    the conjunctions a price list uses, and keep the clauses that do normalise.
+    """
+    parts = re.split(r"\s+or\s+|;\s*|\s+/\s+", str(candidate), flags=re.IGNORECASE)
+    clauses: list[str] = []
+    for part in parts:
+        # "$8 per user per month (annual billing)" is not a normalisable value
+        # until the aside is removed; the aside is exactly the qualifier that
+        # makes it annual, and the basis comparison handles that on its own.
+        cleaned = re.sub(r"\([^)]*\)", " ", part).strip(" .,")
+        if normalize_value(cleaned).get("type") in SCOPED_KINDS:
+            clauses.append(cleaned)
+    return clauses
+
+
 def _scope_blocks(claim_value: Any, fact: EvidenceFact) -> bool:
     """Does this "contradiction" compare a different kind of number?
 
@@ -44,16 +76,22 @@ def _scope_blocks(claim_value: Any, fact: EvidenceFact) -> bool:
     honest reading is that the values are not comparable, not that the answer
     was wrong. `settle` only checks the proposal against its own quote, so
     without this gate a scope difference became a decisive `contradicted`
-    whenever no support happened to be found. Textual contradictions are left
-    alone: there is no scope to compare, and settlement already decided.
+    whenever no support happened to be found.
+
+    A candidate that states *no* comparable value at all - "free", "not
+    available on this plan", "included in the Business plans" - is left alone:
+    those are textual refutations, settlement already decided them, and blocking
+    them would turn a real contradiction into a false `supported`.
     """
     if fact.candidate_value is None:
         return False
-    left = normalize_value(claim_value).get("type")
-    right = normalize_value(fact.candidate_value).get("type")
-    if left not in SCOPED_KINDS or right not in SCOPED_KINDS:
+    if normalize_value(claim_value).get("type") not in SCOPED_KINDS:
         return False
-    return compare(claim_value, fact.candidate_value).reason in SCOPE_REASONS
+    clauses = _comparable_clauses(fact.candidate_value)
+    if not clauses:
+        return False
+    return all(compare(claim_value, clause).reason in SCOPE_REASONS
+               for clause in clauses)
 
 
 @dataclass(frozen=True)
@@ -114,14 +152,22 @@ def decide(*, claim_value: Any, answer_generated_at: datetime | None,
 
     counted = [f for f in locatable if f.settled]
     supports = [f for f in counted if f.relationship == Relationship.SUPPORTS]
-    contradicts = [f for f in counted if f.relationship == Relationship.CONTRADICTS]
+    proposed = [f for f in counted if f.relationship == Relationship.CONTRADICTS]
 
-    # A contradiction about a differently-scoped number is not a refutation.
-    # Only the no-support case is rerouted: when a support exists, the table
-    # below already decides between `supported` and `scope_mismatch`, and
-    # changing that path would be a second rule change in the same breath.
-    blocked = [f for f in contradicts if _scope_blocks(claim_value, f)]
-    if blocked and not supports and len(blocked) == len(contradicts):
+    # The scope gate. A passage that states its value in a different currency,
+    # period or per-unit basis cannot refute this claim, so it leaves the
+    # contradiction set here and no rule below can be reached by it. Keeping the
+    # gate off R3/R6 let a live Mistral run refute "$10 per member per month"
+    # with a passage that itself said "a monthly subscription will cost you
+    # $10" -- the annual figure beside it is what `compare` called
+    # `different_basis`.
+    blocked = [f for f in proposed if _scope_blocks(claim_value, f)]
+    blocked_ids = set(_ids(blocked))
+    contradicts = [f for f in proposed if f.evidence_id not in blocked_ids]
+
+    # R2b — a passage disagrees, but in a scope where the two values cannot be
+    # compared, and nothing establishes the claim.
+    if blocked and not supports and not contradicts:
         return Decision(
             ClaimStatus.UNVERIFIABLE, ReasonCode.SCOPE_MISMATCH, "R2b",
             "A passage disagrees, but states its value in a different scope "
@@ -185,12 +231,9 @@ def decide(*, claim_value: Any, answer_generated_at: datetime | None,
                     "A passage marked as a contradiction states a value "
                     "equivalent to the claim; the metadata and the value disagree.",
                     supporting=_ids(supports), contradicting=_ids(contradicts))
-            if cmp.reason in SCOPE_REASONS:
-                return Decision(
-                    ClaimStatus.UNVERIFIABLE, ReasonCode.SCOPE_MISMATCH, "R5",
-                    f"The replacement value cannot be compared with the claim "
-                    f"({cmp.reason}); a change is not established.",
-                    supporting=_ids(supports), contradicting=_ids(contradicts))
+            # No scope check here: an incomparable replacement left the
+            # contradiction set at the gate above, so reaching this line means
+            # the two values are comparable and `changed` is on the table.
             if answer_generated_at is None:
                 return Decision(
                     ClaimStatus.CONTRADICTED, ReasonCode.GENERATION_TIME_UNKNOWN,
@@ -219,9 +262,19 @@ def decide(*, claim_value: Any, answer_generated_at: datetime | None,
         return Decision(ClaimStatus.SUPPORTED, ReasonCode.SUPPORTED_BY_SOURCE, "R4",
                         "A settled, locatable passage supports the claim, and "
                         "any contradiction predates it.",
-                        supporting=_ids(supports), contradicting=_ids(contradicts))
+                        supporting=_ids(supports), contradicting=_ids(contradicts),
+                        material=({"scope_blocked": list(_ids(blocked))}
+                                  if blocked else {}))
 
-    # Only support remains.
+    # Only support remains. A passage that disagreed in an incomparable scope is
+    # disclosed in `material` and in the `claim.settled` event, never decisive:
+    # the claim is established, and the passage that disagreed could not be
+    # compared with it. Refusing to say `supported` here would let one
+    # misclassified proposal veto a settled support.
+    explanation = "A settled, locatable passage supports the claim."
+    if blocked:
+        explanation += (" A passage that disagreed states its value in a different "
+                        "scope, so it cannot refute the claim.")
     return Decision(ClaimStatus.SUPPORTED, ReasonCode.SUPPORTED_BY_SOURCE, "R4",
-                    "A settled, locatable passage supports the claim.",
-                    supporting=_ids(supports))
+                    explanation, supporting=_ids(supports),
+                    material={"scope_blocked": list(_ids(blocked))} if blocked else {})

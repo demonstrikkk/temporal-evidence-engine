@@ -4,7 +4,8 @@ from __future__ import annotations
 from app.verify.decision import EvidenceFact, decide
 from app.verify.schemas import ClaimStatus, ReasonCode, Relationship
 from app.verify.settlement import (evidence_speaks_to, is_scope_block,
-                                   settle_assertion, subject_named)
+                                   object_terms_named, settle_assertion,
+                                   subject_named)
 
 PAGE = ("Acme Pro plan pricing. The Pro plan costs $99 per month, billed "
         "monthly. Enterprise is $499 per month. Contact sales@acme.test.")
@@ -166,3 +167,47 @@ def test_subject_matching_is_on_words_not_substrings():
     # is there. Requiring the brand would refuse the most common support shape.
     named, _ = subject_named("The Pro plan costs $99 per month", "Acme Pro")
     assert named
+
+
+def test_object_terms_catch_a_passage_about_a_different_property():
+    """The live-run defect: a file-size cap is not a page/block allowance.
+
+    Claim: "The Notion free plan lets an individual store unlimited pages and
+    blocks." Proposed refutation: "Free plans have a 5 MB file upload limit per
+    file." The subject was named and the quote resolved, so settlement accepted
+    it - but the passage never mentions pages, blocks or a storage allowance.
+    """
+    named, why = object_terms_named("Free plans have a 5 MB file upload limit "
+                                    "per file", "unlimited pages and blocks")
+    assert not named
+    assert "different property" in why
+
+
+def test_object_terms_accept_a_passage_about_the_same_property():
+    named, _ = object_terms_named("The Free plan is capped at 1,000 blocks and "
+                                  "100 pages", "unlimited pages and blocks")
+    assert named
+
+
+def test_object_terms_do_not_gate_a_numeric_value():
+    """A price is compared field by field; this check must stay out of it."""
+    named, _ = object_terms_named("The Plus plan costs $8 per user per month",
+                                  "$10 per member per month")
+    assert named
+
+
+def test_object_terms_with_no_distinctive_word_are_not_checked():
+    named, _ = object_terms_named("anything at all", "and the of")
+    assert named
+
+
+def test_a_contradiction_must_be_about_the_claims_property():
+    settlement = settle_assertion(
+        subject="Notion free plan", predicate="allows storing",
+        value_raw="5 MB file upload limit per file",
+        quote="Free plans have a 5 MB file upload limit per file",
+        source_text=("Free plans have a 5 MB file upload limit per file. "
+                     "They also include unlimited pages and blocks."),
+        must_name_subject=True, object_text="unlimited pages and blocks")
+    assert not settlement.ok
+    assert "different property" in settlement.reason

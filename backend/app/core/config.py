@@ -41,7 +41,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 #: `1.0.0` - a label that can be changed without changing the rules is not a
 #: rule version. Bumping this constant is a code change, reviewed with the rule
 #: change it describes.
-RULE_VERSION = "tev-1.1.0"
+#:
+#: tev-1.2.0 (D-020): the scope gate became a filter in front of every rule
+#: instead of a guard on R2b alone.
+RULE_VERSION = "tev-1.2.0"
 
 
 class Settings(BaseSettings):

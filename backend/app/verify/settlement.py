@@ -148,6 +148,39 @@ def subject_named(quote: str, subject: str) -> tuple[bool, str]:
                    f"({forms[0]})")
 
 
+def object_terms_named(quote: str, object_text: str) -> tuple[bool, str]:
+    """Is the passage about the same *property* the claim states?
+
+    Naming the subject is not enough when the claim has no numeric value to
+    compare. Measured on a live run: "The Notion free plan lets an individual
+    store unlimited pages and blocks" was refuted by "Free plans have a 5 MB
+    file upload limit per file". The subject ("free plan") is named, the quote
+    resolves, and settlement accepted it -- but a file-size cap says nothing
+    about a page/block allowance, so it is not a refutation of this claim.
+
+    Applied only when the claim's value is textual. A money, quantity, period or
+    version is already compared field by field, and `compare` is the better
+    judge there; running this check on top would reject a genuine refutation
+    that phrases the disagreement differently ("headquartered in Munich" for a
+    claim of "located in Berlin").
+
+    A quote that shares no distinctive term is refused; an object with no
+    distinctive terms at all is not checked.
+    """
+    if normalize_value(object_text).get("type") != "string":
+        return True, ""
+    terms = [word for word in re.findall(r"[a-z0-9]+", (object_text or "").casefold())
+             if len(word) >= 3 and word not in _GENERIC_SUBJECT_WORDS]
+    if not terms:
+        return True, ""
+    text = (quote or "").casefold()
+    for term in terms:
+        if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text):
+            return True, ""
+    return False, ("the quote is about a different property: it mentions none "
+                   f"of {', '.join(terms[:4])}")
+
+
 def evidence_speaks_to(value_raw: Any, quote: str) -> tuple[bool, str]:
     """Cheap deterministic check that the quote is *about* the stated value.
 
@@ -218,13 +251,17 @@ def evidence_speaks_to(value_raw: Any, quote: str) -> tuple[bool, str]:
 
 def settle_assertion(*, subject: str, predicate: str, value_raw: Any,
                      quote: str, source_text: str,
-                     must_name_subject: bool = False) -> Settlement:
+                     must_name_subject: bool = False,
+                     object_text: str = "") -> Settlement:
     """Did this passage establish this value, at a locatable position?
 
     `must_name_subject` is set by the caller for a proposal that *contradicts*:
     refuting a claim requires naming the same subject, which a support does not
     (a supporting sentence may say "it costs $10" in a paragraph that already
     named the subject). See `subject_named` for the defect this prevents.
+
+    `object_text` is the claim's own value; when it is supplied, a contradiction
+    must also be about that property. See `object_terms_named`.
     """
     if not quote or not source_text:
         return Settlement(False, None, None,
@@ -236,6 +273,10 @@ def settle_assertion(*, subject: str, predicate: str, value_raw: Any,
         named, why = subject_named(quote, subject)
         if not named:
             return Settlement(False, None, None, why, "")
+        if object_text:
+            about, why = object_terms_named(quote, object_text)
+            if not about:
+                return Settlement(False, None, None, why, "")
     cell = synthetic_cell(subject, predicate, value_raw)
     settled = validator.settle(cell, status="verified", quote=quote,
                                source_text=source_text,

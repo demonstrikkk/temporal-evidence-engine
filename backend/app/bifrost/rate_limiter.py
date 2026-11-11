@@ -73,6 +73,24 @@ class QuotaLimiter:
             if target > self._pause_until:
                 self._pause_until = target
 
+    def reset(self) -> None:
+        """Forget the current window and any provider-reported pause.
+
+        The limiter is process-wide on purpose - it guards one provider key
+        shared by every run in this process - so anything that asserts on *how
+        long* a call waits has to start from an empty window. That includes a
+        test that measures `Retry-After` handling, and an operator who has just
+        raised the ceiling and wants the new one to take effect immediately.
+        """
+        with self._lock:
+            self._window = RateLimitWindow()
+            self._pause_until = 0.0
+            self._remaining_requests = None
+            self._remaining_tokens = None
+            self._reset_requests_seconds = None
+            self._reset_tokens_seconds = None
+            self._last_header_update = 0.0
+
     def is_paused(self) -> bool:
         with self._lock:
             return time.time() < self._pause_until

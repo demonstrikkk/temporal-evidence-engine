@@ -45,7 +45,7 @@ ROW = {
     "skip_non_factual": True,
     "status": "queued",
     "stage": "queued",
-    "rule_version": "tev-1.1.0",
+    "rule_version": "tev-1.2.0",
     "cache_mode": "read-write",
     "started_at": "2026-01-01T00:00:00Z",
     "claim_text": "x",

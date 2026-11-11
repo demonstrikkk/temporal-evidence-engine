@@ -97,6 +97,11 @@ class BifrostResult:
     status: Literal["live", "snapshot"]
     created_at: datetime
     raw: dict[str, Any] = field(default_factory=dict)
+    #: Where `cost_usd` came from. `gateway` - the completion reported it.
+    #: `catalogue` - the gateway reported no cost, so the call was priced from
+    #: the prices the gateway publishes in `/v1/models`. `none` - unpriced.
+    #: Never conflate the first two: an estimate is not a bill.
+    cost_source: str = "gateway"
 
     def json(self) -> Any:
         from app.schemas.evidence import parse_llm_json
@@ -123,6 +128,24 @@ def _num(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _first_number(*values: Any) -> float | None:
+    """The first value that is actually a number, or None.
+
+    `_num` maps a missing value to 0.0, which is indistinguishable from a caller
+    that reported a real zero. That difference matters for cost: a gateway that
+    says `cost: null` has not said the call was free, and the old `a or b or c`
+    chain silently turned "unpriced" into "$0.00".
+    """
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _int(value: Any) -> int:
@@ -176,6 +199,8 @@ class BifrostClient:
             else budget_usd
         self.cache_mode = cache_mode or settings.CACHE_MODE
         self.cache = CacheCoordinator(store)
+        #: model -> (monotonic fetch time, prompt/completion price per token)
+        self._price_cache: dict[str, tuple[float, dict[str, float]]] = {}
 
     # -- configuration ----------------------------------------------------
     def model_for(self, stage: str) -> str:
@@ -209,6 +234,44 @@ class BifrostClient:
                         "base_url": self.base_url}
         return {"ok": False, "detail": "gateway did not answer a health probe",
                 "base_url": self.base_url}
+
+    def catalogue_prices(self, model: str) -> dict[str, float]:
+        """What the gateway says one token of `model` costs.
+
+        Mistral completions come back with `cost: null` while the same gateway
+        publishes `pricing.prompt` and `pricing.completion` for that model in
+        `/v1/models`. Reporting the null as $0.00 told the operator a run was
+        free when it had spent about half a cent, so an unpriced completion is
+        priced from the catalogue and the row is marked `catalogue` - never
+        `gateway`, because an estimate is not a bill.
+
+        Best effort by design: pricing must never be able to fail a completion.
+        Cached for an hour per model, so the extra request is one per run.
+        """
+        cached = self._price_cache.get(model)
+        if cached and (time.monotonic() - cached[0]) < 3600:
+            return cached[1]
+        headers = {"Authorization": f"Bearer {self.virtual_key}",
+                   "x-bf-vk": self.virtual_key}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(f"{self.base_url}/v1/models",
+                                      headers=headers)
+            if response.status_code >= 400:
+                return {}
+            for entry in (response.json().get("data") or []):
+                if str(entry.get("id")) != model:
+                    continue
+                pricing = entry.get("pricing") or {}
+                prices = {"prompt": _num(pricing.get("prompt")),
+                          "completion": _num(pricing.get("completion"))}
+                if prices["prompt"] or prices["completion"]:
+                    self._price_cache[model] = (time.monotonic(), prices)
+                    return prices
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("price catalogue unavailable", extra={
+                "data": {"model": model, "error": str(exc)[:160]}})
+        return {}
 
     def diagnostics(self) -> dict[str, Any]:
         """Complete diagnostics including health, rate limiter, circuit breaker, and models."""
@@ -265,7 +328,8 @@ class BifrostClient:
                     latency_ms=_int(cached.get("latency_ms")),
                     fallback_attempts=_int(cached.get("fallback_attempts")),
                     status="snapshot", created_at=parse_iso(cached.get("created_at")) or now(),
-                    raw=cached.get("raw") or {})
+                    raw=cached.get("raw") or {},
+                    cost_source=str(cached.get("cost_source") or "gateway"))
 
         if self.cache_mode != "off":
             cached = self.store.find_model_call(digest, model, stage)
@@ -291,7 +355,8 @@ class BifrostClient:
                     cost_usd=_num(cached.get("cost_usd")),
                     latency_ms=_int(cached.get("latency_ms")),
                     fallback_attempts=_int(cached.get("fallback_attempts")),
-                    status="snapshot", created_at=created, raw=payload.get("raw") or {})
+                    status="snapshot", created_at=created, raw=payload.get("raw") or {},
+                    cost_source=str(cached.get("cost_source") or "gateway"))
             if self.cache_mode == "read-only":
                 raise BifrostError(
                     "cache_miss",
@@ -423,18 +488,28 @@ class BifrostClient:
         request_id = (str(payload.get("id") or "")
                       or _header(response.headers, "x-bifrost-request-id",
                                  "x-bf-request-id", "x-request-id"))
-        cost = (_num(extra.get("cost")) or _num(usage.get("cost"))
-                or _num(_header(response.headers, "x-bifrost-cost")))
+        input_tokens = _int(usage.get("prompt_tokens"))
+        output_tokens = _int(usage.get("completion_tokens"))
+        cost = _first_number(extra.get("cost"), usage.get("cost"),
+                             _header(response.headers, "x-bifrost-cost"))
+        cost_source = "gateway" if cost is not None else "none"
+        if cost is None:
+            prices = self.catalogue_prices(model)
+            if prices:
+                cost = (input_tokens * prices["prompt"]
+                        + output_tokens * prices["completion"])
+                cost_source = "catalogue"
         fallbacks = (_int(extra.get("fallback_index"))
                      or _int(_header(response.headers, "x-bifrost-fallbacks")))
 
         result = BifrostResult(
             text=text, provider=provider, model=str(payload.get("model") or model),
             request_id=request_id,
-            input_tokens=_int(usage.get("prompt_tokens")),
-            output_tokens=_int(usage.get("completion_tokens")),
-            cost_usd=cost, latency_ms=latency_ms, fallback_attempts=fallbacks,
-            status="live", created_at=now(), raw=payload)
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=float(cost or 0.0), latency_ms=latency_ms,
+            fallback_attempts=fallbacks, status="live", created_at=now(),
+            raw=payload, cost_source=cost_source)
 
         # The audit row is not the cache. `CACHE_MODE=off` means "never read,
         # never write the cache"; it does not mean "do not say what you spent".
@@ -460,7 +535,8 @@ class BifrostClient:
             "response_json": {"text": text, "raw": payload},
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
-            "cost_usd": result.cost_usd, "latency_ms": latency_ms,
+            "cost_usd": result.cost_usd, "cost_source": cost_source,
+            "latency_ms": latency_ms,
             "fallback_attempts": fallbacks, "status": "ok",
             "cacheable": self.cache_mode != "off",
             "created_at": iso(result.created_at),
@@ -475,13 +551,15 @@ class BifrostClient:
                          "output_tokens": result.output_tokens,
                          "cost_usd": result.cost_usd, "latency_ms": latency_ms,
                          "fallback_attempts": fallbacks,
-                         "created_at": iso(result.created_at)},
+                         "cost_source": cost_source,
+                          "created_at": iso(result.created_at)},
                 temperature=0.0, max_tokens=max_tokens, json_mode=json_mode)
         log.info("bifrost call", extra={"data": {
             "stage": stage, "model": result.model, "provider": provider,
             "request_id": request_id, "latency_ms": latency_ms,
             "input_tokens": result.input_tokens,
-            "output_tokens": result.output_tokens, "cost_usd": cost}})
+            "output_tokens": result.output_tokens, "cost_usd": cost,
+            "cost_source": cost_source}})
         # Quota accounting reads these rows through the ledger; without this
         # call the quota rail was a permanently-zero panel.
         from app.governance.quota_ledger import quota_ledger

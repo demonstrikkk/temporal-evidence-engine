@@ -19,14 +19,30 @@ next identical request and `CACHE_MODE=read-only` could never replay a run.
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from app.bifrost import client as client_mod
 from app.bifrost.client import BifrostClient
+from app.bifrost.scheduler import scheduler
 from app.verify.store import LocalStore
 
 REQUESTED = "groq/openai/gpt-oss-20b"
 PROMPT = "extract these claims"
 STAGE = "extract_claims"
+
+
+@pytest.fixture(autouse=True)
+def _empty_pacer_window():
+    """Each test here starts with a fresh token window.
+
+    The pacer is process-wide by design, so without this the tests inherit one
+    another's spend: by the sixth call the window holds ~8k tokens, the next
+    request waits a full minute before it even reaches the 429 it is asserting
+    on, and the assertion sees the pacer's sleep instead of the retry's.
+    """
+    scheduler.limiter.reset()
+    yield
+    scheduler.limiter.reset()
 
 
 class _Response:

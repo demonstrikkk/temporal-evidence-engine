@@ -406,6 +406,10 @@ class LocalStore:
             "input_tokens": sum(int(r.get("input_tokens") or 0) for r in rows),
             "output_tokens": sum(int(r.get("output_tokens") or 0) for r in rows),
             "cost_usd": round(sum(float(r.get("cost_usd") or 0) for r in rows), 6),
+            # How much of `cost_usd` is an estimate rather than a bill. Without
+            # this the panel cannot tell a free run from an unpriced one.
+            "estimated_calls": sum(1 for r in rows
+                                   if r.get("cost_source") == "catalogue"),
             "fallback_attempts": sum(int(r.get("fallback_attempts") or 0) for r in rows),
             "providers": sorted({str(r.get("provider") or "") for r in rows} - {""}),
             "last": rows[-1] if rows else None,
@@ -418,8 +422,8 @@ class LocalStore:
         rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
         keys = ("stage", "provider", "model", "resolved_model",
                 "bifrost_request_id", "input_tokens", "output_tokens",
-                "cost_usd", "latency_ms", "fallback_attempts", "status",
-                "created_at")
+                "cost_usd", "cost_source", "latency_ms", "fallback_attempts",
+                "status", "created_at")
         return [{k: row.get(k) for k in keys} for row in rows[:limit]]
 
     # -- multi-layer cache entries ----------------------------------------
@@ -911,16 +915,18 @@ class PgStore:
             """INSERT INTO model_calls (id, run_id, claim_id, stage, provider,
                    model, resolved_model, bifrost_request_id, prompt_hash,
                    response_json, input_tokens, output_tokens, cost_usd,
-                   latency_ms, fallback_attempts, status, cacheable, created_at)
+                   cost_source, latency_ms, fallback_attempts, status, cacheable,
+                   created_at)
                VALUES (%(id)s, %(run_id)s, %(claim_id)s, %(stage)s, %(provider)s,
                    %(model)s, %(resolved_model)s, %(bifrost_request_id)s,
                    %(prompt_hash)s, %(response_json)s, %(input_tokens)s,
-                   %(output_tokens)s, %(cost_usd)s, %(latency_ms)s,
-                   %(fallback_attempts)s, %(status)s, %(cacheable)s,
-                   %(created_at)s)
+                   %(output_tokens)s, %(cost_usd)s, %(cost_source)s,
+                   %(latency_ms)s, %(fallback_attempts)s, %(status)s,
+                   %(cacheable)s, %(created_at)s)
                ON CONFLICT (prompt_hash, model, stage) WHERE cacheable DO NOTHING
                RETURNING *""",
-            {"cacheable": True, "resolved_model": "", **row,
+            {"cacheable": True, "resolved_model": "",
+             "cost_source": "gateway", **row,
              "response_json": _jsonb(row.get("response_json"))}) or \
             self.find_model_call(row["prompt_hash"], row["model"], row["stage"])
 
@@ -947,11 +953,14 @@ class PgStore:
                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
                        COALESCE(SUM(cost_usd), 0) AS cost_usd,
-                       COALESCE(SUM(fallback_attempts), 0) AS fallback_attempts
+                       COALESCE(SUM(fallback_attempts), 0) AS fallback_attempts,
+                       COUNT(*) FILTER (WHERE cost_source = 'catalogue')
+                           AS estimated_calls
                 FROM model_calls {where}""", params) or {}
         providers = [r["provider"] for r in self._all(
             f"SELECT DISTINCT provider FROM model_calls {where}", params)]
         return {**row, "cost_usd": float(row.get("cost_usd") or 0),
+                "estimated_calls": int(row.get("estimated_calls") or 0),
                 "providers": [p for p in providers if p]}
 
     def list_model_calls(self, limit: int = 25,
@@ -959,8 +968,8 @@ class PgStore:
         where, params = ("WHERE run_id = %s", (run_id,)) if run_id else ("", ())
         return self._all(
             f"""SELECT stage, provider, model, resolved_model, bifrost_request_id,
-                       input_tokens, output_tokens, cost_usd, latency_ms,
-                       fallback_attempts, status, created_at
+                       input_tokens, output_tokens, cost_usd, cost_source,
+                       latency_ms, fallback_attempts, status, created_at
                 FROM model_calls {where}
                 ORDER BY created_at DESC LIMIT %s""",
             (*params, limit))

@@ -21,6 +21,7 @@ import QuotaRail from './QuotaRail.jsx';
 import BudgetModeSelector from './BudgetModeSelector.jsx';
 import DiagnosticsPanel from './DiagnosticsPanel.jsx';
 import CoveragePanel from './CoveragePanel.jsx';
+import TracePanel from './TracePanel.jsx';
 
 const STAGE_COPY = {
   queued: 'Queued',
@@ -310,6 +311,8 @@ export default function RunView() {
           </section>
 
           <EventRail events={events} streamState={streamState} />
+
+          <TracePanel runId={runId} live={live} />
 
           <GatewayPanel gateway={run.gateway} />
         </div>

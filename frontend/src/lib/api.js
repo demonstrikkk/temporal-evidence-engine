@@ -468,6 +468,8 @@ export const api = {
     report: (id, o) => request(`/verify/runs/${encodeURIComponent(id)}/report`, o),
     coverage: (id, o) =>
       request(`/verify/runs/${encodeURIComponent(id)}/coverage`, o),
+    trace: (id, o) =>
+      request(`/verify/runs/${encodeURIComponent(id)}/trace`, o),
     watchlist: (o) => request('/verify/watchlist', o),
   },
 

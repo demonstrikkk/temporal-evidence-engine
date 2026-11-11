@@ -13,7 +13,8 @@
     "test:viewmodel": "node test/dataset-view-model.test.mjs",
     "test:api": "node test/api.test.mjs",
     "test:verify": "node test/verify-model.test.mjs",
-    "test": "node test/verify-model.test.mjs && node test/charts.test.mjs && node test/tokens.test.mjs && node test/encoding.test.mjs && node test/dataset-view-model.test.mjs && node test/api.test.mjs && node test/run-stream.test.mjs",
+    "test:trace": "node test/trace-model.test.mjs",
+    "test": "node test/verify-model.test.mjs && node test/trace-model.test.mjs && node test/charts.test.mjs && node test/tokens.test.mjs && node test/encoding.test.mjs && node test/dataset-view-model.test.mjs && node test/api.test.mjs && node test/run-stream.test.mjs",
     "e2e": "python e2e/smoke.py && python e2e/interactions.py && python e2e/verify.py && python e2e/partial.py && python e2e/visual.py && python e2e/proof.py && python e2e/gaps.py && python e2e/ask.py && python e2e/ops.py"
   },
   "dependencies": {

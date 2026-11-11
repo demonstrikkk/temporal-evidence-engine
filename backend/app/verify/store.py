@@ -39,6 +39,7 @@ COLLECTIONS = (
     "assertions", "history", "events", "calls", "queries", "cache",
     "cache_entries", "conversations", "messages", "quota_ledger",
     "assertion_spans", "coverage_audits", "execution_traces", "trace_spans",
+    "research_plans",
 )
 
 
@@ -121,6 +122,10 @@ class VerifyStore(Protocol):
     def get_execution_trace(self, run_id: str) -> dict | None: ...
     def add_trace_span(self, row: dict) -> dict: ...
     def list_trace_spans(self, trace_id: str) -> list[dict]: ...
+
+    # research plans: one row per subject group
+    def add_research_plan(self, row: dict) -> dict: ...
+    def list_research_plans(self, run_id: str) -> list[dict]: ...
 
     # model calls / research cache
     def add_model_call(self, row: dict) -> dict: ...
@@ -441,6 +446,16 @@ class LocalStore:
         rows = [r for r in self._data["trace_spans"]
                 if r.get("trace_id") == trace_id]
         return sorted(rows, key=lambda r: int(r.get("ordinal") or 0))
+
+    # -- research plans ---------------------------------------------------
+    def add_research_plan(self, row: dict) -> dict:
+        return self._insert("research_plans", row)
+
+    def list_research_plans(self, run_id: str) -> list[dict]:
+        rows = [r for r in self._data["research_plans"]
+                if r.get("run_id") == run_id]
+        return sorted(rows, key=lambda r: (str(r.get("created_at") or ""),
+                                           str(r.get("id") or "")))
 
     # -- calls / cache ----------------------------------------------------
     def add_model_call(self, row: dict) -> dict:
@@ -1145,6 +1160,29 @@ class PgStore:
         return self._all(
             """SELECT * FROM trace_spans WHERE trace_id = %s ORDER BY ordinal""",
             (trace_id,))
+
+    # -- research plans ---------------------------------------------------
+    def add_research_plan(self, row: dict) -> dict:
+        return self._write(
+            """INSERT INTO research_plans (id, run_id, group_key, claim_ids,
+                   queries, queries_asked, budget_mode, queries_dropped,
+                   pairs_examined, pairs_skipped, created_at)
+               VALUES (%(id)s, %(run_id)s, %(group_key)s, %(claim_ids)s,
+                   %(queries)s, %(queries_asked)s, %(budget_mode)s,
+                   %(queries_dropped)s, %(pairs_examined)s, %(pairs_skipped)s,
+                   %(created_at)s)
+               RETURNING *""",
+            {"group_key": "", "budget_mode": "balanced", "queries_dropped": 0,
+             "pairs_examined": 0, "pairs_skipped": 0,
+             "created_at": now(), **row,
+             "claim_ids": _jsonb(row.get("claim_ids") or []),
+             "queries": _jsonb(row.get("queries") or []),
+             "queries_asked": _jsonb(row.get("queries_asked") or [])})
+
+    def list_research_plans(self, run_id: str) -> list[dict]:
+        return self._all(
+            """SELECT * FROM research_plans WHERE run_id = %s
+               ORDER BY created_at, id""", (run_id,))
 
     # -- calls / cache ----------------------------------------------------
     def add_model_call(self, row: dict) -> dict:

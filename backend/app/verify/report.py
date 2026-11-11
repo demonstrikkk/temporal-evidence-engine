@@ -181,6 +181,49 @@ def _cost_lines(cost: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _research_lines(research: dict[str, Any]) -> list[str]:
+    """What was asked once, and what the pre-filter refused to send.
+
+    Both counts are printed. "Examined 11" without "skipped 3" would read as a
+    run that looked at everything, which is exactly the impression a cheaper
+    run must not be able to give.
+    """
+    lines = ["## Research plan", ""]
+    plans = research.get("plans") or []
+    if not plans:
+        lines.append("- No research plan was recorded for this run.")
+        lines.append("")
+        return lines
+
+    asked = int(research.get("queries_asked") or 0)
+    planned = int(research.get("queries_planned") or 0)
+    examined = int(research.get("pairs_examined") or 0)
+    skipped = int(research.get("pairs_skipped") or 0)
+    lines.append(f"- Groups: {len(plans)}")
+    lines.append(f"- Search queries asked: {asked} of {planned} planned"
+                 + (" — the remainder were not run because every claim in the "
+                    "group already had a verdict, or the budget refused them"
+                    if asked < planned else ""))
+    lines.append(f"- Claim/evidence pairs examined: {examined}")
+    lines.append(f"- Pairs skipped by the pre-filter: {skipped} "
+                 f"(a page sharing no term with the claim's subject or value "
+                 f"is not sent to the model)")
+    lines.append("")
+    lines.append("| Group | Claims | Queries asked | Planned | Dropped | Examined | Skipped |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    for plan in plans:
+        lines.append(
+            f"| {plan.get('group_key') or '(no subject)'} | "
+            f"{len(plan.get('claim_ids') or [])} | "
+            f"{len(plan.get('queries_asked') or [])} | "
+            f"{len(plan.get('queries') or [])} | "
+            f"{int(plan.get('queries_dropped') or 0)} | "
+            f"{int(plan.get('pairs_examined') or 0)} | "
+            f"{int(plan.get('pairs_skipped') or 0)} |")
+    lines.append("")
+    return lines
+
+
 def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
     run = store.get_run(run_id)
     if not run:
@@ -199,6 +242,15 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
         "trace_status": (trace_header or {}).get("status"),
         "totals": summary["totals"],
         "stages": summary["stages"],
+    }
+    plans = store.list_research_plans(run_id)
+    research = {
+        "plans": plans,
+        "queries_planned": sum(len(p.get("queries") or []) for p in plans),
+        "queries_asked": sum(len(p.get("queries_asked") or []) for p in plans),
+        "queries_dropped": sum(int(p.get("queries_dropped") or 0) for p in plans),
+        "pairs_examined": sum(int(p.get("pairs_examined") or 0) for p in plans),
+        "pairs_skipped": sum(int(p.get("pairs_skipped") or 0) for p in plans),
     }
 
     claim_views = []
@@ -259,10 +311,11 @@ def build_report(store: VerifyStore, run_id: str) -> dict[str, Any]:
         "events": events,
         "gateway": store.gateway_stats(run_id),
         "cost": cost,
+        "research": research,
         "markdown": render_markdown(run, answer, claim_views,
                                     store.gateway_stats(run_id),
                                     coverage=coverage, spans=spans,
-                                    cost=cost),
+                                    cost=cost, research=research),
     }
 
 
@@ -270,7 +323,8 @@ def render_markdown(run: dict[str, Any], answer: dict[str, Any],
                     claims: list[dict[str, Any]], gateway: dict[str, Any],
                     *, coverage: dict[str, Any] | None = None,
                     spans: list[dict[str, Any]] | None = None,
-                    cost: dict[str, Any] | None = None) -> str:
+                    cost: dict[str, Any] | None = None,
+                    research: dict[str, Any] | None = None) -> str:
     lines: list[str] = []
     lines.append("# Claim verification report")
     lines.append("")
@@ -344,6 +398,9 @@ def render_markdown(run: dict[str, Any], answer: dict[str, Any],
 
     if cost is not None:
         lines.extend(_cost_lines(cost))
+
+    if research is not None:
+        lines.extend(_research_lines(research))
 
     lines.append("## Gateway")
     lines.append("")

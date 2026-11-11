@@ -68,6 +68,10 @@ class FakeTavily:
     pages: dict[str, str] = field(default_factory=dict)
     fail_search: bool = False
     searches: list[str] = field(default_factory=list)
+    #: URLs handed to `extract`, in call order — plus which URLs each call
+    #: covered. Used to prove a shared page is extracted once per run, not once
+    #: per claim that shares it.
+    extracts: list[dict[str, Any]] = field(default_factory=list)
 
     def search(self, query: str, **_: Any) -> SearchOutcome:
         self.searches.append(query)
@@ -83,6 +87,7 @@ class FakeTavily:
                              credits=1, status="live", raw={})
 
     def extract(self, urls: list[str], **_: Any) -> ExtractOutcome:
+        self.extracts.append({"urls": list(urls)})
         pages = {url: self.pages[url] for url in urls if url in self.pages}
         failed = [FailedUrl(url, "not found") for url in urls if url not in self.pages]
         return ExtractOutcome(pages=pages, failed=failed, request_id="extract-1",

@@ -15,13 +15,14 @@ from __future__ import annotations
 import re
 import threading
 import traceback
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any
 
 from app.bifrost.client import BifrostClient, BifrostError
 from app.core.config import RULE_VERSION, settings
 from app.core.logging import log
-from app.research.planner import plan_queries
+from app.research.planner import plan_queries_detail
 from app.research.sources import (canonicalize_url, domain_of, find_existing_revisions,
                                   save_revision, save_source)
 from app.research.tavily import ResearchError, TavilyClient
@@ -48,6 +49,77 @@ _NEGATIONS = ("no longer", "not available", "no longer available",
 
 _ACTIVE_RUNS: set[str] = set()
 _LOCK = threading.Lock()
+
+#: A word, for the pre-filter. Unicode-aware so a claim about "Zürich" can
+#: match a page that says "zürich"; no stemming, because a stemmer that gets it
+#: wrong would skip a page that would have answered the claim.
+_WORD = re.compile(r"[^\W\d_]+|\d+", re.UNICODE)
+
+#: Terms shorter than this are not evidence of anything: "per" appears on every
+#: pricing page, so matching it would examine everything and save nothing.
+_MIN_TERM = 4
+
+#: Terms are compared as their first six characters, so "germany" matches
+#: "german" and "available" matches "availability". Longer prefixes would miss
+#: inflections; shorter ones would match unrelated words.
+_TERM_PREFIX = 6
+
+
+@dataclass
+class ResearchPlan:
+    """One subject group, researched once.
+
+    The plan owns what would otherwise be recomputed per claim: the queries, the
+    revisions they produced, and the pairs the pre-filter refused. A group of one
+    is a plan of one — there is no second code path for the common case, because
+    two paths drift.
+    """
+
+    group_key: str
+    budget_mode: str
+    claims: list[tuple[dict, ClaimDraft]]
+    queries: list[str]
+    queries_dropped: int = 0
+    span: Any = None
+    event: Any = None
+    asked: list[str] = field(default_factory=list)
+    revisions: list[str] = field(default_factory=list)
+    pairs_examined: int = 0
+    pairs_skipped: int = 0
+
+    def still_unasked(self, query: str) -> bool:
+        return self.asked.count(query) == 0
+
+
+def _normalise_subject(subject: Any) -> str:
+    """The grouping key: a subject reduced to its words.
+
+    Case and punctuation are not what makes two claims the same topic, and
+    keeping them would split "Acme Pro" from "acme pro." into two plans that
+    then issue the same queries twice.
+    """
+    return " ".join(_WORD.findall(str(subject or "").casefold()))
+
+
+def _claim_terms(draft: ClaimDraft) -> set[str]:
+    """The words a page would have to share to be worth a model call."""
+    text = f"{draft.subject or ''} {draft.object_raw or ''}".casefold()
+    return {word[:_TERM_PREFIX] for word in _WORD.findall(text)
+            if len(word) >= _MIN_TERM}
+
+
+def _shares_term(content: str, terms: set[str]) -> bool:
+    """Whether a document could possibly be about the claim's subject.
+
+    An empty `terms` answers True: a claim with no usable term cannot be
+    filtered, and guessing would skip pages this function is not smart enough
+    to judge. The filter may only ever *skip* a pair whose text shares nothing
+    with the claim, and every skip is counted and reported.
+    """
+    if not terms:
+        return True
+    lowered = str(content or "").casefold()
+    return any(term in lowered for term in terms)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +275,14 @@ class Verifier:
             #: claims recovered by the one focused coverage repair. Both exist so
             #: a run cannot silently lose what the answer actually asserted.
             "extraction_drops": 0, "coverage_recovered": 0,
+            #: Research plans: how many subject groups were formed, how many
+            #: query slots were not spent because another claim in the group had
+            #: already asked the same question, and what the pre-filter did.
+            #: `pairs_skipped` is printed beside `pairs_examined` on purpose: a
+            #: cheaper run that hides what it never looked at is the failure
+            #: this repository exists to remove.
+            "plans": 0, "queries_shared": 0,
+            "pairs_examined": 0, "pairs_skipped": 0,
         }
 
     # -- plumbing ---------------------------------------------------------
@@ -500,30 +580,36 @@ class Verifier:
             budget_mode=str(run.get("budget_mode") or "balanced"))
         self.counters["claims"] = len(stored)
 
-        # 3. research + settle, one claim at a time
+        # 3. research + settle, one subject group at a time. Claims that share a
+        # subject share a plan: the queries are asked once and the pages they
+        # return are settled against every claim in the group. A group of one is
+        # a plan of one, so there is no second path for the common case.
         self.store.update_run(self.run_id, stage="research")
         extracted: dict[str, Any] = {}
-        for claim_row, draft in stored:
-            claim_span = self.trace.begin("claim", "verify_claim",
-                                          claim_id=str(claim_row["id"]))
-            try:
-                self._verify_claim(claim_row, draft, generated_at, extracted,
-                                   claim_span)
-            except Exception as exc:  # noqa: BLE001 — one claim must not end the run
-                log.warning("claim verification crashed",
-                            extra={"data": {"claim_id": claim_row["id"],
-                                            "error": str(exc)[:300]}})
-                self.trace.end(claim_span, self.emit("claim.failed", {
-                    "claim_id": claim_row["id"],
-                    "error": str(exc)[:400],
-                    "trace": traceback.format_exc()[-1200:]}),
-                    error_type=type(exc).__name__)
-                self.store.update_claim(
-                    claim_row["id"], status=ClaimStatus.UNVERIFIABLE.value,
-                    reason_code=ReasonCode.EXTRACTION_FAILED.value,
-                    last_verified_at=iso(now()))
-                self.fail("settle", "claim verification crashed",
-                          claim_id=claim_row["id"])
+        budget_mode = str(run.get("budget_mode") or "balanced")
+        for plan in self._plan_groups(stored, budget_mode):
+            for claim_row, draft in plan.claims:
+                claim_span = self.trace.begin("claim", "verify_claim",
+                                              claim_id=str(claim_row["id"]))
+                try:
+                    self._verify_claim(claim_row, draft, generated_at, extracted,
+                                       claim_span, plan=plan)
+                except Exception as exc:  # noqa: BLE001 — one claim must not end the run
+                    log.warning("claim verification crashed",
+                                extra={"data": {"claim_id": claim_row["id"],
+                                                "error": str(exc)[:300]}})
+                    self.trace.end(claim_span, self.emit("claim.failed", {
+                        "claim_id": claim_row["id"],
+                        "error": str(exc)[:400],
+                        "trace": traceback.format_exc()[-1200:]}),
+                        error_type=type(exc).__name__)
+                    self.store.update_claim(
+                        claim_row["id"], status=ClaimStatus.UNVERIFIABLE.value,
+                        reason_code=ReasonCode.EXTRACTION_FAILED.value,
+                        last_verified_at=iso(now()))
+                    self.fail("settle", "claim verification crashed",
+                              claim_id=claim_row["id"])
+            self._close_plan(plan)
 
         # 4. finish
         if self.failures:
@@ -531,11 +617,113 @@ class Verifier:
         else:
             self._finish("completed", stage="done")
 
+    # -- research plans ---------------------------------------------------
+    def _plan_groups(self, stored: list[tuple[dict, ClaimDraft]],
+                     budget_mode: str) -> list[ResearchPlan]:
+        """Group claims by subject and open one plan per group.
+
+        Grouping is by normalised subject because that is what makes two
+        questions the same question: "Acme Pro price" and "Acme Pro costs" are
+        one page and one search, not two of each. Claims with no subject are
+        not grouped with each other - the only thing two such claims share is
+        that nobody said what they are about.
+        """
+        groups: dict[str, list[tuple[dict, ClaimDraft]]] = {}
+        for claim_row, draft in stored:
+            key = _normalise_subject(draft.subject)
+            if not key:
+                key = f"claim:{claim_row['id']}"
+            groups.setdefault(key, []).append((claim_row, draft))
+
+        plans: list[ResearchPlan] = []
+        for key, members in groups.items():
+            queries, dropped = self._plan_queries(members, budget_mode)
+            plan = ResearchPlan(
+                group_key="" if key.startswith("claim:") else key,
+                budget_mode=budget_mode, claims=members, queries=queries,
+                queries_dropped=dropped)
+            plan.span = self.trace.begin(
+                "research", "plan",
+                tool_arguments={"group": plan.group_key or "(no subject)",
+                                "claims": len(members)})
+            plan.event = self.emit("research.planned", {
+                "group_key": plan.group_key,
+                "claims": len(members),
+                "claim_ids": [str(row["id"]) for row, _ in members],
+                "queries": queries,
+                "queries_dropped": dropped,
+                "budget_mode": budget_mode,
+            })
+            if dropped:
+                # The plan was truncated by the budget mode. A run that says so
+                # can be judged; a run that quietly asks fewer questions looks
+                # like a claim that had fewer questions to ask.
+                self.emit("research.budget_exhausted", {
+                    "group_key": plan.group_key,
+                    "claims": len(members),
+                    "queries_dropped": dropped,
+                    "budget_mode": budget_mode,
+                    "reason": "the budget mode caps queries per claim; the "
+                              "refused questions are not asked, not hidden",
+                })
+            plans.append(plan)
+        return plans
+
+    def _plan_queries(self, members: list[tuple[dict, ClaimDraft]],
+                      budget_mode: str) -> tuple[list[str], int]:
+        """The union of the group's queries, in claim order, asked once each.
+
+        The union can never exceed the sum of the per-claim plans, so sharing
+        cannot cost more searches than not sharing. Each claim's own cap is
+        still the policy's, because the plan asks *its* claims' questions.
+        """
+        queries: list[str] = []
+        seen: set[str] = set()
+        dropped = 0
+        for _row, draft in members:
+            wanted, refused = plan_queries_detail(draft, budget_mode)
+            dropped += refused
+            for query in wanted:
+                key = query.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                queries.append(query)
+        return queries, dropped
+
+    def _close_plan(self, plan: ResearchPlan) -> None:
+        """Store what the plan did, and close its span with its own event."""
+        self.counters["plans"] += 1
+        try:
+            self.store.add_research_plan({
+                "id": new_id(), "run_id": self.run_id,
+                "group_key": plan.group_key,
+                "claim_ids": [str(row["id"]) for row, _ in plan.claims],
+                "queries": plan.queries,
+                "queries_asked": plan.asked,
+                "queries_dropped": plan.queries_dropped,
+                "budget_mode": plan.budget_mode,
+                "pairs_examined": plan.pairs_examined,
+                "pairs_skipped": plan.pairs_skipped,
+                "created_at": iso(now()),
+            })
+        except Exception as exc:  # noqa: BLE001 — losing the row must not lose the verdicts
+            log.warning("research plan not stored",
+                        extra={"data": {"group": plan.group_key,
+                                        "error": str(exc)[:300]}})
+            self.fail("research", "the research plan could not be stored")
+        self.trace.end(
+            plan.span, plan.event,
+            decision_result=(f"{len(plan.asked)} asked · "
+                             f"{plan.pairs_examined} examined · "
+                             f"{plan.pairs_skipped} skipped"))
+
     # -- one claim --------------------------------------------------------
     def _verify_claim(self, claim_row: dict, draft: ClaimDraft,
                       generated_at: datetime | None,
                       extracted: dict[str, Any],
-                      span: Any = None) -> None:
+                      span: Any = None,
+                      *, plan: ResearchPlan | None = None) -> None:
         claim_id = str(claim_row["id"])
         self.store.update_run(self.run_id, stage="research")
         self.emit("claim.started", {"claim_id": claim_id,
@@ -584,7 +772,8 @@ class Verifier:
         # looked" are different claims about the run.
         self.trace.end(reuse_span, None, cache_status="miss")
 
-        queries = plan_queries(draft, budget_mode=budget_mode)
+        queries = plan.queries if plan is not None else plan_queries_detail(
+            draft, budget_mode=budget_mode)[0]
 
         # Existing-source discovery: settle pages we already hold before
         # spending a Tavily credit. This is the first rung of the escalation
@@ -607,7 +796,8 @@ class Verifier:
                 "claim_id": claim_id, "sources": len(existing_ids),
                 "stage": "existing_sources"}))
             self.counters["sources"] += len(existing_ids)
-            facts.extend(self._settle(claim_id, draft, existing_ids, span))
+            facts.extend(self._settle(claim_id, draft, existing_ids, span,
+                                      plan=plan))
             settled_revisions.update(existing_ids)
             decision = decide(claim_value=draft.object_raw,
                               answer_generated_at=generated_at, facts=facts)
@@ -637,7 +827,13 @@ class Verifier:
 
         revision_ids: list[str] = []
         for query in queries:
+            if plan is not None and not plan.still_unasked(query):
+                # Another claim in this group already paid for this search.
+                self.counters["queries_shared"] += 1
+                continue
             self.counters["queries"] += 1
+            if plan is not None:
+                plan.asked.append(query)
             search_span = self.trace.begin(
                 "research", "search", parent=span, claim_id=claim_id,
                 tool_name="tavily_search", tool_arguments={"query": query})
@@ -667,6 +863,10 @@ class Verifier:
                 canonical = canonicalize_url(hit.url)
                 if canonical in extracted:
                     revision_ids.append(extracted[canonical].revision_id)
+                    if (plan is not None
+                            and extracted[canonical].revision_id
+                            not in plan.revisions):
+                        plan.revisions.append(extracted[canonical].revision_id)
                     continue
                 extract_span = self.trace.begin(
                     "research", "extract", parent=span, claim_id=claim_id,
@@ -718,6 +918,8 @@ class Verifier:
                         content_hash=revision.content_hash)
                 extracted[canonical] = revision
                 revision_ids.append(revision.revision_id)
+                if plan is not None and revision.revision_id not in plan.revisions:
+                    plan.revisions.append(revision.revision_id)
                 self.counters["sources"] += 1
                 self.trace.end(extract_span, self.emit("source.stored", {
                     "claim_id": claim_id,
@@ -730,9 +932,15 @@ class Verifier:
                     tool_result_ref=revision.revision_id,
                     input_hash=revision.content_hash)
 
-        new_revisions = [rid for rid in revision_ids
+        # A shared plan's pages are settled against every claim in the group,
+        # not only the claim that issued the search: that is the reuse the plan
+        # exists for. `settled_revisions` still prevents judging the same page
+        # twice for the same claim.
+        candidates = plan.revisions if plan is not None else revision_ids
+        new_revisions = [rid for rid in candidates
                          if rid not in settled_revisions]
-        facts.extend(self._settle(claim_id, draft, new_revisions, span))
+        facts.extend(self._settle(claim_id, draft, new_revisions, span,
+                                  plan=plan))
         # L5: Store settled evidence for future claim-evidence reuse
         evidence_list = []
         for f in facts:
@@ -760,6 +968,7 @@ class Verifier:
         decision = decide(claim_value=draft.object_raw,
                           answer_generated_at=generated_at, facts=facts)
         self._record(claim_row, draft, decision, facts, generated_at, span=span)
+
 
     def _reuse_evidence(self, claim_id: str,
                         cached: list[dict]) -> list[EvidenceFact]:
@@ -828,9 +1037,11 @@ class Verifier:
         return facts
 
     def _settle(self, claim_id: str, draft: ClaimDraft,
-                revision_ids: list[str], parent: Any = None) -> list[EvidenceFact]:
+                revision_ids: list[str], parent: Any = None,
+                *, plan: ResearchPlan | None = None) -> list[EvidenceFact]:
         facts: list[EvidenceFact] = []
         seen: set[str] = set()
+        terms = _claim_terms(draft)
         for revision_id in revision_ids:
             if revision_id in seen:
                 continue
@@ -841,6 +1052,29 @@ class Verifier:
             source = self.store.get_source(str(revision["source_id"])) or {}
             content = str(revision.get("content") or "")
             url = str(source.get("canonical_url") or "")
+
+            # Deterministic pre-filter, before the model is asked anything. It
+            # may only skip a pair whose text shares no term with the claim's
+            # subject or value; every skip is counted, traced and reported, so
+            # a cheaper run cannot look like a run that examined everything.
+            if not _shares_term(content, terms):
+                self.counters["pairs_skipped"] += 1
+                if plan is not None:
+                    plan.pairs_skipped += 1
+                skip_span = self.trace.begin(
+                    "research", "prefilter", parent=parent, claim_id=claim_id,
+                    tool_name="stored_revision", tool_result_ref=revision_id)
+                self.trace.end(skip_span, self.emit("evidence.prefiltered", {
+                    "claim_id": claim_id, "url": url,
+                    "revision_id": revision_id,
+                    "reason": "the document shares no term with the claim's "
+                              "subject or value, so no model call was made"}),
+                    decision_rule="prefilter", decision_result="skipped")
+                continue
+
+            self.counters["pairs_examined"] += 1
+            if plan is not None:
+                plan.pairs_examined += 1
             span = self.trace.begin(
                 "research", "judge_evidence", parent=parent, claim_id=claim_id,
                 prompt_version=PROPOSE_PROMPT_VERSION,

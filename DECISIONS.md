@@ -712,3 +712,60 @@ cover the interpolated answer, the claim or the document windows: that is data,
 and it is what `trace_spans.prompt_hash` records separately.
 
 
+## D-027 - One research plan per subject group, researched once (2026-11-11)
+
+A five-claim answer about one product issued five searches for "the product's
+price" and extracted the pricing page five times. The research plan is the row
+that says which questions were asked once, for which claims, and what the
+pre-filter then refused to send.
+
+### Grouping key
+
+Claims are grouped by normalised `subject` (case-folded, whitespace collapsed).
+That is what makes two questions the same question: "Acme Pro price" and "Acme
+Pro costs" are one page and one search, not two of each. Claims with no usable
+subject are not grouped with each other - the only thing two such claims share
+is that nobody said what they are about - so each gets a singleton plan keyed
+`claim:<id>`.
+
+### Query union
+
+A group plan holds the deduplicated, case-insensitive union of its members'
+per-claim queries, in claim order, asked once each. The union can never exceed
+the sum of the per-claim plans, so sharing cannot cost more searches than not
+sharing. Each claim's own cap still comes from `budget_manager.get_policy()` as
+the single source of truth, because the plan asks *its* claims' questions. The
+plan stores both `queries` (planned) and `queries_asked` (actually sent), so a
+truncated plan is visible rather than mistaken for a claim with fewer
+questions.
+
+### Pre-filter rule and fallback
+
+Before the model is asked anything, a (claim, evidence) pair is skipped when
+the document shares no term with the claim's subject or value. Terms are the
+first six characters of words of at least four characters from subject +
+object, compared against lowered content. The filter may only ever *skip*; it
+never adds evidence. A claim with no usable term is examined in full - the
+filter is not smart enough to guess, so guessing would skip pages it cannot
+judge. Every skip is counted (`pairs_skipped`), traced as an `evidence.prefiltered`
+event with a `prefilter` decision rule, and reported beside `pairs_examined`,
+because a cheaper run that hides what it never looked at is the failure this
+repository exists to avoid.
+
+### No early sufficiency stop
+
+Stopping on evidence sufficiency is deliberately **not** implemented. With
+search-all-then-settle a sufficiency stop is unreachable, and an early stop can
+hide a later dated change - which is the product's headline outcome. Dedupe,
+pre-filter and disclosure are the cost controls; sufficiency is not.
+
+### What is recorded
+
+`tev.research_plans` holds one row per group: `group_key`, `claim_ids`, `queries`
+(planned), `queries_asked`, `budget_mode`, `queries_dropped`, `pairs_examined`,
+`pairs_skipped`. `queries_dropped` is non-zero exactly when the budget mode
+truncated the plan, and the run emits `research.budget_exhausted` so a
+truncation is never silent. The report prints examined / skipped per group and
+the planned / asked split.
+
+

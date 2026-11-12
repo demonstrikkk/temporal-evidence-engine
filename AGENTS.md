@@ -20,6 +20,12 @@ substrate is reused; the product is not. See `UPSTREAM.md`.
 # backend, hermetic (no network, no DB, no provider credits)
 backend\.venv\Scripts\python.exe -m pytest backend\tests -q
 
+# verdict gate, unchanged gold set
+backend\.venv\Scripts\python.exe eval\run_eval.py
+
+# independent assertion recall, offline, zero cost (separate measurement)
+backend\.venv\Scripts\python.exe eval\independent\run.py
+
 # frontend
 cd frontend; npm test; npm run build; cd ..
 ```
@@ -27,6 +33,13 @@ cd frontend; npm test; npm run build; cd ..
 Markers are unchanged: `hermetic` (default), `postgres`, `live`, `slow`.
 `--strict-markers` is on. Postgres tests read `DATABASE_URL` from the process
 environment, never from `.env`.
+
+The verdict gate and the independent suite are **different measurements** and
+are always run separately. Verdict accuracy answers "are the statuses right for
+the claims given"; independent recall answers "how many material assertions a
+reader finds does the scanner see". The extraction suite's 100% is circular and
+is never quoted as real-world recall. See `DECISIONS.md` D-032 and
+`docs/INDEPENDENT-COVERAGE-EVALUATION.md`.
 
 Do not write a test count into a document. Write the command; the number is
 whatever it printed.

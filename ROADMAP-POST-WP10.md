@@ -1,7 +1,7 @@
 # TEV Post-WP-10 Development Roadmap
 
 **Repository:** `temporal-evidence-engine`  
-**Baseline commit:** `60843c1` — WP-10: Complete OTLP observability integration  
+**Baseline commit:** `5cc3340` – Coverage: disclose the sentences the deterministic scan cannot read  
 **Branch:** `main`  
 **Working tree:** clean (4 untracked files pre-date WP-10)
 
@@ -10,7 +10,9 @@
 Verified against the current repository, not assumed from prior summaries.
 
 ### Commit
-`60843c1 WP-10: Complete OTLP observability integration` — HEAD of `main`.
+`5cc3340 Coverage: disclose the sentences the deterministic scan cannot read` –
+HEAD of `main`, two commits past `60843c1` (`4f8b376` trace integrity,
+`5cc3340` additive coverage disclosure).
 
 ### Gate results (observed in this session)
 
@@ -22,6 +24,8 @@ Verified against the current repository, not assumed from prior summaries.
 | Evaluation — false `changed` | 0 |
 | Evaluation — quote validity | 136/136 |
 | Evaluation — event-date accuracy | 44/44 |
+| Independent assertion coverage (`backend\.venv\Scripts\python.exe eval\independent\run.py`) | recall 32/53 = 60.4%, precision 32/36 = 88.9%, F1 71.9%; four cases report 100% coverage while blind; $0.0000 |
+| Independent suite guards (`backend\tests\test_independent_coverage_eval.py`) | passed |
 | OTLP exporter tests (`test_otel_exporter.py`) | passed |
 
 These numbers are the **regression baseline**. Any later change must reproduce them against the same gold set and its original expectations.
@@ -48,6 +52,7 @@ These numbers are the **regression baseline**. Any later change must reproduce t
 | 1 — WP-10 validation | done | `docs/WP10-VALIDATION.md`: nine defects reproduced and fixed, contracts pinned by `test_otel_validation.py`, overhead measured by `scripts/otel_overhead.py` |
 | 2 — assertion coverage | done | `docs/ASSERTION-COVERAGE.md`: 13-case taxonomy, 12 of 22 material assertions invisible to the scanner, the 100% extraction result shown to be circular |
 | 2a — coverage disclosure | done | additive `unscanned_sentences` (migration `032`), no ratio or verdict change; evidence in `docs/ASSERTION-COVERAGE.md` |
+| 2b — independent assertion coverage evaluation | done | `docs/INDEPENDENT-COVERAGE-EVALUATION.md`: 29 independently annotated inputs, 57 assertions, recall 60.4%, precision 88.9%, F1 71.9%; suite version `independent-1.0.0`; production unchanged |
 | 3 — execution hardening | not started | — |
 | 4 — research efficiency | not started | — |
 | 5 — WP-8 design decision | not started | needs explicit approval |
@@ -187,6 +192,15 @@ Identify whether the problem is extraction, atomic decomposition, coverage check
 
 Deliverable: assertion-coverage failure analysis with reproducible examples.
 
+**Status (2b, done):** `docs/ASSERTION-COVERAGE.md` answered "where do assertions
+disappear" on 13 hand-built cases. `docs/INDEPENDENT-COVERAGE-EVALUATION.md`
+answers "how large is the gap" on an independently annotated set that is not
+derived from scanner output. It measured material in-scope recall at 32/53
+(60.4%), precision at 32/36 (88.9%), F1 at 71.9%, and found four cases where the
+production ratio reports 100% while the scanner sees nothing. It changed no
+production file and made no model or Tavily call. WP-8 still needs a spec, a
+taxonomy, and a budget; the measurement now exists to size that work.
+
 ### D2. Research efficiency analysis
 
 **Classification:** INVESTIGATION_REQUIRED
@@ -273,13 +287,29 @@ Each phase produces its own evidence, acceptance criteria, and commit. Do not ru
 | 5 | WP-8 design decision — check governing docs, draft spec, define acceptance criteria, obtain explicit decision | SPEC_REQUIRED → GOVERNANCE_APPROVAL_REQUIRED | Approved spec or documented decision not to proceed |
 | 6 | Reassess roadmap — revisit WP-9, WP-12, WP-5, WP-6, WP-7 only after their own checks | — | Roadmap update |
 
-Priority order: Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5.
+Priority order (as set by the user):
+
+1. **External OTLP collector validation** — blocked in this environment; no
+   collector exists. Deployment check, not claimed.
+2. **Postgres coverage parity** — the parity test exists and skips without
+   `DATABASE_URL`; running it needs a database, not a code change.
+3. **Independent assertion benchmark** — **done** in 2b
+   (`docs/INDEPENDENT-COVERAGE-EVALUATION.md`, `independent-1.0.0`).
+4. **Scanner blind-spot characterization** — **done** in 2b: 60.4% material
+   recall, 0% on entities/relations/locations/comparisons/rankings, four
+   "100% while blind" cases.
+5. **Research efficiency analysis** — investigation only, no optimization yet.
+6. **WP-8 spec** — deferred until 1-4 are settled and a spec is approved.
+
+Phase ordering in the table above is historical. The live order is the six-item
+list, and items 1 and 2 are environment-blocked rather than work-blocked. Items
+3 and 4 are measured; do not re-open them without a dataset version bump.
 
 ## 8. Acceptance criteria for recommended next tasks
 
 ### Phase 0 — Baseline
-- [ ] `git log` shows `60843c1` at HEAD; working tree clean of WP-11+ changes.
-- [ ] `pytest backend/tests -q` reproduces 2,570 passed / 16 skipped.
+- [ ] `git log` shows `5cc3340` at HEAD; working tree clean of WP-11+ changes.
+- [ ] `pytest backend/tests -q` passes with no failures (Postgres/live skipped without `DATABASE_URL` and provider credits).
 - [ ] `eval/run_eval.py` reproduces Gate PASS (106 cases, 100% accuracy, 0 false supported/changed, 136/136 quotes, 44/44 event dates).
 - [ ] `RULE_VERSION == "tev-1.2.0"` in `app/core/config.py`; not a Settings field.
 - [ ] Migration files `000`–`031` present; schema `tev` tables exist.
@@ -299,6 +329,16 @@ Priority order: Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phas
 - [ ] Failure stage identified (extraction / decomposition / research / settlement / presentation).
 - [ ] Reproducible examples with model calls, Tavily calls, tokens, latency, cache, cost.
 - [ ] No extraction prompt change, no added model calls.
+
+### Phase 2b — Independent assertion coverage evaluation (done)
+- [x] Dataset is versioned (`independent-1.0.0`), independently annotated, with stable ids, input id, sentence, exact span, normalized assertion, subject, property, value and unit, category, materiality, scope disposition, rationale.
+- [x] All twelve required case categories present.
+- [x] Runner reports precision, recall, F1, sentence-level detection, compound splitting, category recall, omission, duplicate, false-candidate, and "complete coverage while missed".
+- [x] Matching rules defined and justified; no partial credit without justification.
+- [x] Failure taxonomy derived deterministically from observable facts.
+- [x] D-031 examples measured and classified, not fixed.
+- [x] Old evaluation and gold files untouched; production ratios, claim records, verdicts and `RULE_VERSION` pinned by regression tests.
+- [x] Zero model, Tavily, database and network calls; cost $0.0000.
 
 ### Phase 3 — Execution hardening
 - [ ] Each confirmed defect has a reproducible test before the fix.
@@ -337,6 +377,14 @@ Priority order: Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phas
 | Conflicts with `PRODUCT.md` | Reject until product governance changes |
 | New product capability without a spec | Require spec first |
 
-**Strongest recommendation:** Prioritize the assertion-coverage investigation (Phase 2) after validating WP-10 (Phase 1). The Eiffel Tower example exposed that TEV may produce correct verdicts for investigated claims while failing to investigate all material assertions. The next milestone should demonstrate not merely that TEV verifies claims correctly, but that it can reliably account for what it was asked to verify.
+**Strongest recommendation:** The assertion-coverage investigation is now
+measured rather than argued: 60.4% material in-scope recall, 88.9% precision,
+and four answers reporting 100% coverage while the scanner sees nothing
+(`docs/INDEPENDENT-COVERAGE-EVALUATION.md`). The next decision is not "should we
+look at coverage" but "which of the measured failures, if any, is worth a
+scanner change or a WP-8 spec". Every option moves the denominator or the model
+budget and needs its own approval. Until then, the highest-value open work is
+the two environment-blocked checks: an external OTLP collector round-trip and
+Postgres coverage parity.
 
 **Do not begin implementation until this roadmap has been reviewed and an individual next task has been explicitly approved.**

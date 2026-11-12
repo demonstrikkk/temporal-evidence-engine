@@ -861,3 +861,42 @@ its own decision, a test for each shape (`7 million` -> number/measure,
 `1.5 million` -> measure, `10,100 tonnes` -> measure) and an evaluation
 re-run. `scripts/coverage_probe.py` already counts the cases it affects, so the
 change can be measured before and after rather than asserted.
+
+## D-032 - Three coverage measurements, kept separate (2026-11-12)
+
+The repository had two accuracy numbers and a habit of quoting the wrong one.
+It now has three measurements with three different questions, and they are
+never blended:
+
+- **verdict accuracy** (`eval/run_eval.py`): does the engine assign the
+  expected status to the claims it is given? Unchanged at 107 claims, 100.0%
+  status accuracy, 0 false supported/changed, 136/136 quotes, 44/44 event dates.
+- **scanner-visible coverage** (`CoverageReport.coverage`,
+  `scripts/coverage_probe.py`): how much of the answer does the deterministic
+  value scanner see? Unchanged ratios; `unscanned_sentences` from D-030 stays a
+  disclosure.
+- **independent assertion recall** (`eval/independent/run.py`,
+  `independent-1.0.0`): how many material assertions a human reader finds does
+  the scanner find? Measured at 32/53 = 60.4%, precision 32/36 = 88.9%, F1
+  71.9%, with four cases reporting 100% coverage while blind.
+
+The extraction suite's 100% is circular: its expected assertions are shapes the
+scanner was written to find. It remains a regression test and must not be
+quoted as real-world recall. The independent suite is the non-circular
+counterpart: ground truth is written from the sentence, carries no `kind`,
+`expected_disposition`, `expected_match`, or `scanner_kind`, and records
+`scanner_output_used: false`.
+
+The suite is a measurement, not a gate. It is offline (no model, Tavily,
+database, or socket), costs $0.0000, lives outside `backend/app/`, and no
+production module may import it. Pinned metrics and file hashes in
+`backend/tests/test_independent_coverage_eval.py` make a silent drift in either
+the dataset or the scanner fail a test.
+
+This decision does not change the scanner, the denominator, `RULE_VERSION`,
+settlement, the decision table, prompts, routing, budgets, schema, or any
+verdict. Widening the scanner to reach prose, or changing the coverage ratio to
+count what it cannot read, moves `total_assertions` and the model budget and
+needs its own decision, per-shape tests, and a re-run of both suites. D-031
+stays unfixed for exactly that reason; the suite now measures it instead of
+describing it.

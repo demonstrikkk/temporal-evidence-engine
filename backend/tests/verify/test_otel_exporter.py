@@ -224,6 +224,8 @@ def test_headers_for_outgoing_call_without_context():
 
 
 def test_headers_for_outgoing_call_with_context():
+    from opentelemetry.context import detach
+
     ctx = SpanContext(
         trace_id=int("4bf92f3577b34da6a3ce929d0e0e4736", 16),
         span_id=int("00f067aa0ba902b7", 16),
@@ -232,7 +234,12 @@ def test_headers_for_outgoing_call_with_context():
     )
     non_rec = NonRecordingSpan(ctx)
     token = attach(set_span_in_context(non_rec))
-    headers = headers_for_outgoing_call()
+    try:
+        headers = headers_for_outgoing_call()
+    finally:
+        # A context that is attached and never detached leaks into every
+        # later operation on this thread - including other tests.
+        detach(token)
     assert "traceparent" in headers
     assert headers["traceparent"] == (
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"

@@ -788,3 +788,26 @@ the report's next-check disclosure and any future reverify scheduler.
 EPHEMERAL at 15 min clamped to the 1 h floor.
 
 
+## D-029 - A trace is one run, exported as a tree (2026-11-12)
+
+WP-10 exported spans; it did not export a trace. Every span was started with
+`INVALID_SPAN` as its parent (40 spans → 40 single-span traces), each run called
+`otel_trace.set_tracer_provider()` (a process-wide singleton, so concurrent runs
+replaced each other's exporter), and the incoming W3C context was built and
+discarded, so no Bifrost or Tavily request ever carried a `traceparent`.
+
+The contract now:
+
+- one run is one OTLP trace, exported at flush with the parent links recorded in
+  `trace_spans`;
+- ids are derived from the run (`trace_id` from the run UUID or the caller's
+  `traceparent`, span ids from span UUIDs), so a span can be matched to its row
+  and the exported trace id equals `execution_traces.trace_id`;
+- the global tracer provider is never set; each export owns its provider;
+- the run context is attached around `execute()` and detached in `finally`, so
+  outgoing calls carry the trace even when the caller sent none.
+
+This is observability, not verification. `OTEL_ENABLED=false` produces no spans,
+an unavailable collector is a counted export failure, and no code path here can
+reach a verdict, a budget or `claims.status`. `RULE_VERSION` is unchanged.
+Evidence: `docs/WP10-VALIDATION.md`, `test_otel_validation.py`.

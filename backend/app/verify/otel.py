@@ -36,23 +36,24 @@ Local demonstration with the OpenTelemetry Collector:
 """
 from __future__ import annotations
 
-import base64
 import hashlib
-import queue
+import random
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from opentelemetry import trace as otel_trace
+from opentelemetry.context import Context, attach, detach
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter as _OTLPSpanExporter,
 )
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, Span
-from opentelemetry.sdk.trace.export import SpanExportResult
-from opentelemetry.trace import Span as OTelSpan
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.id_generator import IdGenerator
+from opentelemetry.trace import NonRecordingSpan, SpanContext, StatusCode
 from opentelemetry.trace import format_span_id, format_trace_id
 from opentelemetry.trace.propagation import set_span_in_context
 from opentelemetry.util.types import Attributes
@@ -89,6 +90,10 @@ _SENSITIVE_ATTRIBUTES = frozenset({
 
 #: Prefix for TEV-specific span attributes.
 TEV_PREFIX = "tev."
+
+#: Sentinel marking an exporter that hands spans to an injected provider
+#: instead of creating its own OTLP network exporter.
+_INJECTED_EXPORTER = object()
 
 #: Semantic convention attribute names.
 ATTR_SERVICE_NAME = "service.name"
@@ -238,38 +243,137 @@ def _otel_attributes(span_row: dict[str, Any], capture_content: bool) -> Attribu
     return redactor.redact(attrs)
 
 
+# ---------------------------------------------------------------------------
+# deterministic ids: the exported trace is the internal trace
+# ---------------------------------------------------------------------------
+
+def _hex_only(value: Any) -> str:
+    """Keep only hexadecimal characters (a UUID becomes its 32-char form)."""
+    return "".join(ch for ch in str(value or "") if ch in "0123456789abcdefABCDEF")
+
+
+def trace_id_from_uuid(value: Any) -> int:
+    """The 128-bit OpenTelemetry trace id carried by a run's `trace_id`.
+
+    A run's internal `trace_id` is a UUID (128 bits). Stripping the dashes
+    yields exactly the 32 hex characters a W3C trace id is made of, so the
+    exported trace can be found from the database row and vice versa. Returns
+    0 when the value cannot be read as an id (the exporter then generates one).
+    """
+    hexed = _hex_only(value)
+    if len(hexed) < 32:
+        return 0
+    try:
+        return int(hexed[:32], 16)
+    except ValueError:  # pragma: no cover - guarded by the character filter
+        return 0
+
+
+def span_id_from_uuid(value: Any) -> int:
+    """The 64-bit OpenTelemetry span id carried by an internal span id."""
+    hexed = _hex_only(value)
+    if len(hexed) < 16:
+        return 0
+    try:
+        return int(hexed[:16], 16) or 1
+    except ValueError:  # pragma: no cover
+        return 0
+
+
+def _timestamp_ns(value: Any) -> int | None:
+    """Parse a stored ISO timestamp into OTel's nanosecond epoch form."""
+    if not value:
+        return None
+    try:
+        if isinstance(value, datetime):
+            stamp = value
+        else:
+            stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return int(stamp.timestamp() * 1_000_000_000)
+    except (TypeError, ValueError):
+        return None
+
+
+class _DeterministicIdGenerator(IdGenerator):
+    """Ids that come from the run, not from a random number generator.
+
+    The trace id is fixed for the run, so every span lands in one trace and
+    that trace is the same one the caller started (when they sent a
+    `traceparent`). Span ids are taken from the internal span ids, so a span in
+    the tracing backend can be matched to the row in `trace_spans` that produced
+    it. Random ids are still used whenever an id cannot be derived - an
+    unusable identifier must not lose the span.
+    """
+
+    def __init__(self, trace_id: int = 0) -> None:
+        self._trace_id = trace_id or 0
+        self._next_span_id = 0
+        self._lock = threading.Lock()
+
+    def use_trace_id(self, trace_id: int) -> None:
+        if not trace_id:
+            return
+        with self._lock:
+            self._trace_id = trace_id
+
+    def set_next_span_id(self, span_id: int) -> None:
+        with self._lock:
+            self._next_span_id = span_id or 0
+
+    def generate_trace_id(self) -> int:
+        with self._lock:
+            if not self._trace_id:
+                self._trace_id = random.getrandbits(128) or 1
+            return self._trace_id
+
+    def generate_span_id(self) -> int:
+        with self._lock:
+            span_id = self._next_span_id
+            self._next_span_id = 0
+            return span_id or random.getrandbits(64) or 1
+
+
 class OtelExporter:
-    """Batch OTLP span exporter.
+    """Run-scoped OTLP exporter: one run, one trace tree.
 
-    Spans are added via `emit()` (called synchronously from `TraceRecorder.end`)
-    and placed on an in-memory queue. A background worker drains the queue and
-    exports in batches via the OTLP HTTP/protobuf exporter.
+    Spans are collected by `emit()` (called from `TraceRecorder.end()` as each
+    span closes) and the whole tree is exported by `flush()` (called from
+    `TraceRecorder.finish()`). Collecting first is what makes the tree real: a
+    child is always created with its parent's context, so the trace shows the
+    run, its stages and their children nested the way the database recorded
+    them instead of arriving as unrelated single-span traces.
 
-    `flush()` blocks until the queue is drained - called from
-    `TraceRecorder.finish()` so a completed run's trace is exported before the
-    process exits.
-
-    An unavailable collector never blocks verification: `emit()` never waits on
-    the network, and export failures are logged and swallowed.
+    Nothing here is on the verdict path. `emit()` never waits on the network; a
+    full buffer drops spans and counts them rather than blocking a run; every
+    export failure is counted and swallowed. The SDK `BatchSpanProcessor` does
+    the network batching, so a slow collector costs latency at flush, never a
+    verdict.
     """
 
     def __init__(self, config: OtelConfig,
                  store: VerifyStore | None = None,
-                 tracer_provider: TracerProvider | None = None) -> None:
+                 tracer_provider: TracerProvider | None = None,
+                 run_id: str = "",
+                 trace_id_hint: str = "") -> None:
         self.config = config
         self.store = store
-        self._queue: "queue.Queue[dict[str, Any] | None]" = queue.Queue(
-            maxsize=config.max_queue_size)
-        self._worker: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._flush_event = threading.Event()
+        self.run_id = run_id
+        #: W3C trace id of the caller (hex), from the run's `traceparent`.
+        #: When present, the exported trace continues the caller's trace.
+        self.trace_id_hint = trace_id_hint
+        self._pending: list[dict[str, Any]] = []
         self._exported = 0
         self._dropped = 0
         self._failures = 0
         self._lock = threading.Lock()
-        self._sdk_exporter: _OTLPSpanExporter | None = None
+        self._sdk_exporter: Any = None
         self._batch_processor: BatchSpanProcessor | None = None
         self._tracer_provider: TracerProvider | None = tracer_provider
+        self._tracer: Any = None
+        self.provider: TracerProvider | None = None
+        self._ids: _DeterministicIdGenerator | None = None
 
         if config.enabled and config.endpoint:
             self._start_sdk_exporter()
@@ -289,24 +393,38 @@ class OtelExporter:
             if self.config.service_version:
                 resource.attributes[ATTR_SERVICE_VERSION] = self.config.service_version
 
-            provider = self._tracer_provider or TracerProvider(resource=resource)
-            self._sdk_exporter = _OTLPSpanExporter(
-                endpoint=self.config.endpoint,
-                headers=self.config.headers,
-                timeout=self.config.export_timeout_s,
-            )
-            self._batch_processor = BatchSpanProcessor(
-                self._sdk_exporter,
-                max_queue_size=self.config.max_queue_size,
-                schedule_delay_millis=self.config.batch_timeout_s * 1000,
-                max_export_batch_size=self.config.batch_size,
-            )
-            provider.add_span_processor(self._batch_processor)
-            otel_trace.set_tracer_provider(provider)
-
-            self._worker = threading.Thread(target=self._drain_loop, daemon=True,
-                                            name="otel-export")
-            self._worker.start()
+            if self._tracer_provider is None:
+                self._ids = _DeterministicIdGenerator(
+                    trace_id_from_uuid(self.trace_id_hint))
+                provider = TracerProvider(resource=resource,
+                                          id_generator=self._ids)
+                self._sdk_exporter = _OTLPSpanExporter(
+                    endpoint=self.config.endpoint,
+                    headers=self.config.headers,
+                    timeout=self.config.export_timeout_s,
+                )
+                self._batch_processor = BatchSpanProcessor(
+                    self._sdk_exporter,
+                    max_queue_size=self.config.max_queue_size,
+                    schedule_delay_millis=self.config.batch_timeout_s * 1000,
+                    # The SDK rejects a batch larger than its queue, which used
+                    # to disable telemetry outright for a small queue. Clamp
+                    # instead: a config mismatch must not silence the exporter.
+                    max_export_batch_size=max(1, min(self.config.batch_size,
+                                                     self.config.max_queue_size)),
+                )
+                provider.add_span_processor(self._batch_processor)
+            else:
+                # An injected provider owns its ids and its exporters (tests do
+                # this to capture spans). The tree is built the same way.
+                provider = self._tracer_provider
+                self._sdk_exporter = _INJECTED_EXPORTER
+            # Deliberately not `otel_trace.set_tracer_provider`: that is a
+            # process-wide singleton, so a second concurrent run would replace
+            # the first run's provider and export through the wrong exporter.
+            # Each run keeps its own tracer instead.
+            self.provider = provider
+            self._tracer = provider.get_tracer("tev.otel")
             log.info("OTLP exporter started",
                      extra={"data": {"endpoint": self.config.endpoint,
                                      "service": self.config.service_name}})
@@ -317,36 +435,32 @@ class OtelExporter:
             self.config.enabled = False
 
     def emit(self, span_row: dict[str, Any]) -> None:
-        """Queue a span for export. Non-blocking: never waits on the network.
+        """Collect a closed span. Non-blocking: never waits on the network.
 
-        Called from `TraceRecorder.end()` for every closed span. If the queue
+        Called from `TraceRecorder.end()` for every closed span. If the buffer
         is full, the span is dropped and counted (never blocks a verdict).
         """
         if not self.config.enabled or self._sdk_exporter is None:
             return
-        try:
-            self._queue.put_nowait(span_row)
-        except queue.Full:
-            with self._lock:
+        with self._lock:
+            if len(self._pending) >= self.config.max_queue_size:
                 self._dropped += 1
+                return
+            self._pending.append(span_row)
 
     def flush(self, timeout_s: float | None = None) -> None:
-        """Block until all queued spans are exported.
+        """Export the run's collected spans as one tree, then wait for the SDK.
 
-        Called from `TraceRecorder.finish()`. A timeout prevents a hung
-        collector from blocking application shutdown.
+        Called from `TraceRecorder.finish()`. The timeout bounds how long a
+        hung collector can delay run finalisation; it never turns into a run
+        failure.
         """
         if not self.config.enabled or self._sdk_exporter is None:
             return
-        # Signal the drain loop to stop after the queue empties.
-        self._flush_event.set()
-        try:
-            self._queue.put_nowait(None)  # sentinel
-        except queue.Full:
-            pass
-        if self._worker is not None:
-            self._worker.join(timeout=timeout_s or self.config.export_timeout_s)
-        # Force an SDK-level flush (waits for in-flight export).
+        with self._lock:
+            rows, self._pending = self._pending, []
+        if rows:
+            self._export_rows(rows)
         try:
             if self._batch_processor is not None:
                 self._batch_processor.force_flush(
@@ -355,80 +469,84 @@ class OtelExporter:
         except Exception:  # noqa: BLE001
             pass
 
-    def _drain_loop(self) -> None:
-        """Background worker: drains the queue and exports spans via OTLP.
-
-        Runs until the sentinel (`None`) is received. Spans are converted to
-        OpenTelemetry `Span` objects and emitted through the SDK's batch
-        processor, which handles its own batching and retry.
-        """
-        tracer = otel_trace.get_tracer(__name__)
-        batch: list[dict[str, Any]] = []
-
-        def export_batch() -> None:
-            if not batch:
-                return
-            with self._lock:
-                current = batch
-                batch = []
-            self._emit_spans(tracer, current)
-
-        while not self._stop.is_set():
+    def _export_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Export one run's spans as a tree, parents before children."""
+        ordered = sorted(rows, key=lambda row: int(row.get("ordinal") or 0))
+        if self._ids is not None:
+            root = next((r for r in ordered if not r.get("parent_span_id")), None)
+            hinted = trace_id_from_uuid(self.trace_id_hint)
+            self._ids.use_trace_id(hinted or trace_id_from_uuid(
+                (root or {}).get("trace_id")))
+        contexts: dict[str, Any] = {}
+        for row in ordered:
             try:
-                item = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                if self._flush_event.is_set():
-                    export_batch()
-                    break
-                continue
-
-            if item is None:  # sentinel
-                export_batch()
-                break
-
-            batch.append(item)
-            if len(batch) >= self.config.batch_size:
-                export_batch()
-
-    def _emit_spans(self, tracer: Any, spans: list[dict[str, Any]]) -> None:
-        """Convert internal spans to OTLP spans and emit them."""
-        for span_row in spans:
-            try:
-                self._emit_one_span(tracer, span_row)
+                self._export_one(row, contexts)
                 with self._lock:
                     self._exported += 1
             except Exception:  # noqa: BLE001 - one bad span never stops export
                 with self._lock:
                     self._failures += 1
 
-    def _emit_one_span(self, tracer: Any, span_row: dict[str, Any]) -> None:
-        """Create and end one OTLP span from an internal trace span row."""
-        ctx = otel_trace.set_span_in_context(otel_trace.INVALID_SPAN)
-        otel_span: OTelSpan | None = None
+    def _export_one(self, row: dict[str, Any],
+                    contexts: dict[str, Any]) -> None:
+        """Create and end one OTLP span under its recorded parent."""
+        if self._tracer is None:
+            return
+        attributes = _otel_attributes(
+            row, capture_content=self.config.capture_content)
+        if self.run_id:
+            attributes["tev.run_id"] = self.run_id
+        for column, attribute in (("trace_id", "trace_id"), ("id", "span_id"),
+                                  ("parent_span_id", "parent_span_id")):
+            value = row.get(column)
+            if value:
+                attributes[f"{TEV_PREFIX}{attribute}"] = str(value)
+        if self._ids is not None:
+            self._ids.set_next_span_id(span_id_from_uuid(row.get("id")))
+        parent_id = str(row.get("parent_span_id") or "")
+        parent = contexts.get(parent_id) if parent_id else None
+        name = _span_name(str(row.get("stage") or ""),
+                          str(row.get("operation") or ""))
+        # An empty context (not None) keeps a root span a root: `None` would
+        # adopt whatever span happens to be current on the exporting thread.
+        span = self._tracer.start_span(
+            name, context=parent or Context(), attributes=attributes,
+            start_time=_timestamp_ns(row.get("started_at")))
         try:
-            name = _span_name(str(span_row.get("stage", "")),
-                              str(span_row.get("operation", "")))
-            otel_span = tracer.start_span(
-                name=name,
-                context=ctx,
-                attributes=_otel_attributes(span_row,
-                                            capture_content=self.config.capture_content),
-            )
-            # Status.
-            status_code = otel_trace.StatusCode.UNSET
-            error_type = str(span_row.get("error_type") or "")
+            error_type = str(row.get("error_type") or "")
             if error_type:
-                status_code = otel_trace.StatusCode.ERROR
-                otel_span.set_status(status_code, error_type[:200])
-            otel_span.end()
-        except Exception:  # noqa: BLE001 - one bad span never stops export
-            pass
+                span.set_status(StatusCode.ERROR, error_type[:200])
+            contexts[str(row.get("id") or "")] = set_span_in_context(span)
         finally:
-            if otel_span is not None:
-                try:
-                    otel_span.end()
-                except Exception:  # noqa: BLE001
-                    pass
+            span.end(end_time=_timestamp_ns(row.get("ended_at")))
+
+    # -- W3C context for outgoing calls ------------------------------------
+    def begin_run_context(self, fallback_trace_id: str = "") -> Any:
+        """Make the run's trace current on this thread.
+
+        `headers_for_outgoing_call()` reads the current span, so attaching a
+        non-recording span here is what puts a `traceparent` on every Bifrost
+        and Tavily request - including a run started without one. Returns the
+        context token, or None when no valid trace id exists.
+        """
+        trace_id = (trace_id_from_uuid(self.trace_id_hint)
+                    or trace_id_from_uuid(fallback_trace_id))
+        if not trace_id:
+            return None
+        context = SpanContext(
+            trace_id=trace_id, span_id=random.getrandbits(64) or 1,
+            is_remote=False, trace_flags=0x01)
+        return attach(set_span_in_context(NonRecordingSpan(context)))
+
+    @staticmethod
+    def end_run_context(token: Any) -> None:
+        """Detach a context attached by `begin_run_context`. Never raises."""
+        if token is None:
+            return
+        try:
+            detach(token)
+        except Exception:  # noqa: BLE001 - a stale token must not fail a run
+            pass
 
     # -- statistics ---------------------------------------------------------
     def stats(self) -> dict[str, Any]:

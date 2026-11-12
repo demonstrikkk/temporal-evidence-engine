@@ -61,12 +61,7 @@ from app.services import reputation as reputation_svc
 from app.services import runner as runner_svc
 from app.services import selector_learn as selector_learn_svc
 from app.services import sqlq as sqlq_svc
-from app.verify.otel import (
-    TRACEPARENT_HEADER, TRACESTATE_HEADER, extract_trace_context,
-    parse_traceparent, traceparent_from_trace,
-)
-from opentelemetry import trace as otel_trace
-from opentelemetry.trace.propagation import set_span_in_context
+from app.verify.otel import parse_traceparent
 
 set_level(settings.LOG_LEVEL)
 
@@ -89,16 +84,18 @@ class _TraceMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         request = Request(scope, receive)
-        headers = dict(request.headers.getlist("traceparent"))
-        traceparent = headers[0] if headers else None
+        # `Headers.getlist` returns a list of strings; the old `dict(...)` cast
+        # raised ValueError on every request that carried a `traceparent`, so a
+        # tracing-aware proxy turned each call into a 500. Read the first value.
+        traceparent = request.headers.get("traceparent")
         tracestate = request.headers.get("tracestate")
         ctx = None
         if traceparent:
             parsed = parse_traceparent(traceparent)
             if parsed:
-                # Rebuild a valid OTel span context from the incoming ids so
-                # Bifrost/Tavily calls in the worker thread can continue it.
-                from opentelemetry.trace import INVALID_SPAN, SpanContext
+                # Rebuild the caller's span context so the request span and the
+                # run continue their trace instead of starting a new one.
+                from opentelemetry.trace import SpanContext
                 try:
                     ctx = SpanContext(
                         trace_id=int(parsed["trace_id"], 16),
@@ -113,17 +110,14 @@ class _TraceMiddleware:
             "tracestate": tracestate,
             "context": ctx,
         }
-        # Create an OTel span for the request handling itself.
-        tracer = otel_trace.get_tracer(__name__)
-        parent_ctx = set_span_in_context(otel_trace.INVALID_SPAN, ctx) if ctx else None
-        with tracer.start_as_current_span(
-            f"http.{request.method} {request.url.path}",
-            context=parent_ctx or otel_trace.set_span_in_context(otel_trace.INVALID_SPAN),
-            attributes={"http.method": request.method,
-                        "http.route": request.url.path,
-                        "http.scheme": request.url.scheme},
-        ):
-            await self.app(scope, receive, send)
+        # No request span is started here, deliberately. A span created by
+        # `otel_trace.get_tracer()` goes to the *global* provider, and D-029
+        # forbids installing one: each run owns its exporter so two concurrent
+        # runs cannot replace each other's. The request span would therefore be
+        # a non-recording span whose invalid context replaced the caller's. The
+        # trace the operator sees is the run's own, exported by the run, and its
+        # root carries the caller's trace id through `request.state`.
+        await self.app(scope, receive, send)
 
 
 app.add_middleware(_TraceMiddleware)

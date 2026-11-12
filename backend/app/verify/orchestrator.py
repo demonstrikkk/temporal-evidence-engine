@@ -39,8 +39,6 @@ from app.verify.settlement import settle_assertion
 from app.verify.store import VerifyStore, build_store, iso, new_id, now, parse_iso
 from app.verify.temporal import event_date_from_quote
 from app.verify.otel import OtelExporter, config_from_settings, parse_traceparent
-from opentelemetry.trace.propagation import set_span_in_context
-from opentelemetry.trace import SpanContext, INVALID_SPAN, NonRecordingSpan
 from app.verify.trace import TraceRecorder, model_fields
 from app.cache.coordinator import CacheCoordinator
 
@@ -265,36 +263,27 @@ class Verifier:
         self.tavily = tavily or TavilyClient(store)
         self.cache = CacheCoordinator(store)
         self.failures: list[dict[str, Any]] = []
-        #: OTLP export of the execution trace — additive observability only.
-        #: A bad config or unavailable collector never reaches a verdict:
-        #: `OtelExporter` degrades to disabled and keeps swallowing failures.
-        self.otel = OtelExporter(config=config_from_settings(), store=store)
-        #: Re-establish the caller's W3C trace context on this worker thread so
-        #: Bifrost and Tavily calls continue the trace started by the HTTP
-        #: request. Absent or malformed `traceparent` starts a fresh trace.
+        #: The caller's W3C trace context, when the run was started with a
+        #: `traceparent`. The run continues that trace; absent or malformed
+        #: headers start a fresh one. Never a failure either way.
         self._incoming_traceparent: str | None = None
         run = self.store.get_run(self.run_id) or {}
         incoming = str(run.get("traceparent") or "")
-        if incoming:
-            parsed = parse_traceparent(incoming)
-            if parsed:
-                self._incoming_traceparent = incoming
-                try:
-                    ctx = SpanContext(
-                        trace_id=int(parsed["trace_id"], 16),
-                        span_id=int(parsed["span_id"], 16),
-                        is_remote=True,
-                        trace_flags=int(parsed.get("flags", "01"), 16),
-                    )
-                    non_rec = NonRecordingSpan(ctx)
-                    set_span_in_context(non_rec)
-                except (ValueError, TypeError, AttributeError):
-                    pass
+        parsed = parse_traceparent(incoming) if incoming else None
+        if parsed:
+            self._incoming_traceparent = incoming
+        #: OTLP export of the execution trace — additive observability only.
+        #: A bad config or unavailable collector never reaches a verdict:
+        #: `OtelExporter` degrades to disabled and keeps swallowing failures.
+        self.otel = OtelExporter(
+            config=config_from_settings(), store=store, run_id=run_id,
+            trace_id_hint=(parsed or {}).get("trace_id", ""))
         #: The run as a tree. Every span is closed by the same emit call that
         #: writes its rail row, so the trace cannot drift from the events.
         self.trace = TraceRecorder(store, run_id, emit=self.emit,
                                    enabled=settings.TRACE_ENABLED,
                                    exporter=self.otel)
+        self._trace_token: Any = None
         self.counters: dict[str, int] = {
             "claims": 0, "queries": 0, "sources": 0, "evidence": 0,
             "settled": 0, "failed_sources": 0, "failed_calls": 0,
@@ -524,6 +513,20 @@ class Verifier:
 
     # -- entry point ------------------------------------------------------
     def execute(self) -> None:
+        """Run the verification with the run's trace context attached.
+
+        The context is attached here, not in `__init__`, so a Verifier that is
+        built and never executed cannot leave a `traceparent` behind for the
+        next operation on this thread; it is detached in `finally` so a
+        crashing run cannot either. Everything else is `_execute`.
+        """
+        self._trace_token = self.otel.begin_run_context(self.trace.trace_id)
+        try:
+            self._execute()
+        finally:
+            self.otel.end_run_context(self._trace_token)
+
+    def _execute(self) -> None:
         run = self.store.get_run(self.run_id)
         if not run:
             return

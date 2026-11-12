@@ -201,6 +201,47 @@ def test_positional_reads_still_pass_a_tuple(pg):
     assert all(not isinstance(params, Mapping) for _sql, params in cursor.seen)
 
 
+def test_coverage_audit_carries_the_unscanned_columns_as_a_mapping(pg):
+    """The disclosure is stored, not only rendered.
+
+    A column added to the INSERT but not to the parameter mapping is a
+    KeyError; a parameter without a column is a silent drop. Both are checked
+    here without a server.
+    """
+    store, cursor = pg
+
+    def row(**overrides):
+        base = {
+            "run_id": ROW["run_id"], "answer_id": ROW["answer_id"],
+            "answer_chars": 40, "sentences": 2, "candidates": 0, "claims": 0,
+            "claims_without_candidate": 0, "total_assertions": 0, "checked": 0,
+            "coverage": 1.0, "material_assertions": 0, "material_coverage": 1.0,
+            "dispositions": {}, "unscanned": 2,
+            "unscanned_sentences": [{"start": 0, "end": 41, "text": "x",
+                                     "signals": {}}],
+            "repair_calls": 0, "repaired_claims": 0, "repair_targets": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+        base.update(overrides)
+        return base
+
+    store.put_coverage_audit(row())
+
+    sql, params = cursor.seen[-1]
+    assert isinstance(params, Mapping)
+    for column in ("unscanned", "unscanned_sentences"):
+        assert f"{column}," in sql or f"{column})" in sql
+        assert f"%({column})s" in sql
+        assert column in params
+    assert params["unscanned"] == 2
+    # A row written before the disclosure existed reads as 0, not NULL.
+    store.put_coverage_audit(row(unscanned=None))
+    assert cursor.seen[-1][1]["unscanned"] == 0
+
+
+
+
 def test_an_event_payload_with_a_datetime_survives_a_jsonb_round_trip():
     """`claims.extracted` carries the model receipt, which carries `created_at`.
 

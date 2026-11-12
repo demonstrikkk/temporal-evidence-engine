@@ -94,6 +94,11 @@ def _coverage_lines(coverage: dict[str, Any], spans: list[dict[str, Any]],
     lines.append(f"- Material coverage: {material * 100:.1f}% "
                  f"(opinions and predictions excluded)")
     lines.append(f"- Sentences: {coverage.get('sentences') or 0}")
+    unscanned = int(coverage.get("unscanned") or 0)
+    if unscanned:
+        # Said next to the ratio, because the ratio does not include them.
+        lines.append(f"- Not visible to the deterministic scan: {unscanned} "
+                     f"sentence(s) with no checkable value and no claim")
     dispositions = coverage.get("dispositions") or {}
     if dispositions:
         lines.append("- Dispositions: " + ", ".join(
@@ -114,6 +119,21 @@ def _coverage_lines(coverage: dict[str, Any], spans: list[dict[str, Any]],
             lines.append(f"- `{span.get('text')}` — “{sentence[:180]}”")
         if len(uncovered) > 20:
             lines.append(f"- …and {len(uncovered) - 20} more")
+    unscanned_items = coverage.get("unscanned_sentences") or []
+    if unscanned_items:
+        lines.append("")
+        lines.append(f"### Not visible to the scan ({len(unscanned_items)})")
+        lines.append("")
+        lines.append("These sentences contain no value the deterministic scanner "
+                     "recognises and produced no claim. The ratios above do not "
+                     "include them; they cannot say whether these sentences "
+                     "assert anything.")
+        lines.append("")
+        for item in unscanned_items[:20]:
+            text = str(item.get("text") or "").strip()
+            lines.append(f"- “{text[:180]}”")
+        if len(unscanned_items) > 20:
+            lines.append(f"- …and {len(unscanned_items) - 20} more")
     lines.append("")
     return lines
 

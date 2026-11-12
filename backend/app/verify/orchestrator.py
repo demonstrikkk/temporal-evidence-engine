@@ -1356,6 +1356,9 @@ class Verifier:
                 "material_coverage": coverage.get("material_coverage"),
                 "uncovered": (coverage.get("dispositions") or {}).get(
                     "not_checked", 0),
+                #: Sentences the deterministic scan could not read. The ratio
+                #: cannot speak for them, so the terminal event names them.
+                "unscanned": coverage.get("unscanned") or 0,
                 "repair_calls": coverage.get("repair_calls"),
                 "repaired_claims": coverage.get("repaired_claims"),
             }

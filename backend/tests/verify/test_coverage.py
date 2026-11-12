@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.verify.assertions import candidates, disposition_for
 from app.verify.coverage import audit
 from app.verify.orchestrator import Verifier, create_run
-from app.verify.report import build_report
+from app.verify.report import build_report, render_markdown
 from app.verify.schemas import AnswerIn
 from app.verify.segment import segment
 from app.verify.value_normalizer import normalize_value
@@ -184,6 +184,116 @@ def test_coverage_never_writes_a_claim_status():
                                     "not_checked"}
     # The audit returns dispositions; it has no status field to write.
     assert not hasattr(report, "status")
+
+
+# ---------------------------------------------------------------------------
+# the blind spot: sentences the deterministic scan cannot read
+# ---------------------------------------------------------------------------
+
+PROSE = ("The Eiffel Tower is located in Paris. "
+         "It was designed by Gustave Eiffel.")
+
+
+def test_a_sentence_with_no_value_and_no_claim_is_disclosed_not_rounded_away():
+    """`coverage == 1.0` over an answer nothing was checked in is a false calm.
+
+    Both sentences assert material facts and contain no value the scanner
+    recognises, so `total_assertions` is zero and the ratio is a vacuous 1.0.
+    The disclosure is additive: the ratio must not move, and the sentences must
+    be named.
+    """
+    report = audit(PROSE, [])
+
+    assert report.total_assertions == 0
+    assert report.coverage == 1.0, "the published ratio must not change"
+    assert report.material_coverage == 1.0
+    assert report.unscanned == 2
+    assert [item["text"].strip() for item in report.unscanned_sentences] == [
+        "The Eiffel Tower is located in Paris.",
+        "It was designed by Gustave Eiffel.",
+    ]
+    assert report.unscanned_sentences[0]["start"] == 0
+
+
+def test_a_sentence_with_a_scannable_value_is_not_disclosed_as_unscanned():
+    report = audit("The tower is 330 metres tall. It is in Paris.", [])
+    assert report.unscanned == 1
+    assert [item["text"].strip() for item in report.unscanned_sentences] == [
+        "It is in Paris."]
+
+
+def test_a_sentence_covered_by_a_claim_is_not_disclosed_as_unscanned():
+    """An extracted claim means the sentence was read, even with no value in it."""
+    answer = "The tower is in Paris. The tower is 330 metres tall."
+    claim = _claim("The tower is in Paris", answer, object_raw="Paris")
+    report = audit(answer, [claim])
+
+    assert report.unscanned == 0
+    # The extracted claim still counts: two assertions, one checked.
+    assert report.claims_without_candidate == 1
+    assert report.total_assertions == 2
+    assert report.checked == 1
+    assert report.coverage == 0.5
+
+
+def test_unscanned_is_disclosed_beside_a_checked_value_in_a_mixed_answer():
+    answer = ("Acme Pro costs $99 per month. "
+              "Acme Pro is faster than Nimbus Pro.")
+    report = audit(answer, [])
+
+    assert report.unscanned == 1
+    assert report.unscanned_sentences[0]["text"].strip() == (
+        "Acme Pro is faster than Nimbus Pro.")
+    # The value in the first sentence still has a disposition of its own.
+    assert [item.kind for item in report.items] == ["money"]
+    assert report.dispositions["not_checked"] == 1
+    assert report.coverage == 0.0
+
+
+def test_unscanned_survives_as_dict_and_is_named_in_the_summary():
+    report = audit(PROSE, [])
+    payload = report.as_dict()
+    assert payload["unscanned"] == 2
+    assert len(payload["unscanned_sentences"]) == 2
+    assert "2 sentence(s) the scan could not read" in report.summary()
+
+    clean = audit("The tower is 330 metres tall.", [])
+    assert clean.unscanned == 0
+    assert "could not read" not in clean.summary()
+    assert clean.as_dict()["unscanned"] == 0
+
+
+def test_the_report_says_what_the_ratio_cannot_see():
+    report = audit(PROSE, [])
+    text = render_markdown(
+        {"id": "run-1", "status": "completed", "rule_version": "tev-1.2.0",
+         "cache_mode": "read-write"},
+        {"answer_text": PROSE},
+        [], {}, coverage=report.as_dict(), spans=[])
+    assert "Not visible to the deterministic scan: 2 sentence(s)" in text
+    assert "### Not visible to the scan (2)" in text
+    assert "located in Paris" in text
+
+
+def test_a_run_records_which_sentences_the_scan_could_not_read(
+        store, make_gateway, make_tavily):
+    """The disclosure reaches the run record, not only the audit function."""
+    answer = ("Acme Pro costs $99 per month. "
+              "Acme Pro is faster than Nimbus Pro.")
+    run = _start(store, answer=answer)
+    gw = make_gateway(claims=[_pricing_claim()])
+    Verifier(store, run.run_id, bifrost=gw, tavily=make_tavily()).execute()
+
+    audit_row = store.get_coverage_audit(run.run_id)
+    assert audit_row["unscanned"] == 1
+    assert audit_row["unscanned_sentences"][0]["text"].strip() == (
+        "Acme Pro is faster than Nimbus Pro.")
+    # The ratio is unchanged: this is a disclosure, not a redefinition.
+    assert audit_row["coverage"] == 1.0
+
+    terminal = [event for event in store.list_events(run.run_id)
+                if event["event_type"].startswith("run.")][-1]
+    assert terminal["payload"]["coverage"]["unscanned"] == 1
 
 
 # ---------------------------------------------------------------------------

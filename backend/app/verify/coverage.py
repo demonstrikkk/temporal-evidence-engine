@@ -87,6 +87,12 @@ class CoverageReport:
     checked: int = 0
     dispositions: dict[str, int] = field(default_factory=dict)
     items: list[AssertionItem] = field(default_factory=list)
+    #: Sentences that produced no scannable value and no stored claim. The
+    #: deterministic scanner cannot read them, so no ratio can speak for them.
+    #: Recorded so a 100% over an unreadable answer is not indistinguishable
+    #: from a 100% over a checked one. Informational: the ratios below are
+    #: unchanged, because changing them would silently redefine the metric.
+    unscanned_sentences: list[dict[str, Any]] = field(default_factory=list)
     #: Sentences holding at least one `not_checked` candidate and no claim.
     repair_targets: list[dict[str, Any]] = field(default_factory=list)
     repair_calls: int = 0
@@ -115,6 +121,11 @@ class CoverageReport:
     def uncovered(self) -> int:
         return self.dispositions.get("not_checked", 0)
 
+    @property
+    def unscanned(self) -> int:
+        """Sentences the deterministic scan had nothing to say about."""
+        return len(self.unscanned_sentences)
+
     def pct(self, value: float) -> str:
         return f"{value * 100:.1f}%"
 
@@ -132,18 +143,24 @@ class CoverageReport:
             "material_coverage": round(self.material_coverage, 4),
             "dispositions": dict(self.dispositions),
             "uncovered": self.uncovered,
+            "unscanned": self.unscanned,
+            "unscanned_sentences": list(self.unscanned_sentences),
             "repair_calls": self.repair_calls,
             "repaired_claims": self.repaired_claims,
             "repair_targets": list(self.repair_targets),
         }
 
     def summary(self) -> str:
-        return (
+        text = (
             f"{self.checked}/{self.total_assertions} assertions checked "
             f"({self.pct(self.coverage)}); "
             f"material {self.pct(self.material_coverage)}; "
-            f"{self.uncovered} uncovered"
-        )
+            f"{self.uncovered} uncovered")
+        if self.unscanned:
+            # The ratio cannot see these sentences; saying so beside the ratio
+            # is the difference between a stated limit and a false claim.
+            text += f"; {self.unscanned} sentence(s) the scan could not read"
+        return text
 
 
 def _claim_spans(claims: Iterable[dict[str, Any]]) -> list[tuple[int, int, str]]:
@@ -184,10 +201,13 @@ def audit(answer: str, claims: Iterable[dict[str, Any]]) -> CoverageReport:
     items: list[AssertionItem] = []
     counts: dict[str, int] = {name: 0 for name in DISPOSITIONS}
     covered_claims: set[str] = set()
+    unscanned: list[dict[str, Any]] = []
 
     for sentence in sentences:
+        found_any = False
         for candidate in sentence_candidates(sentence.start, sentence.end,
                                              sentence.text):
+            found_any = True
             claim_id = _covering_claim(candidate.start, candidate.end, spans)
             if claim_id:
                 covered_claims.add(claim_id)
@@ -201,6 +221,15 @@ def audit(answer: str, claims: Iterable[dict[str, Any]]) -> CoverageReport:
                 sentence_start=sentence.start, sentence_end=sentence.end,
                 disposition=disposition, claim_id=claim_id,
                 signals=_signals(sentence.text)))
+        has_claim = any(sentence.overlaps(start, end)
+                        for start, end, _claim_id in spans)
+        if not found_any and not has_claim:
+            # Nothing to scan and nothing extracted. The ratios cannot speak
+            # for this sentence, so it is recorded rather than left out.
+            unscanned.append({
+                "start": sentence.start, "end": sentence.end,
+                "text": sentence.text, "signals": _signals(sentence.text),
+            })
 
     # A claim with no candidate inside it is an assertion too. Counting only
     # regex hits would report 100% coverage for an answer whose every claim was
@@ -223,6 +252,7 @@ def audit(answer: str, claims: Iterable[dict[str, Any]]) -> CoverageReport:
         checked=checked,
         dispositions=counts,
         items=items,
+        unscanned_sentences=unscanned,
         repair_targets=targets,
     )
     return report

@@ -1042,13 +1042,15 @@ class PgStore:
             """INSERT INTO coverage_audits (run_id, answer_id, answer_chars,
                    sentences, candidates, claims, claims_without_candidate,
                    total_assertions, checked, coverage, material_assertions,
-                   material_coverage, dispositions, repair_calls,
-                   repaired_claims, repair_targets, created_at, updated_at)
+                   material_coverage, dispositions, unscanned,
+                   unscanned_sentences, repair_calls, repaired_claims,
+                   repair_targets, created_at, updated_at)
                VALUES (%(run_id)s, %(answer_id)s, %(answer_chars)s,
                    %(sentences)s, %(candidates)s, %(claims)s,
                    %(claims_without_candidate)s, %(total_assertions)s,
                    %(checked)s, %(coverage)s, %(material_assertions)s,
-                   %(material_coverage)s, %(dispositions)s, %(repair_calls)s,
+                   %(material_coverage)s, %(dispositions)s, %(unscanned)s,
+                   %(unscanned_sentences)s, %(repair_calls)s,
                    %(repaired_claims)s, %(repair_targets)s, %(created_at)s,
                    %(updated_at)s)
                ON CONFLICT (run_id) DO UPDATE SET
@@ -1063,6 +1065,8 @@ class PgStore:
                    material_assertions = EXCLUDED.material_assertions,
                    material_coverage = EXCLUDED.material_coverage,
                    dispositions = EXCLUDED.dispositions,
+                   unscanned = EXCLUDED.unscanned,
+                   unscanned_sentences = EXCLUDED.unscanned_sentences,
                    repair_calls = EXCLUDED.repair_calls,
                    repaired_claims = EXCLUDED.repaired_claims,
                    repair_targets = EXCLUDED.repair_targets,
@@ -1070,6 +1074,9 @@ class PgStore:
                RETURNING *""",
             {**row,
              "dispositions": _jsonb(row.get("dispositions") or {}),
+             "unscanned": int(row.get("unscanned") or 0),
+             "unscanned_sentences": _jsonb(
+                 row.get("unscanned_sentences") or []),
              "repair_targets": _jsonb(row.get("repair_targets") or []),
              "created_at": row.get("created_at") or now(),
              "updated_at": row.get("updated_at") or now()})

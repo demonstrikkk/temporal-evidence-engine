@@ -811,3 +811,53 @@ This is observability, not verification. `OTEL_ENABLED=false` produces no spans,
 an unavailable collector is a counted export failure, and no code path here can
 reach a verdict, a budget or `claims.status`. `RULE_VERSION` is unchanged.
 Evidence: `docs/WP10-VALIDATION.md`, `test_otel_validation.py`.
+
+## D-030 - The coverage ratio discloses what it cannot read (2026-11-12)
+
+`coverage` counts a checked assertion over every assertion the audit can see.
+The audit is a value scanner (money, percentages, measures, dates, versions,
+numbers), so a factual sentence with no value - "located in Paris", "faster than
+Nimbus" - never enters the denominator. With no claim either, the report printed
+`100%` for an answer nothing was checked in. `docs/ASSERTION-COVERAGE.md`
+measured that blind spot at 12 of 22 material assertions, with two cases
+reporting 100% while fully blind.
+
+`CoverageReport.unscanned_sentences` now records every sentence with no
+scannable candidate and no claim. It is a disclosure, not a rule:
+
+- `coverage`, `material_coverage`, `total_assertions` and `dispositions`
+  are computed exactly as before (`coverage` still reads `1.0` over nothing);
+- no claim is created, no verdict changes, `claims.status` is untouched;
+- the count is stored (`migrations/032`), rendered beside the ratio, and named
+  in the terminal run event;
+- a row written before the column existed reads as `0` / `[]`, because that
+  is what it recorded.
+
+The distinction this buys is the one the metric needed: "100% of the assertions
+I can see were checked" is no longer printed for an answer the scanner could not
+read at all. Raising that floor means reaching propositions, which is WP-8 and
+needs a spec, a budget and a taxonomy - not a regex.
+
+The scanner's own vocabulary also has holes (D-031, in
+`docs/ASSERTION-COVERAGE.md` F7): `7 million` and `3 billion` produce no
+candidate, and `1.5 million` is classified as a version. Fixing that moves the
+denominator, so it is recorded as a task rather than folded into a disclosure.
+
+## D-031 - Rounded magnitudes are a known scanner hole (2026-11-12, not fixed)
+
+Measured, not suspected: `candidates()` returns nothing for `7 million`,
+`2 million` and `3 billion`, and returns `version: 1.5` for
+`1.5 million`. The patterns (`app/verify/assertions.py`) have no scale-word
+alternative anywhere, and the version pattern outranks number at the same start.
+
+Consequence: a sentence asserting a population - "Roughly 7 million people visit
+it each year" (`tax-02`) - is invisible to the coverage audit even though the
+scanner exists to find exactly that kind of value.
+
+It is recorded instead of fixed because widening the patterns changes
+`total_assertions`, the coverage ratio, the capped repair's targets and
+therefore the model calls a run makes. That is a metric change and belongs with
+its own decision, a test for each shape (`7 million` -> number/measure,
+`1.5 million` -> measure, `10,100 tonnes` -> measure) and an evaluation
+re-run. `scripts/coverage_probe.py` already counts the cases it affects, so the
+change can be measured before and after rather than asserted.

@@ -9,11 +9,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../lib/api';
-import { claimCounts, isLive, shortDate, timeOnly } from './model.js';
+import Prose from '../components/Prose.jsx';
+import { isLive, runCounts, shortDate, timeOnly } from './model.js';
 import { useVerifyRun } from './useVerifyRun';
 import AnswerSpans from './AnswerSpans.jsx';
 import ClaimInspector from './ClaimInspector.jsx';
-import ClaimRegister, { StatusSummary } from './ClaimRegister.jsx';
+import ClaimRegister, { VerdictBar } from './ClaimRegister.jsx';
 import EventRail from './EventRail.jsx';
 import GatewayPanel from './GatewayPanel.jsx';
 import { Empty, RunStatePill, SectionHeading, SkeletonBlock } from './ui.jsx';
@@ -21,6 +22,7 @@ import QuotaRail from './QuotaRail.jsx';
 import BudgetModeSelector from './BudgetModeSelector.jsx';
 import DiagnosticsPanel from './DiagnosticsPanel.jsx';
 import CoveragePanel from './CoveragePanel.jsx';
+import ResearchLedger from './ResearchLedger.jsx';
 import TracePanel from './TracePanel.jsx';
 
 const STAGE_COPY = {
@@ -92,11 +94,22 @@ export default function RunView() {
   const { run, events, error, loading, streamState } = useVerifyRun(runId);
   const [exporting, setExporting] = useState('');
   const [exportError, setExportError] = useState(null);
+  /*
+   * Two ways to see the same stored text.
+   *
+   * `formatted` reads the answer as the model wrote it — headings, tables,
+   * bold — and draws every claim mark on the rendered words. `source` shows the
+   * exact stored characters, Markdown syntax and all, which is what the offsets
+   * literally address and what a reviewer quotes when the wording matters.
+   * Neither view rewrites the stored string; the register below is
+   * authoritative in both.
+   */
+  const [answerView, setAnswerView] = useState('formatted');
 
   const selectedId = params.get('claim') || '';
   const claims = run?.claims || [];
   const counts = useMemo(
-    () => run?.counters || claimCounts(claims),
+    () => runCounts(claims, run?.counters),
     [run?.counters, claims],
   );
 
@@ -174,69 +187,91 @@ export default function RunView() {
 
   return (
     <div className="space-y-5 animate-fade-up">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2 text-[11px] text-muted">
-            <Link className="hover:text-ink" to="/runs">
-              Runs
-            </Link>
+      <header className="case-head">
+        <div className="min-w-0 flex-1">
+          <div className="case-crumb">
+            <Link to="/runs">runs</Link>
             <span aria-hidden="true">/</span>
-            <span className="font-mono">{String(run.id).slice(0, 8)}</span>
+            <span>{String(run.id).slice(0, 8)}</span>
+            <span aria-hidden="true">·</span>
+            <span>{run.status}</span>
           </div>
-          <h1 className="mt-1 max-w-3xl font-display text-[26px] leading-tight text-ink sm:text-[30px]">
-            {answer.prompt || 'Untitled answer'}
-          </h1>
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[11px] text-muted">
+          <h1 className="case-title">{answer.prompt || 'Untitled answer'}</h1>
+          <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
             <RunStatePill status={run.status} />
-            <span>
-              generated{' '}
-              <span className="font-mono text-ink-2">
+            {answer.answer_text ? (
+              <span className="font-mono text-[10px] text-muted">
+                {answer.answer_text.length} chars · {claims.length} claim
+                {claims.length === 1 ? '' : 's'}
+              </span>
+            ) : null}
+          </div>
+          <dl className="case-meta">
+            <div>
+              <dt>answer generated</dt>
+              <dd className={answer.generated_at ? '' : 'is-missing'}>
                 {answer.generated_at
                   ? `${shortDate(answer.generated_at)} ${timeOnly(answer.generated_at)}`
                   : 'unknown'}
-              </span>
-            </span>
-            <span>
-              started <span className="font-mono text-ink-2">{shortDate(run.started_at)}</span>
-            </span>
-            <span className="font-mono">{run.rule_version}</span>
-            <span className="font-mono">cache {run.cache_mode}</span>
-          </div>
+              </dd>
+            </div>
+            <div>
+              <dt>run started</dt>
+              <dd>{shortDate(run.started_at)}</dd>
+            </div>
+            <div>
+              <dt>rule</dt>
+              <dd>{run.rule_version || '—'}</dd>
+            </div>
+            <div>
+              <dt>cache</dt>
+              <dd>{run.cache_mode || '—'}</dd>
+            </div>
+          </dl>
         </div>
 
-        <div className="flex flex-col items-end gap-2">
-          <StatusSummary counts={counts} />
-          <BudgetModeSelector mode={run?.budget_mode || 'balanced'} />
-          <div className="flex flex-wrap justify-end gap-1.5">
-            <button
-              type="button"
-              className="btn-outline btn-xs"
-              onClick={() => exportReport('md')}
-              disabled={Boolean(exporting) || live}
-              title={live ? 'The report is complete when the run is' : 'Download the Markdown report'}
-            >
-              {exporting === 'md' ? 'Preparing…' : 'Report .md'}
-            </button>
-            <button
-              type="button"
-              className="btn-outline btn-xs"
-              onClick={() => exportReport('json')}
-              disabled={Boolean(exporting) || live}
-              title={live ? 'The report is complete when the run is' : 'Download the JSON evidence pack'}
-            >
-              {exporting === 'json' ? 'Preparing…' : 'JSON'}
-            </button>
+        <div className="w-full shrink-0 lg:w-[318px]">
+          <p className="case-sub">
+            Verdict distribution
+            <b>
+              {counts.total ? `${counts.total - counts.pending}/${counts.total} settled` : 'no claims'}
+            </b>
+          </p>
+          <div className="mt-2">
+            <VerdictBar counts={counts} />
+          </div>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+            <BudgetModeSelector mode={run?.budget_mode || 'balanced'} />
+            <div className="flex flex-wrap justify-end gap-1.5">
+              <button
+                type="button"
+                className="btn-outline btn-xs"
+                onClick={() => exportReport('md')}
+                disabled={Boolean(exporting) || live}
+                title={live ? 'The report is complete when the run is' : 'Download the Markdown report'}
+              >
+                {exporting === 'md' ? 'Preparing…' : 'Report .md'}
+              </button>
+              <button
+                type="button"
+                className="btn-outline btn-xs"
+                onClick={() => exportReport('json')}
+                disabled={Boolean(exporting) || live}
+                title={live ? 'The report is complete when the run is' : 'Download the JSON evidence pack'}
+              >
+                {exporting === 'json' ? 'Preparing…' : 'JSON'}
+              </button>
+            </div>
           </div>
           {exportError ? (
-            <p className="text-[10.5px] text-danger" role="alert">
+            <p className="mt-1.5 text-[10.5px] text-danger" role="alert">
               {exportError.message || String(exportError)}
             </p>
           ) : null}
         </div>
-      </div>
+      </header>
 
       <PartialBanner run={run} events={events} />
-      <QuotaRail />
 
       {live ? (
         <div className="flex items-center gap-3 rounded-md border border-rule bg-paper-2 px-3.5 py-2.5">
@@ -256,18 +291,72 @@ export default function RunView() {
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_420px]">
         <div className="min-w-0 space-y-5">
-          <section className="surface p-4" aria-label="The answer">
-            <SectionHeading aside={`${answer.answer_text?.length || 0} chars`}>
+          <section className="surface px-4 py-3.5" aria-label="The answer">
+            <SectionHeading
+              aside={`${answer.answer_text?.length || 0} chars · ${claims.length} claims`}
+            >
               The answer
             </SectionHeading>
-            <div className="mt-3">
+            <div className="answer-sheet">
               {answer.answer_text ? (
-                <AnswerSpans
-                  answer={answer.answer_text}
-                  claims={claims}
-                  selectedId={selectedId}
-                  onSelect={selectClaim}
-                />
+                <>
+                  <p className="answer-caption">
+                    <span>as generated</span>
+                    <span className="answer-caption-right">
+                      <span>
+                        {answer.generated_at
+                          ? `${shortDate(answer.generated_at)} ${timeOnly(answer.generated_at)}`
+                          : 'generation time unknown'}
+                      </span>
+                      <span className="view-switch" role="group" aria-label="Answer view">
+                        <button
+                          type="button"
+                          aria-pressed={answerView === 'formatted'}
+                          onClick={() => setAnswerView('formatted')}
+                          title="The answer as written, with each claim marked on the rendered text"
+                        >
+                          formatted
+                        </button>
+                        <button
+                          type="button"
+                          aria-pressed={answerView === 'source'}
+                          onClick={() => setAnswerView('source')}
+                          title="The exact stored characters, before any Markdown is interpreted"
+                        >
+                          source
+                        </button>
+                      </span>
+                    </span>
+                  </p>
+                  {answerView === 'formatted' ? (
+                    <>
+                      <div className="run-md">
+                        <Prose marks={{ claims, selectedId, onSelect: selectClaim }}>
+                          {answer.answer_text}
+                        </Prose>
+                      </div>
+                      <p className="answer-note">
+                        Rendered from the stored text — nothing here was rewritten. Each mark is
+                        drawn at the offset the extractor recorded; switch to <em>source</em> to see
+                        the exact characters, or use the register below for every verdict.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <AnswerSpans
+                        answer={answer.answer_text}
+                        claims={claims}
+                        selectedId={selectedId}
+                        onSelect={selectClaim}
+                      />
+                      <p className="answer-note">
+                        The exact stored characters, so Markdown syntax is visible where the model
+                        wrote it. This is the view to quote from: every span is a slice of this
+                        string at the offset the extractor stored.
+                      </p>
+                    </>
+                  )}
+                </>
               ) : (
                 <p className="text-[12px] text-muted">No answer text was stored for this run.</p>
               )}
@@ -281,7 +370,7 @@ export default function RunView() {
             live={live}
           />
 
-          <section className="surface p-4" aria-label="Claim register">
+          <section className="surface px-4 py-3.5" aria-label="Claim register">
             <SectionHeading
               aside={
                 claims.length
@@ -293,7 +382,7 @@ export default function RunView() {
             >
               Claim register
             </SectionHeading>
-            <div className="mt-2">
+            <div className="mt-2.5">
               {claims.length ? (
                 <ClaimRegister claims={claims} selectedId={selectedId} onSelect={selectClaim} />
               ) : live ? (
@@ -314,11 +403,15 @@ export default function RunView() {
 
           <TracePanel runId={runId} live={live} />
 
+          <ResearchLedger events={events} />
+
           <GatewayPanel gateway={run.gateway} />
         </div>
 
         <aside className="min-w-0">
-          <div className="lg:sticky lg:top-[72px]">
+          {/* A pinned inspector taller than the viewport would have its bottom
+              cut off with no way to reach it, so it scrolls inside its frame. */}
+          <div className="lg:sticky lg:top-[72px] lg:max-h-[calc(100dvh-88px)] lg:overflow-y-auto lg:overscroll-contain lg:pr-1">
             <ClaimInspector
               runId={runId}
               claimId={selectedId}
@@ -328,6 +421,8 @@ export default function RunView() {
           </div>
         </aside>
       </div>
+
+      <QuotaRail />
 
       <DiagnosticsPanel />
     </div>

@@ -3,6 +3,9 @@
  *
  * Newest first on purpose: a run is watched live, and the thing that just
  * happened should not require scrolling past everything that already did.
+ *
+ * The stream state is the panel's aside, not a separate chip row: "streaming"
+ * is the answer to "can I trust this list to be current".
  */
 import { useMemo, useState } from 'react';
 import { describeEvent, isProblem, timeOnly } from './model.js';
@@ -33,23 +36,28 @@ export default function EventRail({ events, streamState = 'connecting' }) {
   const problemCount = useMemo(() => (events || []).filter(isProblem).length, [events]);
 
   return (
-    <section className="surface p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <SectionHeading
-          aside={
-            <span className="inline-flex items-center gap-1.5">
-              <span
-                className={`h-1.5 w-1.5 rounded-full ${
-                  streamState === 'live' ? 'bg-ok' : 'bg-rule-2'
-                }`}
-                aria-hidden="true"
-              />
-              {STREAM_COPY[streamState] || streamState}
-            </span>
-          }
-        >
-          Run ledger ({events?.length || 0})
-        </SectionHeading>
+    <section className="surface px-4 py-3.5" aria-label="Run ledger">
+      <SectionHeading
+        aside={
+          <span className="inline-flex items-center gap-1.5">
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${
+                streamState === 'live' ? 'bg-ok' : 'bg-rule-2'
+              }`}
+              aria-hidden="true"
+            />
+            {STREAM_COPY[streamState] || streamState}
+          </span>
+        }
+      >
+        Run ledger
+        <span className="ml-1 text-muted">({events?.length || 0})</span>
+      </SectionHeading>
+
+      <div className="event-tools">
+        <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-muted">
+          newest first · each stage emits one event
+        </p>
         <label className="flex items-center gap-1.5 text-[11px] text-ink-2">
           <input
             type="checkbox"
@@ -66,27 +74,22 @@ export default function EventRail({ events, streamState = 'connecting' }) {
         </label>
       </div>
 
-      <div className="mt-3 max-h-[320px] overflow-y-auto pr-1">
+      <div className="event-list">
         {rows.length ? (
-          <ol className="space-y-1.5">
+          <ol>
             {rows.map((event, index) => {
               const view = describeEvent(event);
               return (
-                <li
-                  key={event.sequence ?? `${view.type}-${index}`}
-                  className="grid grid-cols-[64px_10px_minmax(0,1fr)] items-start gap-2 text-[11.5px]"
-                >
-                  <span className="font-mono text-[10.5px] tabular-nums text-muted">
-                    {timeOnly(event.created_at) || '—'}
-                  </span>
+                <li key={event.sequence ?? `${view.type}-${index}`} className="event-row">
+                  <span className="event-time">{timeOnly(event.created_at) || '—'}</span>
                   <span
-                    className={`mt-1.5 h-1.5 w-1.5 rounded-full ${TONE_DOT[view.tone] || TONE_DOT.muted}`}
+                    className={`event-dot ${TONE_DOT[view.tone] || TONE_DOT.muted}`}
                     aria-hidden="true"
                   />
                   <span className="min-w-0">
-                    <span className="text-ink">{view.label}</span>
+                    <span className="event-label">{view.label}</span>
                     {view.detail ? (
-                      <span className="block truncate text-[10.5px] text-muted" title={view.detail}>
+                      <span className="event-detail" title={view.detail}>
                         {view.detail}
                       </span>
                     ) : null}

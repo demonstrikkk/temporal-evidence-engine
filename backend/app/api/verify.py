@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -20,6 +21,7 @@ from app.bifrost.client import BifrostClient
 from app.core.config import RULE_VERSION, settings
 from app.core.errors import not_found, validation
 from app.verify import orchestrator
+from app.verify.freshness import freshness_index, half_life
 from app.verify.report import build_report
 from app.verify.runtime import get_store
 from app.verify.schemas import AnswerIn
@@ -34,6 +36,40 @@ _TERMINAL = {"completed", "partial", "failed"}
 
 def _store():
     return get_store()
+
+
+def _utc(value: Any) -> datetime | None:
+    """Claim timestamps arrive as datetimes from one store and ISO strings from
+    the other. Freshness must not depend on which store answered."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _freshness(claim: dict) -> dict[str, Any]:
+    """How stale the *verification* is, not how true the claim is.
+
+    The score decays with wall-clock time, so it is computed at read time rather
+    than replayed from the event that settled the claim: a value recorded at
+    100 last week would otherwise still read 100 today.
+
+    `None` means "never verified". A claim that was never checked has no
+    freshness to lose, and 0 would read as "checked and worthless".
+    """
+    volatility = claim.get("volatility_class") or "moderate"
+    last = _utc(claim.get("last_verified_at"))
+    return {
+        "freshness_index": freshness_index(volatility, last) if last else None,
+        # Sent with the claim so the UI never keeps its own copy of the
+        # half-life table and drifts from the policy the backend applies.
+        "half_life_hours": round(half_life(volatility).total_seconds() / 3600, 2),
+    }
 
 
 def _claim_view(claim: dict, evidence_count: int = 0) -> dict[str, Any]:
@@ -59,6 +95,7 @@ def _claim_view(claim: dict, evidence_count: int = 0) -> dict[str, Any]:
         "next_check_at": claim.get("next_check_at"),
         "last_verified_at": claim.get("last_verified_at"),
         "evidence_count": evidence_count,
+        **_freshness(claim),
     }
 
 
@@ -186,6 +223,10 @@ async def get_run(run_id: str) -> dict[str, Any]:
             "generated_at": (answer or {}).get("generated_at"),
             "generated_at_source": (answer or {}).get("generated_at_source"),
             "submitted_at": (answer or {}).get("submitted_at"),
+            # Which model wrote these words, when the caller recorded it. Empty
+            # is "not recorded", and the run page says so rather than guessing.
+            "model": (answer or {}).get("model") or "",
+            "provider": (answer or {}).get("provider") or "",
         },
         "claims": counts,
         "counters": _counters(claims),
@@ -299,7 +340,6 @@ async def get_claim(run_id: str, claim_id: str) -> dict[str, Any]:
         "rule": last.get("rule"),
         "explanation": last.get("explanation")
         or "No verdict has been recorded for this claim yet.",
-        "freshness_index": last.get("freshness_index"),
         "value_diff": diff,
         "evidence": views,
         "corroboration": corroboration,

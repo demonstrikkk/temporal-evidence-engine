@@ -5,10 +5,15 @@
  * key status, routing rules, budget state, recent provider failures, and cache
  * hit/miss statistics. Never presents a configured fallback as working:
  * Ollama shows unavailable when the local runtime isn't serving it.
+ *
+ * The virtual-key row reports *whether* a key is set. The value itself is not
+ * sent to the browser — this panel used to print a hardcoded string, which was
+ * a claim about configuration no endpoint had made.
  */
 import { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { formatCost } from './model.js';
+import { LedgerRow, SectionHeading } from './ui.jsx';
 
 export default function DiagnosticsPanel() {
   const [diag, setDiag] = useState(null);
@@ -19,16 +24,20 @@ export default function DiagnosticsPanel() {
     setLoading(true);
     api.governance.bifrostDiagnostic()
       .then((d) => { if (!cancelled) setDiag(d); })
+      .catch(() => { if (!cancelled) setDiag(null); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, []);
 
   if (loading) {
     return (
-      <div className="surface p-3">
-        <div className="h-5 w-32 skeleton mb-1" />
-        <div className="h-4 w-40 skeleton" />
-      </div>
+      <section className="surface px-4 py-3.5" aria-label="Bifrost diagnostics">
+        <SectionHeading>Bifrost diagnostics</SectionHeading>
+        <div className="mt-3 space-y-2">
+          <span className="skeleton block h-4 w-2/3" />
+          <span className="skeleton block h-4 w-1/2" />
+        </div>
+      </section>
     );
   }
 
@@ -37,85 +46,103 @@ export default function DiagnosticsPanel() {
   const sched = diag?.scheduler || {};
   const circuit = sched?.circuit || {};
   const limiter = sched?.limiter || {};
+  const healthy = Boolean(h.ok);
 
   return (
-    <div className="surface p-4 space-y-3" aria-label="Bifrost diagnostics">
-      <div className="flex items-center justify-between">
-        <span className="label text-[11px] text-muted uppercase tracking-wider">Bifrost diagnostics</span>
-        <span
-          className={`font-mono text-[10px] ${h.ok ? 'text-ok' : 'text-danger'}`}
+    <section className="surface px-4 py-3.5" aria-label="Bifrost diagnostics">
+      <SectionHeading
+        aside={
+          <span className={healthy ? 'text-ok' : 'text-danger'}>
+            {healthy ? 'gateway healthy' : 'gateway unhealthy'}
+          </span>
+        }
+      >
+        Bifrost diagnostics
+      </SectionHeading>
+
+      {!healthy && h.detail ? (
+        <p className="mt-2 border-l-2 border-danger/60 pl-2 font-mono text-[10px] leading-relaxed text-danger">
+          {h.detail}
+        </p>
+      ) : null}
+
+      <div className="mt-2">
+        <LedgerRow
+          label="Gateway route"
+          meta={diag?.configured ? 'configured' : 'not configured'}
+          hint={`virtual key ${diag?.configured ? 'set' : 'not set'} · models ${
+            models.length || 'none'
+          }`}
         >
-          {h.ok ? 'gateway healthy' : 'gateway unhealthy'}
-        </span>
+          <span className="block truncate font-mono text-[11px] text-ink-2" title={diag?.base_url || ''}>
+            {diag?.base_url || 'no base url reported'}
+          </span>
+        </LedgerRow>
+
+        <LedgerRow
+          label="Circuit breaker"
+          meta={circuit.state || 'unknown'}
+          hint={`${circuit.consecutive_failures ?? 0} consecutive failures · ${
+            sched?.total_scheduled ?? 0
+          } scheduled · ${sched?.total_deferred ?? 0} deferred`}
+        >
+          <span className={`block text-[11px] ${circuit.state === 'open' ? 'text-danger' : 'text-ink-2'}`}>
+            {circuit.state
+              ? circuit.state === 'open'
+                ? 'Calls are short-circuiting until the window clears.'
+                : 'Closed — calls are being attempted.'
+              : 'State was not reported.'}
+          </span>
+        </LedgerRow>
+
+        <LedgerRow
+          label="Rate limiter"
+          meta={limiter?.is_paused ? 'paused' : 'active'}
+          hint={`rpm ${limiter?.window_requests ?? 0}/${limiter?.effective_rpm ?? '—'} · tpm ${
+            limiter?.window_tokens ?? 0
+          }/${limiter?.effective_tpm ?? '—'}`}
+        >
+          <span className={`block text-[11px] ${limiter?.is_paused ? 'text-warn' : 'text-ink-2'}`}>
+            {typeof limiter?.is_paused === 'boolean'
+              ? limiter.is_paused
+                ? 'Holding requests until the window resets.'
+                : 'Within the window.'
+              : 'State was not reported.'}
+          </span>
+        </LedgerRow>
+
+        <LedgerRow
+          label="Budget"
+          meta={`${formatCost(diag?.spent_usd ?? 0)} of ${formatCost(diag?.budget_usd ?? 0)}`}
+          hint={`cache ${diag?.cache_mode || 'unknown'} · ollama ${
+            diag?.ollama_available ? 'available' : 'unavailable'
+          }`}
+        >
+          <span className="block text-[11px] text-ink-2">
+            {diag?.cache_mode
+              ? diag.cache_mode === 'off'
+                ? 'Every call reaches a provider.'
+                : 'Cached calls are reused before a provider is asked.'
+              : 'Cache mode was not reported.'}
+          </span>
+        </LedgerRow>
       </div>
 
-      <div className="grid gap-2">
-        <div className="border border-rule/30 rounded-md p-2.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-ink-2">Virtual key</span>
-            <span className="font-mono text-ink">sk-bf-tev-local-dev</span>
-          </div>
-          <div className="flex justify-between text-[9px] text-muted mt-0.5">
-            <span>Base: {diag?.base_url || '—'}</span>
-            <span>Configured: {diag?.configured ? 'yes' : 'no'}</span>
-          </div>
-        </div>
-
-        <div className="border border-rule/30 rounded-md p-2.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-ink-2">Circuit breaker</span>
-            <span
-              className={`font-mono text-[10px] ${circuit.state === 'open' ? 'text-danger' : 'text-ok'}`}
-            >
-              {circuit.state}
-            </span>
-          </div>
-          <div className="flex justify-between text-[9px] text-muted mt-0.5">
-            <span>Failures: {circuit.consecutive_failures ?? 0}</span>
-            <span>Scheduled: {sched?.total_scheduled ?? 0}</span>
-            <span>Deferred: {sched?.total_deferred ?? 0}</span>
-          </div>
-        </div>
-
-        <div className="border border-rule/30 rounded-md p-2.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-ink-2">Rate limiter</span>
-            <span className="font-mono text-ink">{limiter?.is_paused ? 'paused' : 'active'}</span>
-          </div>
-          <div className="flex justify-between text-[9px] text-muted mt-0.5">
-            <span>RPM: {limiter?.window_requests ?? 0} / {limiter?.effective_rpm ?? '—'}</span>
-            <span>TPM: {limiter?.window_tokens ?? 0} / {limiter?.effective_tpm ?? '—'}</span>
-            <span>Paused: {limiter?.is_paused ? 'yes' : 'no'}</span>
-          </div>
-        </div>
-
-        <div className="border border-rule/30 rounded-md p-2.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-ink-2">Budget</span>
-            <span className="font-mono text-ink">{formatCost(diag?.spent_usd ?? 0)} / ${diag?.budget_usd ?? 0}</span>
-          </div>
-          <div className="flex justify-between text-[9px] text-muted mt-0.5">
-            <span>Cache mode: {diag?.cache_mode || '—'}</span>
-            <span>Ollama: {diag?.ollama_available ? 'available' : 'unavailable'}</span>
-          </div>
-        </div>
-      </div>
-
-      {models.length > 0 && (
-        <div className="border border-rule/30 rounded-md p-2.5">
-          <div className="text-[10px] text-muted mb-1">Configured models</div>
-          <div className="flex flex-wrap gap-1.5">
-            {models.map((m) => (
+      {models.length ? (
+        <div className="mt-2.5 border-t border-rule pt-2.5">
+          <p className="infra-label">configured models</p>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {models.map((model) => (
               <span
-                key={m.model_id}
-                className="border border-rule/20 rounded-md px-2 py-1 text-[9px] text-ink-2 bg-paper"
+                key={model.model_id}
+                className="rounded-sm border border-rule-2 bg-paper px-1.5 py-0.5 font-mono text-[9.5px] text-ink-2"
               >
-                {m.model_id}
+                {model.model_id}
               </span>
             ))}
           </div>
         </div>
-      )}
-    </div>
+      ) : null}
+    </section>
   );
 }

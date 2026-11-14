@@ -38,9 +38,12 @@ Rules you must follow:
   version, date, name, or short phrase. Leave it empty only for pure relations.
 - "claim_type" is one of: factual, time_sensitive, stable_factual, opinion,
   prediction, ambiguous.
-- "time_sensitive" is true when the fact can change without the subject changing.
+- "time_sensitive" is true when the fact can change without the subject changing:
+  a price, a plan limit, an API, library or model version, a deprecation date, a
+  law or regulatory threshold, a leader or headcount, a ranking, or a schedule.
 - "volatility_class" is one of: ephemeral, high, moderate, low, stable.
-  Prices, availability, staffing and rankings are high or ephemeral.
+  Prices, availability, plan limits and rankings are high or ephemeral; versions,
+  laws and leadership are moderate or high; definitions and history are stable.
 - "extraction_confidence" is 0..1.
 
 The response must be a json object. Return JSON only: {"claims": [{...}]}
@@ -281,6 +284,8 @@ Rules you must follow:
 - "claim_type" is one of: factual, time_sensitive, stable_factual, opinion,
   prediction, ambiguous.
 - "volatility_class" is one of: ephemeral, high, moderate, low, stable.
+  A price, plan limit, version, law, leader or ranking is volatile; a definition
+  or a historical date is stable.
 
 The response must be a json object. Return JSON only: {"claims": [{...}]}
 Never return prose, never return a verdict, never judge the claim.

@@ -7,18 +7,35 @@
  */
 import { useState } from 'react';
 import { useClaim } from './useVerifyRun';
-import { reasonLabel, shortDate, shortUrl, statusMeta, timeOnly } from './model.js';
+import {
+  freshnessTone,
+  freshnessWord,
+  halfLifeLabel,
+  reasonLabel,
+  shortDate,
+  shortUrl,
+  statusMeta,
+  timeOnly,
+} from './model.js';
 import {
   CopyButton,
-  DateRow,
   Empty,
+  FreshnessMeter,
   SectionHeading,
   SkeletonBlock,
-  StatusPill,
   TabPanel,
   Tabs,
 } from './ui.jsx';
 import ProofGraph from './ProofGraph.jsx';
+
+/* The stamp inherits its colour from the verdict tone; `changed` is amber, not
+   green, and the border is drawn by the component so the two never diverge. */
+const STAMP = {
+  ok: 'border-ok text-ok bg-ok-soft',
+  info: 'border-info text-info bg-info-soft',
+  danger: 'border-danger text-danger bg-danger-soft',
+  muted: 'border-rule-2 text-muted bg-warm/60',
+};
 
 function eventStatusLabel(status) {
   if (status === 'explicit') return 'stated in source';
@@ -33,7 +50,7 @@ function SettlementBadge({ status, reason }) {
   const settled = status === 'accepted';
   return (
     <span
-      className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${
+      className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.08em] ${
         settled
           ? 'border-ok/30 bg-ok-soft text-ok'
           : 'border-warn/30 bg-warn-soft text-warn'
@@ -51,20 +68,25 @@ function ValueChange({ claim }) {
   const from = claim.object_raw;
   const to = claim.evidence?.find((row) => row.candidate_value_raw)?.candidate_value_raw;
   return (
-    <section className="surface-inset p-3">
-      <p className="eyebrow">Replacement</p>
-      <div className="mt-1.5 flex flex-wrap items-baseline gap-2 font-mono text-[13px]">
-        <span className="text-muted line-through decoration-danger/50">{from || '—'}</span>
-        <span className="text-muted" aria-hidden="true">
+    <section className="replacement" aria-label="Replacement value">
+      <p className="case-sub">
+        Replacement
+        <b>
+          {Object.keys(diff).length} field{Object.keys(diff).length === 1 ? '' : 's'} moved
+        </b>
+      </p>
+      <div className="replacement-values">
+        <span className="replacement-from">{from || '—'}</span>
+        <span className="replacement-arrow" aria-hidden="true">
           →
         </span>
-        <span className="font-medium text-info">{to || '—'}</span>
+        <span className="replacement-to">{to || '—'}</span>
       </div>
-      <dl className="mt-2 space-y-1">
+      <dl className="replacement-diff">
         {Object.entries(diff).map(([field, change]) => (
-          <div key={field} className="flex items-baseline gap-2 text-[11px]">
-            <dt className="w-24 shrink-0 text-muted">{field}</dt>
-            <dd className="font-mono text-ink-2">
+          <div key={field}>
+            <dt>{field}</dt>
+            <dd>
               {String(change.from ?? '—')} → {String(change.to ?? '—')}
             </dd>
           </div>
@@ -75,20 +97,25 @@ function ValueChange({ claim }) {
 }
 
 function EvidenceCard({ item, index, answerGeneratedAt }) {
-  const publication = shortDate(item.published_date);
   const event = shortDate(item.event_date);
   const missingEvent = !item.event_date;
+  const retrieved = item.retrieved_at
+    ? `${shortDate(item.retrieved_at)} ${timeOnly(item.retrieved_at)}`
+    : '—';
+  const generated = answerGeneratedAt
+    ? `${shortDate(answerGeneratedAt)} ${timeOnly(answerGeneratedAt)}`
+    : 'unknown';
+
   return (
-    <article className="rounded-sm border border-rule bg-paper-3/60">
-      <header className="flex items-start justify-between gap-2 border-b border-rule/70 px-3 py-2">
+    <article className="evidence-card">
+      <header className="evidence-head">
         <div className="min-w-0">
-          <p className="flex items-center gap-1.5 text-[10.5px] uppercase tracking-[0.1em] text-muted">
-            <span className="font-mono">E{index + 1}</span>
-            <span aria-hidden="true">·</span>
-            <span className="truncate">{item.publisher || shortUrl(item.source_url, 30)}</span>
+          <p className="evidence-id">
+            evidence {String(index + 1).padStart(2, '0')}
+            {item.publisher ? ` · ${item.publisher}` : item.source_url ? ` · ${shortUrl(item.source_url, 26)}` : ''}
           </p>
           <a
-            className="mt-0.5 block truncate text-[12px] text-ink hover:text-accent"
+            className="evidence-title"
             href={item.source_url}
             target="_blank"
             rel="noreferrer noopener"
@@ -100,64 +127,98 @@ function EvidenceCard({ item, index, answerGeneratedAt }) {
         <SettlementBadge status={item.settlement_status} reason={item.settlement_reason} />
       </header>
 
-      <div className="px-3 py-2.5">
-        {item.quote_text ? (
-          <blockquote className="border-l-2 border-accent/40 pl-2.5">
-            <p className="whitespace-pre-wrap text-[12.5px] leading-relaxed text-ink-2">
-              <mark className="proof">{item.quote_text}</mark>
-            </p>
-          </blockquote>
-        ) : (
-          <p className="text-[11.5px] text-muted">No quote was recorded for this source.</p>
-        )}
+      {item.quote_text ? (
+        <blockquote className="evidence-quote">
+          <mark className="proof">{item.quote_text}</mark>
+        </blockquote>
+      ) : (
+        <p className="evidence-quote missing">No quote was recorded for this source.</p>
+      )}
 
-        {item.settlement_reason ? (
-          <p className="mt-2 text-[11px] leading-snug text-warn">
-            <span className="font-medium">Settlement:</span> {item.settlement_reason}
-          </p>
-        ) : null}
-
-        <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] text-muted">
-          <span>
-            Proposed: <span className="font-mono text-ink-2">{item.relationship_proposed || '—'}</span>
+      {item.settlement_reason ? (
+        <p className="evidence-meta">
+          <span className="text-warn">
+            settlement · <b>{item.settlement_reason}</b>
           </span>
-          {item.candidate_value_raw ? (
-            <span>
-              Replacement:{' '}
-              <span className="font-mono text-info">{item.candidate_value_raw}</span>
-            </span>
-          ) : null}
-          {item.extraction_method ? <span>{item.extraction_method.replaceAll('_', ' ')}</span> : null}
-        </div>
-      </div>
+        </p>
+      ) : null}
 
-      <div className="border-t border-rule/70 px-3 py-2">
-        <DateRow
-          label="Event date"
-          value={missingEvent ? 'missing' : event}
-          tone={missingEvent ? 'text-warn' : 'text-ink-2'}
-          title={
-            item.event_date_quote
-              ? `“${item.event_date_quote}” — ${eventStatusLabel(item.event_date_status)}`
-              : eventStatusLabel(item.event_date_status)
-          }
-        />
-        <DateRow
-          label="Published"
-          value={publication}
-          title={item.published_date_source ? `source: ${item.published_date_source}` : undefined}
-        />
-        <DateRow
-          label="Retrieved"
-          value={item.retrieved_at ? `${shortDate(item.retrieved_at)} ${timeOnly(item.retrieved_at)}` : '—'}
-        />
-        <DateRow
-          label="Answer generated"
-          value={answerGeneratedAt ? `${shortDate(answerGeneratedAt)} ${timeOnly(answerGeneratedAt)}` : 'unknown'}
-          tone={answerGeneratedAt ? '' : 'text-warn'}
-        />
-      </div>
+      <p className="evidence-meta">
+        <span>
+          proposed <b>{item.relationship_proposed || '—'}</b>
+        </span>
+        {item.candidate_value_raw ? (
+          <span>
+            replacement <b className="text-ember-deep">{item.candidate_value_raw}</b>
+          </span>
+        ) : null}
+        {item.extraction_method ? <span>{item.extraction_method.replaceAll('_', ' ')}</span> : null}
+      </p>
+
+      <dl className="date-grid">
+        <div>
+          <dt>event date</dt>
+          <dd
+            className={missingEvent ? 'missing' : ''}
+            title={
+              item.event_date_quote
+                ? `“${item.event_date_quote}” — ${eventStatusLabel(item.event_date_status)}`
+                : eventStatusLabel(item.event_date_status)
+            }
+          >
+            {missingEvent ? 'missing' : event}
+          </dd>
+        </div>
+        <div>
+          <dt>published</dt>
+          <dd title={item.published_date_source ? `source: ${item.published_date_source}` : undefined}>
+            {shortDate(item.published_date)}
+          </dd>
+        </div>
+        <div>
+          <dt>retrieved</dt>
+          <dd>{retrieved}</dd>
+        </div>
+        <div>
+          <dt>answer generated</dt>
+          <dd className={answerGeneratedAt ? '' : 'missing'}>{generated}</dd>
+        </div>
+      </dl>
     </article>
+  );
+}
+
+function Freshness({ claim }) {
+  const index = claim.freshness_index;
+  const scored = index !== null && index !== undefined;
+  const tone = freshnessTone(index);
+  const lastVerified = claim.last_verified_at;
+
+  return (
+    <section className="freshness" aria-label="Freshness">
+      <p className="case-sub">
+        Freshness
+        <b className={`fresh-word tone-${tone}`}>
+          {freshnessWord(index)}
+          {scored ? <span className="fresh-scale"> / 100</span> : null}
+        </b>
+      </p>
+      <div className="mt-1.5 flex items-center gap-2.5">
+        <FreshnessMeter index={scored ? index : null} />
+        <span className="fresh-note">
+          half-life {halfLifeLabel(claim.half_life_hours)} · {claim.volatility_class || 'unclassified'}
+        </span>
+      </div>
+      <p className="fresh-note mt-1.5">
+        {scored
+          ? `last verified ${shortDate(lastVerified)}`
+          : 'This claim was never settled against a source, so there is no verification age to score.'}
+      </p>
+      <p className="fresh-caveat">
+        Freshness is the age of the last verification. It is not a probability that the claim is
+        true.
+      </p>
+    </section>
   );
 }
 
@@ -176,15 +237,15 @@ function Corroboration({ data }) {
   ].filter(([tier]) => Number(tiers[tier] || 0) > 0);
 
   return (
-    <section className="surface-inset p-3" aria-label="Source corroboration">
-      <div className="flex items-center justify-between gap-2">
-        <p className="eyebrow">Corroboration</p>
-        <span className={`font-mono text-[10px] ${syndicated ? 'text-warn' : 'text-ok'}`}>
+    <section aria-label="Source corroboration">
+      <p className="case-sub">
+        Corroboration
+        <b className={syndicated ? 'text-warn' : 'text-ok'}>
           {independence.independent_origins}{' '}
           {independence.independent_origins === 1 ? 'independent origin' : 'independent origins'}
-        </span>
-      </div>
-      <p className="mt-1 text-[11px] leading-snug text-ink-2">
+        </b>
+      </p>
+      <p className="mt-1.5 text-[11px] leading-snug text-ink-2">
         {independence.source_count}{' '}
         {independence.source_count === 1 ? 'source' : 'sources'} · effective corroboration{' '}
         <span className="font-mono">{independence.effective_corroboration}</span>
@@ -195,13 +256,11 @@ function Corroboration({ data }) {
           : ''}
       </p>
       {syndicated ? (
-        <p className="mt-1 text-[10.5px] leading-snug text-warn">
-          {independence.note}
-        </p>
+        <p className="mt-1 text-[10.5px] leading-snug text-warn">{independence.note}</p>
       ) : null}
       {tierRows.length ? (
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          <span className="text-[10px] text-muted">Authority</span>
+          <span className="font-mono text-[9px] uppercase tracking-[0.1em] text-muted">authority</span>
           {tierRows.map(([tier, cls]) => (
             <span
               key={tier}
@@ -215,9 +274,7 @@ function Corroboration({ data }) {
             </span>
           ))}
           {Number(quality.official_sources || 0) > 0 ? (
-            <span className="text-[10px] text-muted">
-              {quality.official_sources} official
-            </span>
+            <span className="text-[10px] text-muted">{quality.official_sources} official</span>
           ) : null}
           {Number(quality.first_party_sources || 0) > 0 ? (
             <span className="text-[10px] text-muted">
@@ -270,44 +327,50 @@ export default function ClaimInspector({ runId, claimId, answerGeneratedAt, vers
   const evidence = claim.evidence || [];
 
   return (
-    <div className="surface overflow-hidden" aria-live="polite">
-      <div className="border-b border-rule px-4 py-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <StatusPill status={claim.status} />
-          <span className="font-mono text-[10.5px] text-muted">{claim.reason_code || 'pending'}</span>
-          {claim.rule ? (
-            <span className="ml-auto rounded-xs border border-rule-2 bg-warm/60 px-1.5 py-0.5 font-mono text-[10px] text-ink-2">
-              {claim.rule}
-            </span>
-          ) : null}
+    <div className="case-panel overflow-hidden" aria-live="polite">
+      <header className="case-panel-head">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="case-note">
+              claim {String((claim.ordinal ?? 0) + 1).padStart(2, '0')} ·{' '}
+              {claim.time_sensitive ? 'time-sensitive · ' : ''}
+              {claim.volatility_class || 'unclassified'}
+              {claim.rule ? ` · rule ${claim.rule}` : ''}
+            </p>
+            <h2 className="case-claim">{claim.claim_text}</h2>
+          </div>
+          <span className={`case-stamp ${STAMP[meta.tone] || STAMP.muted}`}>
+            <span className="case-stamp-word">{meta.label}</span>
+            <code>{claim.reason_code || 'pending'}</code>
+          </span>
         </div>
-        <p className="mt-2 font-display text-[17px] leading-snug text-ink">{claim.claim_text}</p>
-        <p className="mt-2 text-[12px] leading-relaxed text-ink-2">
-          {claim.explanation || meta.note}
-        </p>
-        <p className="mt-1.5 text-[10.5px] text-muted">{meta.note}</p>
-      </div>
+        <p className="case-why">{claim.explanation || meta.note}</p>
+        {/* The rule note is a restatement of what the verdict means. When the
+            stored explanation already says it, printing both is noise. */}
+        {claim.explanation && !claim.explanation.includes(meta.note) ? (
+          <p className="case-note">{meta.note}</p>
+        ) : null}
+      </header>
 
-      <div className="space-y-4 px-4 py-3">
-        <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted">
-          {claim.subject ? (
-            <span>
-              subject <span className="text-ink-2">{claim.subject}</span>
-            </span>
-          ) : null}
-          {claim.predicate ? (
-            <span>
-              predicate <span className="text-ink-2">{claim.predicate}</span>
-            </span>
-          ) : null}
-          {claim.object_raw ? (
-            <span>
-              value <span className="font-mono text-ink-2">{claim.object_raw}</span>
-            </span>
-          ) : null}
+      <dl className="claim-facts">
+        <div>
+          <dt>subject</dt>
+          <dd>{claim.subject || '—'}</dd>
         </div>
+        <div>
+          <dt>predicate</dt>
+          <dd>{claim.predicate || '—'}</dd>
+        </div>
+        <div>
+          <dt>value asserted</dt>
+          <dd className="mono">{claim.object_raw || '—'}</dd>
+        </div>
+      </dl>
 
+      <div className="case-body">
         {claim.status === 'changed' ? <ValueChange claim={claim} /> : null}
+
+        <Freshness claim={claim} />
 
         <Corroboration data={claim.corroboration} />
 
@@ -318,7 +381,7 @@ export default function ClaimInspector({ runId, claimId, answerGeneratedAt, vers
             onChange={setTab}
             tabs={[
               { id: 'evidence', label: 'Evidence', count: evidence.length },
-              { id: 'proof', label: 'Proof Graph', count: evidence.length },
+              { id: 'proof', label: 'Proof graph', count: evidence.length },
               { id: 'history', label: 'History', count: (claim.timeline || []).length },
             ]}
           />
@@ -348,21 +411,18 @@ export default function ClaimInspector({ runId, claimId, answerGeneratedAt, vers
             </TabPanel>
 
             <TabPanel id="history" active={tab === 'history'}>
-              <ol className="space-y-2">
+              <ol>
                 {(claim.timeline || []).map((row, index) => (
-                  <li
-                    key={index}
-                    className="flex items-baseline justify-between gap-3 border-b border-rule/60 pb-2 text-[11.5px] last:border-0"
-                  >
+                  <li key={index} className="line-row">
                     <span className="min-w-0">
-                      <span className="text-ink-2">
+                      <span className="font-mono text-[10.5px] text-ink-2">
                         {row.previous_status || 'pending'} → {row.status}
                       </span>
                       <span className="ml-2 text-[10.5px] text-muted">
                         {reasonLabel(row.reason_code)}
                       </span>
                     </span>
-                    <span className="shrink-0 font-mono text-[10.5px] text-muted">
+                    <span className="shrink-0 font-mono text-[10px] text-muted">
                       {shortDate(row.decided_at)} {timeOnly(row.decided_at)}
                     </span>
                   </li>
@@ -375,19 +435,16 @@ export default function ClaimInspector({ runId, claimId, answerGeneratedAt, vers
               {(claim.assertions || []).length ? (
                 <div className="mt-4">
                   <SectionHeading>Value over time</SectionHeading>
-                  <ul className="mt-2 space-y-1.5">
+                  <ul className="mt-2">
                     {claim.assertions.map((row) => (
-                      <li
-                        key={row.id}
-                        className="flex items-baseline justify-between gap-3 text-[11.5px]"
-                      >
+                      <li key={row.id} className="line-row">
                         <span className="min-w-0">
                           <span className="font-mono text-ink-2">{row.value_raw || '—'}</span>
                           <span className="ml-2 text-[10.5px] text-muted">
                             {row.is_original ? 'original' : 'replacement'}
                           </span>
                         </span>
-                        <span className="shrink-0 font-mono text-[10.5px] text-muted">
+                        <span className="shrink-0 font-mono text-[10px] text-muted">
                           from {shortDate(row.valid_from)}
                         </span>
                       </li>
@@ -398,14 +455,16 @@ export default function ClaimInspector({ runId, claimId, answerGeneratedAt, vers
             </TabPanel>
           </div>
         </div>
-
-        <div className="flex items-center justify-between gap-2 border-t border-rule pt-3">
-          <span className="text-[10.5px] text-muted">
-            {claim.next_check_at ? `next recommended check ${shortDate(claim.next_check_at)}` : 'no recheck scheduled'}
-          </span>
-          <CopyButton text={claim.claim_text} label="Copy claim" />
-        </div>
       </div>
+
+      <footer className="case-foot">
+        <span>
+          {claim.next_check_at
+            ? `next recommended check ${shortDate(claim.next_check_at)}`
+            : 'no recheck scheduled'}
+        </span>
+        <CopyButton text={claim.claim_text} label="Copy claim" />
+      </footer>
     </div>
   );
 }

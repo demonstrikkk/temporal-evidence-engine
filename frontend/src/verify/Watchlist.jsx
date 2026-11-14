@@ -8,7 +8,15 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import { ago, reasonLabel, shortDate } from './model.js';
-import { Empty, SectionHeading, SkeletonBlock, StatusPill } from './ui.jsx';
+import { Empty, SkeletonBlock, StatusPill } from './ui.jsx';
+
+const RAIL = {
+  supported: 'bg-ok',
+  changed: 'bg-info',
+  contradicted: 'bg-danger',
+  unverifiable: 'bg-muted',
+  pending: 'bg-rule-2',
+};
 
 function bucket(nextCheckAt) {
   if (!nextCheckAt) return 'unscheduled';
@@ -24,25 +32,21 @@ const GROUPS = [
     id: 'due',
     label: 'Due now',
     hint: 'The recommended recheck time has passed.',
-    tone: 'warn',
   },
   {
     id: 'soon',
     label: 'Due within a week',
     hint: 'High-volatility claims come round quickly.',
-    tone: 'muted',
   },
   {
     id: 'scheduled',
     label: 'Later',
     hint: 'Stable facts are rechecked less often.',
-    tone: 'muted',
   },
   {
     id: 'unscheduled',
     label: 'No recheck scheduled',
     hint: 'The claim has no volatility class, so no interval was assigned.',
-    tone: 'muted',
   },
 ];
 
@@ -51,23 +55,28 @@ function Row({ claim }) {
     <li>
       <Link
         to={`/runs/${claim.run_id}${claim.id ? `?claim=${claim.id}` : ''}`}
-        className="row grid gap-2 px-4 py-2.5 sm:grid-cols-[minmax(0,1fr)_132px_140px] sm:items-center"
+        className="watch-row"
       >
+        <span
+          className={`watch-rail ${RAIL[claim.status] || RAIL.pending}`}
+          aria-hidden="true"
+        />
         <span className="min-w-0">
-          <span className="block text-[12.5px] leading-snug text-ink">{claim.claim_text}</span>
-          <span className="mt-0.5 block text-[10.5px] text-muted">
-            {reasonLabel(claim.reason_code)}
-            {claim.volatility_class ? ` · ${claim.volatility_class}` : ''}
+          <span className="watch-text">{claim.claim_text}</span>
+          <span className="watch-meta">
+            <span className="truncate">{reasonLabel(claim.reason_code)}</span>
+            {claim.volatility_class ? <span>· {claim.volatility_class}</span> : null}
+            {claim.run_id ? <span>· run {String(claim.run_id).slice(0, 8)}</span> : null}
           </span>
         </span>
-        <span>
+        <span className="watch-status">
           <StatusPill status={claim.status} size="sm" />
         </span>
-        <span className="text-[10.5px] text-muted">
+        <span className="watch-when">
           {claim.next_check_at ? (
             <>
-              check {shortDate(claim.next_check_at)}
-              <span className="ml-1.5 opacity-80">{ago(claim.next_check_at)}</span>
+              <span>check {shortDate(claim.next_check_at)}</span>
+              <em>{ago(claim.next_check_at)}</em>
             </>
           ) : (
             'not scheduled'
@@ -108,15 +117,22 @@ export default function Watchlist() {
   }, [rows]);
 
   return (
-    <div className="space-y-5 animate-fade-up">
-      <div>
-        <p className="eyebrow">Recheck</p>
-        <h1 className="mt-1 font-display text-[28px] text-ink">Watchlist</h1>
-        <p className="mt-1 max-w-2xl text-[12.5px] leading-relaxed text-muted">
-          {note || 'Recommendations only. This product does not run a scheduler.'} A claim’s interval
-          comes from its volatility class — a price moves faster than a founding date.
+    <div className="animate-fade-up space-y-6">
+      <header className="page-head">
+        <div>
+          <p className="eyebrow">Recheck</p>
+          <h1 className="page-title">Watchlist</h1>
+          <p className="page-lede">
+            {note || 'Recommendations only. This product does not run a scheduler.'} A claim’s
+            interval comes from its volatility class — a price moves faster than a founding date.
+          </p>
+        </div>
+        <p className="case-crumb hidden lg:flex">
+          <span>{rows.length}</span>
+          <span aria-hidden="true">·</span>
+          <span>claim{rows.length === 1 ? '' : 's'} on watch</span>
         </p>
-      </div>
+      </header>
 
       {loading && !rows.length ? (
         <div className="surface p-4">
@@ -135,27 +151,41 @@ export default function Watchlist() {
           </Empty>
         </div>
       ) : (
-        <div className="space-y-5">
-          {GROUPS.map((group) => {
-            const items = grouped[group.id];
-            if (!items.length) return null;
-            return (
-              <section key={group.id} className="surface overflow-hidden">
-                <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-rule px-4 py-2.5">
-                  <SectionHeading aside={`${items.length} claim${items.length === 1 ? '' : 's'}`}>
-                    {group.label}
-                  </SectionHeading>
-                  <p className="text-[10.5px] text-muted">{group.hint}</p>
-                </div>
-                <ul className="divide-y divide-rule/70">
-                  {items.map((claim) => (
-                    <Row key={`${claim.run_id}-${claim.id}`} claim={claim} />
-                  ))}
-                </ul>
-              </section>
-            );
-          })}
-        </div>
+        <>
+          <dl className="strip-stats" aria-label="Watchlist totals">
+            {GROUPS.map((group) => (
+              <div key={group.id}>
+                <dt>{group.label}</dt>
+                <dd>{grouped[group.id].length}</dd>
+              </div>
+            ))}
+          </dl>
+
+          <div className="space-y-6">
+            {GROUPS.map((group) => {
+              const items = grouped[group.id];
+              if (!items.length) return null;
+              return (
+                <section key={group.id} className="watch-group" aria-label={group.label}>
+                  <div className="watch-group-head">
+                    <div>
+                      <h2 className="watch-group-title">{group.label}</h2>
+                      <p className="watch-hint mt-1">{group.hint}</p>
+                    </div>
+                    <span className="watch-count">
+                      {items.length} claim{items.length === 1 ? '' : 's'}
+                    </span>
+                  </div>
+                  <ul>
+                    {items.map((claim) => (
+                      <Row key={`${claim.run_id}-${claim.id}`} claim={claim} />
+                    ))}
+                  </ul>
+                </section>
+              );
+            })}
+          </div>
+        </>
       )}
     </div>
   );

@@ -473,6 +473,34 @@ export const api = {
     watchlist: (o) => request('/verify/watchlist', o),
   },
 
+  /* --- model comparison -------------------------------------------------
+   *
+   * Read-only: a matrix of recorded calls and verdict mixes. It writes nothing
+   * and starts no run, so a page refresh can never cost money.
+   */
+  compare: {
+    models: (o) => request('/compare/models', { ...o }),
+  },
+
+  /* --- playground -------------------------------------------------------
+   *
+   * The one route family where the operator's own model is not involved: the
+   * caller supplies the endpoint and the key, and the backend writes nothing.
+   * The timeout is long because a local model on a laptop is slow and a tool
+   * loop is two or three round trips; the default 45s would abort an answer
+   * that was still being written.
+   */
+  playground: {
+    presets: (o) => request('/playground/presets', { ...o, timeout: o?.timeout ?? 10_000 }),
+    chat: (body, o) =>
+      request('/playground/chat', {
+        ...o,
+        method: 'POST',
+        body,
+        timeout: o?.timeout ?? 180_000,
+      }),
+  },
+
   /* --- conversational research ------------------------------------------ */
   chat: {
     conversations: (o) => request('/chat/conversations', o),

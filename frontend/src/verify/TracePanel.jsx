@@ -1,10 +1,16 @@
 /**
- * The run as a tree, with the price attached to each branch.
+ * The run as a clock, with the price attached to each span.
  *
- * The event rail answers "what happened, in order". This panel answers the two
- * questions the rail cannot: which stage spent the tokens, and what a span
- * actually did. It is a projection of the same rows — every span names the
- * audit event that reports it — so the two cannot disagree.
+ * The event rail answers "what happened, in order". This panel answers the
+ * questions the rail cannot: what was slow, what ran at the same time, which
+ * stage spent the tokens, and what a span actually did. It is a projection of
+ * the same rows — every span names the audit event that reports it — so the two
+ * cannot disagree.
+ *
+ * Bars are placed on the run's own clock (`started_at`/`ended_at`), not on the
+ * order rows arrived. A zero-length span is a hairline rather than a widened
+ * bar, because a bar that is widened to be visible would claim work that did
+ * not happen.
  *
  * Cost is split rather than summed. A gateway bill and a catalogue estimate are
  * different kinds of number, and adding them produces one number that is
@@ -19,11 +25,15 @@ import {
   countSpans,
   flattenTrace,
   formatDuration,
+  formatOffset,
   formatTokens,
+  slowestSpan,
   spanCost,
   spanDetail,
   spanLabel,
   spanTone,
+  traceWindow,
+  waterfallRows,
 } from './traceModel.js';
 import { SectionHeading, SkeletonBlock } from './ui.jsx';
 
@@ -75,44 +85,136 @@ function StageRow({ bucket }) {
   );
 }
 
-function SpanRow({ row }) {
+/** What the span did, in the order an auditor asks for it. */
+function SpanFacts({ row }) {
+  const cost = spanCost(row);
+  const facts = [
+    ['stage', row.stage],
+    ['operation', row.operation],
+    ['started', row.started_at ? formatOffset(row.offsetMs) : '—'],
+    ['duration', formatDuration(row.durationMs ?? row.latency_ms)],
+    [
+      'model',
+      row.requested_model && row.resolved_model && row.requested_model !== row.resolved_model
+        ? `${row.requested_model} → ${row.resolved_model}`
+        : row.resolved_model || row.requested_model || '—',
+    ],
+    ['provider', row.provider || '—'],
+    [
+      'tokens',
+      Number(row.input_tokens) || Number(row.output_tokens)
+        ? `${formatTokens(row.input_tokens)} in · ${formatTokens(row.output_tokens)} out`
+        : 'not recorded',
+    ],
+    ['cost', cost.priced ? `${formatCost(cost.value)} (${row.cost_source})` : 'unpriced'],
+    ['cache', row.cache_status || '—'],
+    ['prompt', row.prompt_version || '—'],
+    ['tool', row.tool_name || '—'],
+    ['error', row.error_type || '—'],
+    ['decision', row.decision_result || '—'],
+  ];
+  const args = row.tool_arguments && Object.keys(row.tool_arguments).length
+    ? JSON.stringify(row.tool_arguments)
+    : '';
+  return (
+    <div className="trace-facts">
+      <dl>
+        {facts.map(([label, value]) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd title={String(value)}>{String(value)}</dd>
+          </div>
+        ))}
+      </dl>
+      {args ? <p className="trace-args">{args}</p> : null}
+      {row.claim_id ? (
+        <p className="trace-args">claim {String(row.claim_id).slice(0, 8)}</p>
+      ) : null}
+    </div>
+  );
+}
+
+function SpanBar({ row, expanded, onToggle }) {
   const tone = spanTone(row, { context: row.context });
   const detail = spanDetail(row);
   const cost = spanCost(row);
+  const width = row.widthPct === null ? null : Math.max(0, row.widthPct);
+  const barTitle = [
+    spanLabel(row),
+    row.stage,
+    row.started_at ? `starts ${formatOffset(row.offsetMs)}` : 'start not recorded',
+    `lasts ${formatDuration(row.durationMs ?? row.latency_ms)}`,
+    cost.priced ? formatCost(cost.value) : 'unpriced',
+    row.error_type ? `error: ${row.error_type}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
   return (
     <li
-      className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 py-1.5"
-      style={{ paddingLeft: `${Math.min(row.depth, 6) * 13}px` }}
+      className={`trace-row${expanded ? ' is-open' : ''}${row.context ? ' is-context' : ''}`}
+      data-tone={tone}
     >
-      <span className="min-w-0">
-        <span className="flex items-baseline gap-1.5">
-          <span
-            className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${TONE_DOT[tone]}`}
-            aria-hidden="true"
-          />
-          <span className={`text-[11.5px] ${row.context ? 'text-muted' : 'text-ink'}`}>
-            {spanLabel(row)}
-          </span>
-          <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted">
-            {row.stage}
+      <button
+        type="button"
+        className="trace-row-btn"
+        aria-expanded={expanded}
+        onClick={onToggle}
+      >
+        <span className="trace-lab" style={{ paddingLeft: `${Math.min(row.depth, 5) * 11}px` }}>
+          <span className={`trace-dot ${TONE_DOT[tone]}`} aria-hidden="true" />
+          <span className="trace-name">
+            <span className="trace-op">{spanLabel(row)}</span>
+            <span className="trace-stage">{row.stage}</span>
+            {detail ? (
+              <span className="trace-detail" title={detail}>
+                {detail}
+              </span>
+            ) : null}
           </span>
         </span>
-        {detail ? (
-          <span
-            className="mt-0.5 block truncate pl-3 text-[10.5px] text-muted"
-            title={detail}
-          >
-            {detail}
-          </span>
-        ) : null}
-      </span>
-      <span className="text-right font-mono text-[10.5px] leading-relaxed tabular-nums text-muted">
-        <span className="block text-ink-2">
-          {cost.priced ? formatCost(cost.value) : '—'}
+
+        <span className="trace-track" title={barTitle} aria-hidden="true">
+          {width === null ? (
+            <span className="trace-nobar">no clock</span>
+          ) : (
+            <span
+              className="trace-bar"
+              data-stage={row.stage}
+              style={{ left: `${row.startPct}%`, width: `${width}%` }}
+            />
+          )}
         </span>
-        <span className="block">{formatDuration(row.latency_ms)}</span>
-      </span>
+
+        <span className="trace-nums">
+          <span className="trace-dur">{formatDuration(row.durationMs ?? row.latency_ms)}</span>
+          <span className="trace-money">{cost.priced ? formatCost(cost.value) : '—'}</span>
+        </span>
+      </button>
+      {expanded ? <SpanFacts row={row} /> : null}
     </li>
+  );
+}
+
+function Axis({ window: win }) {
+  const ticks = [0, 25, 50, 75, 100];
+  if (!win?.totalMs) return null;
+  return (
+    <div className="trace-axis" aria-hidden="true">
+      <span className="trace-axis-gutter" />
+      <div className="trace-axis-track">
+        {ticks.map((pct) => (
+          <span
+            key={pct}
+            className="trace-tick"
+            style={{ left: `${pct}%` }}
+          >
+            {pct === 0 ? '0s' : formatDuration((win.totalMs * pct) / 100)}
+          </span>
+        ))}
+      </div>
+      <span className="trace-axis-gutter" />
+    </div>
   );
 }
 
@@ -120,6 +222,7 @@ export default function TracePanel({ runId, live }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [filter, setFilter] = useState('all');
+  const [openId, setOpenId] = useState(null);
 
   useEffect(() => {
     let alive = true;
@@ -148,6 +251,14 @@ export default function TracePanel({ runId, live }) {
     () => flattenTrace(data?.tree, filter),
     [data?.tree, filter],
   );
+  // The axis is measured over every span, so filtering a chart never rescales
+  // the bars that remain. A bar whose length changed because of a filter would
+  // be a chart that lies about the run.
+  const allRows = useMemo(() => flattenTrace(data?.tree, 'all'), [data?.tree]);
+  const win = useMemo(() => traceWindow(allRows), [allRows]);
+  const bars = useMemo(() => waterfallRows(rows, win), [rows, win]);
+  const slowest = useMemo(() => slowestSpan(allRows, win), [allRows, win]);
+
   // One pass per filter rather than one per render: the chips show how much
   // each view holds, and recomputing that on every render is work nobody asked
   // for.
@@ -200,7 +311,12 @@ export default function TracePanel({ runId, live }) {
         Execution trace
       </SectionHeading>
 
-      <div className="mt-3 grid grid-cols-2 gap-4 border-y border-rule py-3 sm:grid-cols-4">
+      <div className="mt-3 grid grid-cols-2 gap-3 border-y border-rule py-3 sm:grid-cols-3 lg:grid-cols-5">
+        <Stat
+          label="Wall clock"
+          value={win ? formatDuration(win.totalMs) : '—'}
+          detail={win ? 'first start to last end' : 'no span clock recorded'}
+        />
         <Stat
           label="Billed"
           value={
@@ -237,41 +353,15 @@ export default function TracePanel({ runId, live }) {
         />
       </div>
 
-      {summary.stages?.length > 1 ? (
-        <div className="mt-3 overflow-x-auto">
-          <table className="w-full min-w-[420px] text-[11px]">
-            <caption className="sr-only">
-              Tokens, cost and errors per stage of this run
-            </caption>
-            <thead>
-              <tr className="border-b border-rule text-[10px] uppercase tracking-[0.1em] text-muted">
-                <th scope="col" className="pb-1 pr-2 text-left font-normal">
-                  Stage
-                </th>
-                <th scope="col" className="pb-1 pr-2 text-right font-normal">
-                  Spans
-                </th>
-                <th scope="col" className="pb-1 pr-2 text-right font-normal">
-                  Tokens
-                </th>
-                <th scope="col" className="pb-1 pr-2 text-right font-normal">
-                  Billed
-                </th>
-                <th scope="col" className="pb-1 pr-2 text-right font-normal">
-                  Est.
-                </th>
-                <th scope="col" className="pb-1 text-right font-normal">
-                  Err
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {summary.stages.map((bucket) => (
-                <StageRow key={bucket.stage} bucket={bucket} />
-              ))}
-            </tbody>
-          </table>
-        </div>
+      {slowest ? (
+        <p className="mt-2.5 text-[11px] text-muted">
+          Slowest step{' '}
+          <span className="text-ink-2">{spanLabel(slowest)}</span>{' '}
+          <span className="font-mono">{formatDuration(slowest.durationMs)}</span>
+          {slowest.share ? (
+            <span className="font-mono"> · {Math.round(slowest.share * 100)}% of wall clock</span>
+          ) : null}
+        </p>
       ) : null}
 
       <div className="mt-3 flex flex-wrap items-center gap-1.5">
@@ -296,26 +386,118 @@ export default function TracePanel({ runId, live }) {
           );
         })}
         <span className="ml-auto text-[10.5px] text-muted">
-          {rows.length}
-          {filter === 'all' ? '' : ` of ${counts.all?.total ?? rows.length}`} shown
+          {bars.length}
+          {filter === 'all' ? '' : ` of ${counts.all?.total ?? bars.length}`} shown
+          {win ? ' · click a row for its receipt' : ''}
         </span>
       </div>
 
-      <ol className="mt-2 border-t border-rule pt-1">
-        {rows.length ? (
-          rows.map((row) => <SpanRow key={row.id || `${row.ordinal}-${row.depth}`} row={row} />)
-        ) : (
-          <li className="py-4 text-center text-[11.5px] text-muted">
-            No span in this run matched that filter.
-          </li>
-        )}
-      </ol>
+      {win ? (
+        <div className="trace-flow">
+          <Axis window={win} />
+          <ol className="trace-list">
+            {bars.length ? (
+              bars.map((row) => (
+                <SpanBar
+                  key={row.id || `${row.ordinal}-${row.depth}`}
+                  row={row}
+                  expanded={openId === (row.id || `${row.ordinal}-${row.depth}`)}
+                  onToggle={() =>
+                    setOpenId((current) =>
+                      current === (row.id || `${row.ordinal}-${row.depth}`)
+                        ? null
+                        : row.id || `${row.ordinal}-${row.depth}`,
+                    )
+                  }
+                />
+              ))
+            ) : (
+              <li className="py-4 text-center text-[11.5px] text-muted">
+                No span in this run matched that filter.
+              </li>
+            )}
+          </ol>
+        </div>
+      ) : (
+        <ol className="mt-2 border-t border-rule pt-1">
+          {bars.length ? (
+            bars.map((row) => (
+              <li
+                key={row.id || `${row.ordinal}-${row.depth}`}
+                className="flex items-start justify-between gap-3 py-1.5"
+                style={{ paddingLeft: `${Math.min(row.depth, 6) * 13}px` }}
+              >
+                <span className="min-w-0">
+                  <span className={`text-[11.5px] ${row.context ? 'text-muted' : 'text-ink'}`}>
+                    {spanLabel(row)}
+                  </span>
+                  <span className="ml-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-muted">
+                    {row.stage}
+                  </span>
+                  <span className="mt-0.5 block truncate text-[10.5px] text-muted">
+                    {spanDetail(row)}
+                  </span>
+                </span>
+                <span className="shrink-0 text-right font-mono text-[10.5px] tabular-nums text-muted">
+                  {formatDuration(row.latency_ms)}
+                </span>
+              </li>
+            ))
+          ) : (
+            <li className="py-4 text-center text-[11.5px] text-muted">
+              No span in this run matched that filter.
+            </li>
+          )}
+        </ol>
+      )}
+
+      {summary.stages?.length > 1 ? (
+        <details className="mt-3">
+          <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-[0.12em] text-muted">
+            Spend by stage
+          </summary>
+          <div className="mt-2 overflow-x-auto">
+            <table className="w-full min-w-[420px] text-[11px]">
+              <caption className="sr-only">
+                Tokens, cost and errors per stage of this run
+              </caption>
+              <thead>
+                <tr className="border-b border-rule text-[10px] uppercase tracking-[0.1em] text-muted">
+                  <th scope="col" className="pb-1 pr-2 text-left font-normal">
+                    Stage
+                  </th>
+                  <th scope="col" className="pb-1 pr-2 text-right font-normal">
+                    Spans
+                  </th>
+                  <th scope="col" className="pb-1 pr-2 text-right font-normal">
+                    Tokens
+                  </th>
+                  <th scope="col" className="pb-1 pr-2 text-right font-normal">
+                    Billed
+                  </th>
+                  <th scope="col" className="pb-1 pr-2 text-right font-normal">
+                    Est.
+                  </th>
+                  <th scope="col" className="pb-1 text-right font-normal">
+                    Err
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {summary.stages.map((bucket) => (
+                  <StageRow key={bucket.stage} bucket={bucket} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      ) : null}
 
       <p className="mt-2 text-[10.5px] leading-relaxed text-muted">
-        Every span names the audit event that reports it, or records that it has
-        none, so this tree is the run ledger seen with parents, durations and
-        prices attached. Billed and estimated cost are shown apart because they
-        are not the same number.
+        Bars sit on the run&apos;s own clock, so overlap and waiting are visible; a span with no
+        recorded duration stays a hairline rather than being widened to look like work. Every span
+        names the audit event that reports it, or records that it has none. Billed and estimated
+        cost are shown apart because they are not the same number.
       </p>
     </section>
   );

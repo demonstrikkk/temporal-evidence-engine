@@ -22,9 +22,9 @@ from __future__ import annotations
 import hashlib
 
 #: First extraction pass: answer -> atomic claims.
-EXTRACT_PROMPT_VERSION = "extract.v1"
+EXTRACT_PROMPT_VERSION = "extract.v2"
 #: The one focused re-extraction over assertions no claim covered (D-023).
-REPAIR_PROMPT_VERSION = "extract.repair.v1"
+REPAIR_PROMPT_VERSION = "extract.repair.v2"
 #: One claim against one stored source revision -> a relationship proposal.
 PROPOSE_PROMPT_VERSION = "propose.v1"
 
@@ -33,8 +33,8 @@ PROPOSE_PROMPT_VERSION = "propose.v1"
 #: A missing entry means the version was never registered, which is the same
 #: failure as a stale one: nothing can vouch for the label.
 REGISTERED: dict[str, str] = {
-    EXTRACT_PROMPT_VERSION: "ef6e3e1011ca152d",
-    REPAIR_PROMPT_VERSION: "0a1bc5c7c998d2ef",
+    EXTRACT_PROMPT_VERSION: "f5b0057cfb032080",
+    REPAIR_PROMPT_VERSION: "94ca488fe4f38aaa",
     PROPOSE_PROMPT_VERSION: "dae704467c8c9493",
 }
 

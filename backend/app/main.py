@@ -129,11 +129,15 @@ from app.api.verify import router as verify_router  # noqa: E402
 from app.api.cache import router as cache_router  # noqa: E402
 from app.api.chat import router as chat_router  # noqa: E402
 from app.api.governance import router as governance_router  # noqa: E402
+from app.api.playground import router as playground_router  # noqa: E402
+from app.api.compare import router as compare_router  # noqa: E402
 
 app.include_router(verify_router)
 app.include_router(chat_router)
 app.include_router(governance_router)
 app.include_router(cache_router)
+app.include_router(playground_router)
+app.include_router(compare_router)
 
 PLANS: dict[str, dict] = {}
 RUNS: dict[str, dict] = {}

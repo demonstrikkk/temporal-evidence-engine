@@ -54,6 +54,10 @@ const NOT_A_COLOUR = new Set([
   // character, not a colour — wrapping it in rgb() would produce an invalid
   // declaration and drop the mark.
   'glyph',
+  // The trace waterfall's shared column definition. One string, used by both
+  // the axis and the rows so a bar's left edge means the same thing in both.
+  // A length, not a colour.
+  'trace-cols',
 ]);
 
 function walk(dir, out = []) {

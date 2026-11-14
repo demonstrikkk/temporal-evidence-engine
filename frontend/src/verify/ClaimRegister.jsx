@@ -3,11 +3,88 @@
  * verdict.
  *
  * A verifier that hides the unverifiable claims is reporting a success rate,
- * not a verification. The counts at the top are the summary; the rows are the
- * run.
+ * not a verification. The bar at the top is the summary; the rows are the run.
  */
-import { reasonLabel, statusMeta } from './model.js';
+import { freshnessTone, freshnessWord, reasonLabel, statusMeta } from './model.js';
 import { StatusPill } from './ui.jsx';
+
+const ORDER = ['supported', 'changed', 'contradicted', 'unverifiable'];
+
+/* Fill classes, not inline colours: the verdict palette lives in the Tailwind
+   theme so `changed` can never drift back to green. */
+const FILL = {
+  supported: 'bg-ok',
+  changed: 'bg-info',
+  contradicted: 'bg-danger',
+  unverifiable: 'bg-muted',
+  pending: 'bg-rule-2',
+};
+
+/**
+ * The distribution, as a bar before it is a legend.
+ *
+ * Undecided claims are simply absent from the bar, which leaves the warm track
+ * showing through — the visual length is the settled share, and the legend says
+ * how many rows are still pending. It is `role="img"` with a sentence, because
+ * a series of coloured divs is not readable.
+ */
+export function VerdictBar({ counts }) {
+  const total = counts?.total || 0;
+  const pending = counts?.pending || 0;
+
+  if (!total) {
+    return (
+      <div className="verdict-bar" role="img" aria-label="No claims extracted yet">
+        <span className={FILL.pending} style={{ width: '100%' }} />
+      </div>
+    );
+  }
+
+  const label = [
+    ...ORDER.map((status) => `${counts?.[status] || 0} ${statusMeta(status).label.toLowerCase()}`),
+    ...(pending ? [`${pending} pending`] : []),
+    `of ${total}`,
+  ].join(', ');
+
+  return (
+    <div>
+      <div className="verdict-bar" role="img" aria-label={label}>
+        {ORDER.map((status) => {
+          const count = counts?.[status] || 0;
+          if (!count) return null;
+          return (
+            <span
+              key={status}
+              className={FILL[status]}
+              style={{ width: `${(count / total) * 100}%` }}
+              title={`${statusMeta(status).label}: ${count}`}
+            />
+          );
+        })}
+      </div>
+      <ul className="verdict-legend">
+        {ORDER.map((status) => {
+          const count = counts?.[status] || 0;
+          const meta = statusMeta(status);
+          return (
+            <li key={status} title={meta.note} className={count ? '' : 'opacity-60'}>
+              <span className={`chip ${count ? FILL[status] : FILL.pending}`} aria-hidden="true" />
+              {meta.label}
+              <b>{count}</b>
+            </li>
+          );
+        })}
+        {pending ? (
+          <li title="Extracted, not settled yet">
+            <span className={`chip ${FILL.pending}`} aria-hidden="true" />
+            Pending
+            <b>{pending}</b>
+          </li>
+        ) : null}
+      </ul>
+    </div>
+  );
+}
 
 export default function ClaimRegister({ claims, selectedId, onSelect }) {
   if (!claims?.length) {
@@ -19,38 +96,45 @@ export default function ClaimRegister({ claims, selectedId, onSelect }) {
   }
 
   return (
-    <ul className="divide-y divide-rule/70" aria-label="Claim register">
+    <ul className="claim-list" aria-label="Claim register">
       {claims.map((claim) => {
         const status = claim.status || 'pending';
+        const meta = statusMeta(status);
         const selected = claim.id === selectedId;
         return (
           <li key={claim.id}>
             <button
               type="button"
               onClick={() => onSelect?.(claim.id)}
-              data-active={selected}
               aria-current={selected ? 'true' : undefined}
-              className="row grid w-full grid-cols-[26px_minmax(0,1fr)_auto] items-start gap-3 px-2 py-2.5 text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-[var(--accent-ring)] sm:grid-cols-[26px_minmax(0,1fr)_88px_auto]"
+              aria-label={`Claim ${(claim.ordinal ?? 0) + 1}: ${meta.label}`}
+              className="claim-row"
             >
-              <span className="pt-0.5 font-mono text-[10.5px] tabular-nums text-muted">
-                {String((claim.ordinal ?? 0) + 1).padStart(2, '0')}
-              </span>
+              <span className={`claim-rail ${FILL[status] || FILL.pending}`} aria-hidden="true" />
+              <span className="claim-ordinal">{String((claim.ordinal ?? 0) + 1).padStart(2, '0')}</span>
               <span className="min-w-0">
-                <span className="block text-[12.5px] leading-snug text-ink">
-                  {claim.claim_text}
-                </span>
-                <span className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10.5px] text-muted">
-                  {claim.object_raw ? (
-                    <span className="font-mono text-ink-2">{claim.object_raw}</span>
-                  ) : null}
+                <span className="claim-text">{claim.claim_text}</span>
+                <span className="claim-meta">
+                  {claim.object_raw ? <span className="claim-value">{claim.object_raw}</span> : null}
                   <span className="truncate">{reasonLabel(claim.reason_code)}</span>
                   {claim.evidence_count ? <span>· {claim.evidence_count} evidence</span> : null}
+                  {claim.volatility_class ? (
+                    <span className="claim-flag">{claim.volatility_class}</span>
+                  ) : null}
+                  {claim.freshness_index !== null && claim.freshness_index !== undefined ? (
+                    <span
+                      className="claim-fresh"
+                      data-tone={freshnessTone(claim.freshness_index)}
+                      title={`Freshness ${claim.freshness_index}/100 — the age of the last verification, not a probability that the claim is true (${freshnessWord(
+                        claim.freshness_index
+                      )}).`}
+                    >
+                      fresh {claim.freshness_index}
+                    </span>
+                  ) : null}
                 </span>
               </span>
-              <span className="hidden pt-0.5 text-[10.5px] text-muted sm:block">
-                {claim.volatility_class || ''}
-              </span>
-              <span className="pt-0.5">
+              <span className="claim-status">
                 <StatusPill status={status} size="sm" />
               </span>
             </button>
@@ -58,29 +142,5 @@ export default function ClaimRegister({ claims, selectedId, onSelect }) {
         );
       })}
     </ul>
-  );
-}
-
-export function StatusSummary({ counts }) {
-  return (
-    <div className="flex flex-wrap items-center gap-1.5" aria-label="Verdict counts">
-      {['supported', 'changed', 'contradicted', 'unverifiable'].map((status) => {
-        const count = counts?.[status] || 0;
-        const meta = statusMeta(status);
-        return (
-          <span
-            key={status}
-            className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10.5px] font-medium ${
-              count ? meta.cls : 'border-rule bg-paper-2 text-muted/70'
-            }`}
-            title={meta.note}
-          >
-            <span className={`h-1.5 w-1.5 rounded-full ${count ? meta.dot : 'bg-rule-2'}`} aria-hidden="true" />
-            {meta.label}
-            <span className="tabular-nums">{count}</span>
-          </span>
-        );
-      })}
-    </div>
   );
 }

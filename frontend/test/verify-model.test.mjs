@@ -12,14 +12,20 @@ import test from 'node:test';
 import {
   STATUS,
   VERDICTS,
+  ago,
   buildSegments,
   claimCounts,
   describeEvent,
   formatCost,
+  freshnessTone,
+  freshnessWord,
   gatewayRoute,
+  halfLifeLabel,
   isLive,
   isProblem,
   reasonLabel,
+  researchSummary,
+  runCounts,
   shortDate,
   shortUrl,
   statusMeta,
@@ -177,6 +183,40 @@ test('a cost with no recorded value is unknown, not free', () => {
   assert.equal(formatCost(1.5), '$1.50');
 });
 
+test('a recommended recheck in the future reads as future, not as overdue', () => {
+  const future = new Date(Date.now() + 3 * 86_400_000).toISOString();
+  const past = new Date(Date.now() - 2 * 86_400_000).toISOString();
+  assert.match(ago(future), /^in \d+d$/);
+  assert.match(ago(past), /^\d+d ago$/);
+  assert.equal(ago(null), '');
+  assert.equal(ago('not a date'), '');
+});
+
+test('freshness bands are words, and a missing score is not "stale"', () => {
+  // The backend owns the number; these bands only pick a word. The distinction
+  // that matters is "never verified" (no score) versus "verified long ago" (0).
+  assert.equal(freshnessWord(100), 'current');
+  assert.equal(freshnessWord(70), 'current');
+  assert.equal(freshnessWord(69), 'ageing');
+  assert.equal(freshnessWord(40), 'ageing');
+  assert.equal(freshnessWord(39), 'stale');
+  assert.equal(freshnessWord(0), 'stale');
+  assert.equal(freshnessWord(null), 'not verified');
+  assert.equal(freshnessWord(undefined), 'not verified');
+  assert.equal(freshnessWord('nonsense'), 'not verified');
+  assert.equal(freshnessTone(null), 'muted');
+  assert.equal(freshnessTone(0), 'danger');
+});
+
+test('a half-life reads as a span a human can check', () => {
+  assert.equal(halfLifeLabel(0.25), '15 min');
+  assert.equal(halfLifeLabel(6), '6 h');
+  assert.equal(halfLifeLabel(24), '1 d');
+  assert.equal(halfLifeLabel(720), '30 d');
+  assert.equal(halfLifeLabel(null), '—');
+  assert.equal(halfLifeLabel(0), '—');
+});
+
 test('a gateway route names the model that answered, not the one requested', () => {
   // A fallback answered: the request was for a Groq model, the response came
   // from local Ollama. The panel must not print the request as the answer.
@@ -198,4 +238,85 @@ test('a gateway route names the model that answered, not the one requested', () 
   // A row that recorded nothing is unrecorded, not blank.
   assert.equal(gatewayRoute({}), 'unrecorded route');
   assert.equal(gatewayRoute(null), 'unrecorded route');
+});
+
+test('a research ledger counts events, and never invents a fetch', () => {
+  const empty = researchSummary([]);
+  assert.equal(empty.plans, 0);
+  assert.equal(empty.stored, 0);
+  assert.equal(empty.failed, 0);
+  assert.deepEqual(empty.sources, []);
+
+  // One page quoted by three claims is one stored source, not three.
+  const events = [
+    { event_type: 'research.planned', payload: { queries: ['chatgpt plus price', 'openai leadership'] } },
+    { event_type: 'source.stored', created_at: '2026-11-12T14:00:00Z',
+      payload: { url: 'https://openai.com/pricing', revision_id: 'rev_1', chars: 812, published_date: '2026-11-01' } },
+    { event_type: 'source.stored', created_at: '2026-11-12T14:00:02Z',
+      payload: { url: 'https://openai.com/pricing', revision_id: 'rev_1', chars: 812 } },
+    { event_type: 'source.failed', payload: { url: 'https://example.com/x', stage: 'extract', error: 'no text returned' } },
+    { event_type: 'claim.evidence_reused', payload: { claim_id: 'clm_1' } },
+    { event_type: 'model.call', payload: {} },
+  ];
+  const summary = researchSummary(events);
+  assert.equal(summary.plans, 1);
+  assert.equal(summary.planned, 2);
+  assert.equal(summary.stored, 1);
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.reused, 1);
+  assert.equal(summary.sources.length, 1);
+  assert.equal(summary.sources[0].chars, 812);
+  assert.equal(summary.sources[0].publishedAt, '2026-11-01');
+});
+
+test('a refused query plan is reported, and a plan with no queries still counts', () => {
+  const summary = researchSummary([
+    { event_type: 'research.planned', payload: { queries: [] } },
+    { event_type: 'research.budget_exhausted', payload: { queries_dropped: 3, budget_mode: 'offline' } },
+  ]);
+  // Offline mode asks nothing. "Planned zero queries" is a statement about the
+  // run, not the same as no research stage at all.
+  assert.equal(summary.plans, 1);
+  assert.equal(summary.planned, 0);
+  assert.equal(summary.budgetStops, 1);
+  assert.equal(summary.stored, 0);
+});
+
+test('a payload that is not an object cannot fake a source', () => {
+  const summary = researchSummary([
+    { event_type: 'source.stored', payload: 'not a dict' },
+    { event_type: 'source.stored', payload: { url: 'https://a.example/p', revision_id: 'rev_9' } },
+    { event_type: 'research.planned' },
+    null,
+  ]);
+  assert.equal(summary.stored, 1);
+  assert.equal(summary.plans, 1);
+  assert.equal(summary.sources[0].chars, 0);
+  assert.equal(summary.sources[0].publishedAt, null);
+});
+
+test('a run with no abstention still reports zero abstentions, not undefined', () => {
+  // The store only sends the statuses that occurred. A completed run with no
+  // abstention therefore has no `unverifiable` key, and reading it straight
+  // from the payload printed "undefined abstained" and "no claims" on a real
+  // run. Every verdict key must exist.
+  const claims = [
+    { status: 'supported' }, { status: 'supported' }, { status: 'contradicted' },
+  ];
+  const counts = runCounts(claims, { supported: 2, contradicted: 1, claims: 3 });
+  assert.equal(counts.unverifiable, 0);
+  assert.equal(counts.pending, 0);
+  assert.equal(counts.changed, 0);
+  assert.equal(counts.total, 3);
+  assert.equal(counts.supported, 2);
+
+  // A recorded count still wins over the derived one.
+  const recorded = runCounts(claims, { unverifiable: 4, total: 9 });
+  assert.equal(recorded.unverifiable, 4);
+  assert.equal(recorded.total, 9);
+
+  // No recorded counters at all: derive everything.
+  const derived = runCounts(claims, null);
+  assert.equal(derived.contradicted, 1);
+  assert.equal(derived.total, 3);
 });

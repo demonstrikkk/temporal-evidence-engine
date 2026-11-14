@@ -200,3 +200,94 @@ export function spanCost(row) {
     value: Number(row?.cost_usd) || 0,
   };
 }
+
+/* --- the waterfall -------------------------------------------------------
+ *
+ * A tree says what happened in what order; it cannot say what was slow. Every
+ * span already carries `started_at`/`ended_at`, so the panel can place each one
+ * on the run's own clock. These helpers are pure so the arithmetic that decides
+ * bar length is tested without a browser — an axis that is subtly wrong makes
+ * every bar lie by the same amount, which is exactly the kind of error nobody
+ * notices from a screenshot.
+ */
+
+function toMs(value) {
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * The clock every bar is drawn against: earliest start to latest end.
+ *
+ * A run with no usable timestamps returns `null`, and the panel falls back to
+ * the list rather than drawing every bar full width, which would claim that
+ * every span took the whole run.
+ */
+export function traceWindow(rows = []) {
+  let start = null;
+  let end = null;
+  for (const row of rows) {
+    const started = toMs(row?.started_at);
+    if (started === null) continue;
+    start = start === null ? started : Math.min(start, started);
+    const ended = toMs(row?.ended_at);
+    const finished = ended === null
+      ? started + Math.max(0, Number(row?.latency_ms) || 0)
+      : ended;
+    end = end === null ? finished : Math.max(end, finished);
+  }
+  if (start === null) return null;
+  const last = Math.max(end ?? start, start);
+  return { start, end: last, totalMs: last - start };
+}
+
+function durationOf(row) {
+  const started = toMs(row?.started_at);
+  const ended = toMs(row?.ended_at);
+  if (started !== null && ended !== null && ended >= started) return ended - started;
+  return Math.max(0, Number(row?.latency_ms) || 0);
+}
+
+/** A row plus where its bar goes, as percentages of the run window. */
+export function waterfallRows(rows = [], window = null) {
+  const total = Number(window?.totalMs) || 0;
+  return rows.map((row) => {
+    const durationMs = durationOf(row);
+    if (!total) {
+      return { ...row, offsetMs: 0, durationMs, startPct: null, widthPct: null };
+    }
+    const started = toMs(row?.started_at);
+    const offsetMs = started === null ? 0 : started - window.start;
+    const startPct = Math.min(100, Math.max(0, (offsetMs / total) * 100));
+    const widthPct = Math.max(0, Math.min(100 - startPct, (durationMs / total) * 100));
+    return { ...row, offsetMs, durationMs, startPct, widthPct };
+  });
+}
+
+/**
+ * The longest span that is not the run itself.
+ *
+ * The root always covers the whole window, so "slowest" would name it every
+ * time and tell a reader nothing. Share is of wall time, which is what makes
+ * the number actionable.
+ */
+export function slowestSpan(rows = [], window = null) {
+  const total = Number(window?.totalMs) || 0;
+  let best = null;
+  for (const row of rows) {
+    if (String(row?.operation || '') === 'run') continue;
+    if (row?.context) continue;
+    const durationMs = durationOf(row);
+    if (!best || durationMs > best.durationMs) best = { ...row, durationMs };
+  }
+  if (!best) return null;
+  return { ...best, share: total ? Math.min(1, best.durationMs / total) : 0 };
+}
+
+/** An offset from the start of the run, always signed so it reads as a clock. */
+export function formatOffset(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return '+0';
+  return `+${formatDuration(ms)}`;
+}
+

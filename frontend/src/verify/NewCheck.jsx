@@ -7,7 +7,7 @@
  * generation time the engine can still find contradictions, but it refuses to
  * call anything stale, and says so.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../lib/api';
 import { ago, shortDate } from './model.js';
@@ -60,10 +60,18 @@ const RULES = [
   ['R4', 'Refutation older than support', 'supported'],
 ];
 
+const VERDICT_TONE = {
+  unverifiable: 'text-muted',
+  contradicted: 'text-danger',
+  changed: 'text-info',
+  supported: 'text-ok',
+};
+
 export default function NewCheck() {
   const navigate = useNavigate();
   const [answer, setAnswer] = useState('');
   const [prompt, setPrompt] = useState('');
+  const [model, setModel] = useState('');
   const [generatedAt, setGeneratedAt] = useState(toLocalInput(new Date()));
   const [unknownTime, setUnknownTime] = useState(false);
   const [skipNonFactual, setSkipNonFactual] = useState(true);
@@ -81,6 +89,17 @@ export default function NewCheck() {
       alive = false;
     };
   }, []);
+
+  // Counted here, not sent: the metrics are a reading aid, and the backend
+  // decides what a sentence actually is.
+  const metrics = useMemo(() => {
+    const text = answer.trim();
+    return {
+      chars: answer.length,
+      words: text ? text.split(/\s+/).length : 0,
+      sentences: text ? (text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || []).length : 0,
+    };
+  }, [answer]);
 
   const loadExample = (example) => {
     setAnswer(example.answer);
@@ -102,6 +121,7 @@ export default function NewCheck() {
       const body = {
         answer: answer.trim(),
         prompt: prompt.trim(),
+        model: model.trim(),
         skip_non_factual: skipNonFactual,
         generated_at: unknownTime ? null : new Date(generatedAt).toISOString(),
         generated_at_source: unknownTime ? 'unknown' : 'user_supplied',
@@ -118,147 +138,193 @@ export default function NewCheck() {
   };
 
   return (
-    <div className="animate-fade-up">
-      <div className="mb-6 max-w-3xl">
-        <p className="eyebrow">Claim-level verification</p>
-        <h1 className="mt-2 font-display text-[34px] leading-[1.08] text-ink sm:text-[40px]">
-          An answer is a set of claims.
-          <br />
-          <span className="text-accent">Check each one.</span>
-        </h1>
-        <p className="mt-3 max-w-2xl text-[13.5px] leading-relaxed text-ink-2">
-          Paste an AI-generated answer and the time it was produced. The engine splits it into
-          atomic claims, researches them live, and settles every quote against the exact stored
-          source text — with the event date separated from the publication date, so a new article
-          is never mistaken for a new fact.
+    <div className="animate-fade-up space-y-6">
+      <header className="page-head">
+        <div>
+          <p className="eyebrow">Intake</p>
+          <h1 className="page-title">
+            An answer is a set of claims.
+            <br />
+            <em>Check each one.</em>
+          </h1>
+          <p className="page-lede">
+            Paste an AI-generated answer and the time it was produced. The engine splits it into
+            atomic claims, researches them live, and settles every quote against the exact stored
+            source text — with the event date separated from the publication date, so a new article
+            is never mistaken for a new fact.
+          </p>
+        </div>
+        <p className="case-crumb hidden lg:flex">
+          <span>requires</span>
+          <span aria-hidden="true">·</span>
+          <span>answer text + generation time</span>
         </p>
-      </div>
+      </header>
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.65fr)_minmax(0,1fr)]">
-        <form onSubmit={submit} className="surface space-y-5 p-5" aria-label="New verification">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <SectionHeading>The answer</SectionHeading>
-            <div className="flex flex-wrap gap-1.5">
-              {EXAMPLES.map((example) => (
-                <button
-                  key={example.id}
-                  type="button"
-                  className="btn-outline btn-xs"
-                  onClick={() => loadExample(example)}
-                >
-                  {example.label}
-                </button>
-              ))}
+      {/* An explicit single column below lg. A bare grid's implicit auto track
+          sizes to max-content and pushes the form wider than the viewport at
+          390px; minmax(0,1fr) keeps the page inside the screen. */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1.65fr)_minmax(0,1fr)]">
+        <form onSubmit={submit} className="intake-panel" aria-label="New verification">
+          <div className="intake-bar">
+            <span className="intake-bar-label">the answer</span>
+            <div className="intake-metrics">
+              <span>
+                <b>{metrics.chars}</b> chars
+              </span>
+              <span>
+                <b>{metrics.words}</b> words
+              </span>
+              <span>
+                <b>{metrics.sentences}</b> sentences
+              </span>
             </div>
           </div>
 
-          <Field
-            label="Answer text"
-            hint="One claim per sentence works best. Opinions and predictions are ignored, not failed."
-          >
-            <textarea
-              className="input min-h-[210px] resize-y font-mono text-[12.5px] leading-relaxed"
-              value={answer}
-              onChange={(event) => setAnswer(event.target.value)}
-              placeholder="Paste the answer here…"
-              spellCheck={false}
-              required
-            />
-          </Field>
-
-          <Field label="Original question (context only)" hint="Optional. It helps extraction, and it is shown with the report.">
-            <input
-              className="input"
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              placeholder="What did you ask the model?"
-            />
-          </Field>
-
-          <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto]">
+          <div className="space-y-4 p-4">
             <Field
-              label="Answer generated at"
-              hint={
-                unknownTime
-                  ? 'Without a generation time, no claim can be marked “changed” — only supported, contradicted or unverifiable.'
-                  : 'Local time. This is the reference point for “has the fact changed since?”'
-              }
+              label="Answer text"
+              hint="One claim per sentence works best. Opinions and predictions are ignored, not failed."
             >
-              <input
-                type="datetime-local"
-                className="input font-mono text-[12.5px]"
-                value={generatedAt}
-                onChange={(event) => setGeneratedAt(event.target.value)}
-                disabled={unknownTime}
-                required={!unknownTime}
+              <textarea
+                className="input min-h-[220px] resize-y font-mono text-[12.5px] leading-relaxed"
+                value={answer}
+                onChange={(event) => setAnswer(event.target.value)}
+                placeholder="Paste the answer here…"
+                spellCheck={false}
+                required
               />
             </Field>
-            <label className="flex items-end gap-2 pb-1 text-[12px] text-ink-2">
+
+            <div>
+              <p className="label">Or open a specimen</p>
+              <div className="flex flex-wrap gap-1.5">
+                {EXAMPLES.map((example) => (
+                  <button
+                    key={example.id}
+                    type="button"
+                    className="specimen"
+                    onClick={() => loadExample(example)}
+                    title={example.prompt}
+                  >
+                    <span className="specimen-id">{example.id}</span>
+                    {example.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <Field
+              label="Original question · context only"
+              hint="Optional. It helps extraction, and it is shown with the report."
+            >
+              <input
+                className="input"
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+                placeholder="What did you ask the model?"
+              />
+            </Field>
+
+            <Field
+              label="Model that wrote it · optional"
+              hint="Recorded with the answer so its verdicts can be compared on the compare page. Left blank, it is reported there as a pasted answer with no model recorded."
+            >
+              <input
+                className="input font-mono text-[12.5px]"
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                placeholder="gpt-4o, claude-sonnet-4-5, llama3.2:1b…"
+                autoComplete="off"
+              />
+            </Field>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <Field
+                label="Answer generated at"
+                hint={
+                  unknownTime
+                    ? 'Without a generation time, no claim can be marked “changed” — only supported, contradicted or unverifiable.'
+                    : 'Local time. This is the reference point for “has the fact changed since?”'
+                }
+              >
+                <input
+                  type="datetime-local"
+                  className="input font-mono text-[12.5px]"
+                  value={generatedAt}
+                  onChange={(event) => setGeneratedAt(event.target.value)}
+                  disabled={unknownTime}
+                  required={!unknownTime}
+                />
+              </Field>
+              <label className="flex items-end gap-2 pb-1.5 text-[12px] text-ink-2">
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5 accent-[rgb(var(--accent))]"
+                  checked={unknownTime}
+                  onChange={(event) => setUnknownTime(event.target.checked)}
+                />
+                Unknown
+              </label>
+            </div>
+
+            <label className="flex items-start gap-2 text-[12px] leading-snug text-ink-2">
               <input
                 type="checkbox"
-                className="h-3.5 w-3.5 accent-[rgb(var(--accent))]"
-                checked={unknownTime}
-                onChange={(event) => setUnknownTime(event.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5 accent-[rgb(var(--accent))]"
+                checked={skipNonFactual}
+                onChange={(event) => setSkipNonFactual(event.target.checked)}
               />
-              Unknown
+              <span>
+                Skip opinions, predictions and ambiguous statements.
+                <span className="block text-[11px] text-muted">
+                  They are not factual claims that failed — they are not factual claims.
+                </span>
+              </span>
             </label>
+
+            {error ? (
+              <div
+                role="alert"
+                className="rounded-sm border border-danger/30 bg-danger-soft px-3 py-2 text-[12px] text-danger"
+              >
+                {error.message || String(error)}
+              </div>
+            ) : null}
           </div>
 
-          <label className="flex items-start gap-2 text-[12px] leading-snug text-ink-2">
-            <input
-              type="checkbox"
-              className="mt-0.5 h-3.5 w-3.5 accent-[rgb(var(--accent))]"
-              checked={skipNonFactual}
-              onChange={(event) => setSkipNonFactual(event.target.checked)}
-            />
-            <span>
-              Skip opinions, predictions and ambiguous statements.
-              <span className="block text-[11px] text-muted">
-                They are not factual claims that failed — they are not factual claims.
-              </span>
-            </span>
-          </label>
-
-          {error ? (
-            <div
-              role="alert"
-              className="rounded-sm border border-danger/30 bg-danger-soft px-3 py-2 text-[12px] text-danger"
-            >
-              {error.message || String(error)}
-            </div>
-          ) : null}
-
-          <div className="flex flex-wrap items-center gap-3 border-t border-rule pt-4">
-            <button type="submit" className="btn-primary" disabled={submitting || !answer.trim()}>
+          <div className="intake-foot">
+            <button type="submit" className="btn-accent" disabled={submitting || !answer.trim()}>
               {submitting ? 'Starting…' : 'Verify this answer'}
+              {submitting ? null : <span aria-hidden="true">→</span>}
             </button>
-            <span className="text-[11px] text-muted">
+            <span className="text-[11px] leading-snug text-muted">
               Live research takes tens of seconds. The run reports every stage as it happens.
             </span>
           </div>
         </form>
 
         <aside className="space-y-5">
-          <section className="surface p-5">
+          <section className="surface px-4 py-3.5">
             <SectionHeading aside="frozen">How a verdict is decided</SectionHeading>
-            <ol className="mt-3 space-y-2">
+            <div className="mt-2">
               {RULES.map(([rule, meaning, verdict]) => (
-                <li key={rule} className="flex items-baseline gap-2.5 text-[12px]">
-                  <span className="w-6 shrink-0 font-mono text-[10.5px] text-muted">{rule}</span>
-                  <span className="min-w-0 flex-1 text-ink-2">{meaning}</span>
-                  <span className="shrink-0 font-mono text-[10px] uppercase tracking-wide text-muted">
+                <div key={rule} className="rule-row">
+                  <span className="rule-n">{rule}</span>
+                  <span className="rule-meaning">{meaning}</span>
+                  <span className={`rule-verdict ${VERDICT_TONE[verdict] || 'text-muted'}`}>
                     {verdict}
                   </span>
-                </li>
+                </div>
               ))}
-            </ol>
+            </div>
             <p className="mt-3 border-t border-rule pt-3 text-[11px] leading-relaxed text-muted">
               First match wins. The model proposes a relationship; a deterministic gate decides
               whether the quote establishes it; the table above decides the status from stored rows.
             </p>
           </section>
 
-          <section className="surface p-5">
+          <section className="surface px-4 py-3.5">
             <SectionHeading
               aside={
                 recent.length ? (
@@ -271,18 +337,15 @@ export default function NewCheck() {
               Recent runs
             </SectionHeading>
             {recent.length ? (
-              <ul className="mt-3 divide-y divide-rule/70">
+              <ul className="mt-1">
                 {recent.map((run) => (
                   <li key={run.id}>
-                    <Link
-                      className="row flex items-center justify-between gap-3 py-2"
-                      to={`/runs/${run.id}`}
-                    >
+                    <Link className="line-row group" to={`/runs/${run.id}`}>
                       <span className="min-w-0">
-                        <span className="block truncate text-[12px] text-ink">
+                        <span className="block truncate text-[12px] text-ink group-hover:text-accent">
                           {run.prompt || 'Untitled answer'}
                         </span>
-                        <span className="block text-[10.5px] text-muted">
+                        <span className="block font-mono text-[9.5px] text-muted">
                           {shortDate(run.started_at)} · {ago(run.started_at)}
                         </span>
                       </span>
@@ -292,7 +355,9 @@ export default function NewCheck() {
                 ))}
               </ul>
             ) : (
-              <p className="mt-3 text-[12px] text-muted">No runs yet. The first one starts above.</p>
+              <p className="mt-2 text-[12px] text-muted">
+                No runs yet. The first one starts above.
+              </p>
             )}
           </section>
         </aside>

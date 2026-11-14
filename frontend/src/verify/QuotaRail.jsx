@@ -4,10 +4,22 @@
  * Displays Tavily credits, Groq token/request state, Bifrost provider info,
  * cache hit rate, and saved calls. Never invents precise remaining quota when
  * the provider has not supplied it; marks estimates as estimates.
+ *
+ * Rendered as a compact ledger, not a card grid, and placed *after* the
+ * evidence: quota is context for the operator, not the reason to open a run.
  */
 import { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { formatCost, countLabel } from './model.js';
+import { SectionHeading, LedgerRow } from './ui.jsx';
+
+function Bar({ value, tone = 'bg-ink' }) {
+  return (
+    <span className="infra-bar" aria-hidden="true">
+      <span className={tone} style={{ width: `${Math.max(0, Math.min(100, value))}%` }} />
+    </span>
+  );
+}
 
 export default function QuotaRail() {
   const [quota, setQuota] = useState(null);
@@ -26,15 +38,6 @@ export default function QuotaRail() {
     return () => { cancelled = true; };
   }, []);
 
-  if (loading) {
-    return (
-      <div className="surface p-3">
-        <div className="h-5 w-32 skeleton mb-1" />
-        <div className="h-4 w-24 skeleton" />
-      </div>
-    );
-  }
-
   const t = quota?.quota?.tavily || {};
   const g = quota?.quota?.groq || {};
   const c = cache?.layer_counts || {};
@@ -51,74 +54,67 @@ export default function QuotaRail() {
   const budget = diagnostic?.budget_usd != null ? diagnostic.budget_usd : 0;
   const spent = diagnostic?.spent_usd || 0;
 
+  // The diagnostic returns provider objects; joining them directly printed
+  // "[object Object]" in the footer. Name them, and say nothing when unnamed.
+  const providerNames = providers
+    .map((provider) => (typeof provider === 'string' ? provider : provider?.name || provider?.id))
+    .filter(Boolean);
+
+  if (loading) {
+    return (
+      <section className="surface px-4 py-3.5" aria-label="Quota and infrastructure">
+        <SectionHeading>Quota &amp; infrastructure</SectionHeading>
+        <div className="mt-3 space-y-2">
+          <span className="skeleton block h-4 w-full" />
+          <span className="skeleton block h-4 w-2/3" />
+          <span className="skeleton block h-4 w-1/2" />
+        </div>
+      </section>
+    );
+  }
+
   return (
-    <div className="surface p-4 space-y-3" aria-label="Quota and infrastructure">
-      <div className="flex items-center justify-between">
-        <span className="label text-[11px] text-muted uppercase tracking-wider">Quota &amp; infrastructure</span>
-        <span className={`font-mono text-[10px] ${mode === 'offline' ? 'text-danger' : 'text-muted'}`}>
-          {mode}
+    <section className="surface px-4 py-3.5" aria-label="Quota and infrastructure">
+      <SectionHeading aside={mode === 'offline' ? <span className="text-danger">{mode}</span> : mode}>
+        Quota &amp; infrastructure
+      </SectionHeading>
+
+      <div className="mt-2">
+        <LedgerRow
+          label="Tavily credits"
+          meta={`${tRemaining} of ${tLimit}`}
+          hint={`${tUsed} used · ${t.session_searches ?? 0} session searches`}
+        >
+          <Bar value={(tUsed / tLimit) * 100} tone="bg-ember" />
+        </LedgerRow>
+        <LedgerRow
+          label="Groq · daily"
+          meta={`${countLabel(gRequests)} req`}
+          hint={`${formatCost(spent)} spent · ${formatCost(budget - spent)} of ${formatCost(
+            budget
+          )} budget`}
+        >
+          <Bar value={(gUsed / 500000) * 100} tone="bg-ok" />
+        </LedgerRow>
+        <LedgerRow
+          label="Cache hit rate"
+          meta={`${Math.round(hitRate * 100)}%`}
+          hint={`${Number(cache?.external_calls_saved?.total || 0)} external calls saved · ${Number(
+            cache?.saved_model_calls || 0
+          )} model · ${Number(cache?.saved_tavily_searches || 0)} search`}
+        >
+          <Bar value={hitRate * 100} tone="bg-ok" />
+        </LedgerRow>
+      </div>
+
+      <p className="mt-2.5 flex flex-wrap items-center justify-between gap-2 border-t border-rule pt-2 font-mono text-[9.5px] text-muted">
+        <span title={providerNames.join(', ')}>
+          {providerNames.length
+            ? `providers · ${providerNames.join(', ')}`
+            : 'providers · not reported by the gateway'}
         </span>
-      </div>
-
-      <div className="grid gap-2">
-        {/* Tavily */}
-        <div className="border border-rule/30 rounded-md p-2.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-ink-2">Tavily credits</span>
-            <span className="font-mono text-ink">{tRemaining} / {tLimit}</span>
-          </div>
-          <div className="h-1.5 w-full bg-paper-2 rounded-full mt-1.5 overflow-hidden">
-            <div
-              className="h-full bg-info"
-              style={{ width: `${Math.min(100, (tUsed / tLimit) * 100)}%` }}
-            />
-          </div>
-          <div className="flex justify-between text-[9px] text-muted mt-0.5">
-            <span>{tUsed} used</span>
-            <span>{tRemaining} remaining</span>
-            <span>{t.session_searches ?? 0} session searches</span>
-          </div>
-        </div>
-
-        {/* Groq */}
-        <div className="border border-rule/30 rounded-md p-2.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-ink-2">Groq (daily)</span>
-            <span className="font-mono text-ink">{countLabel(gRequests)} req</span>
-          </div>
-          <div className="h-1.5 w-full bg-paper-2 rounded-full mt-1.5 overflow-hidden">
-            <div className="h-full bg-ok" style={{ width: `${Math.min(100, (gUsed / 500000) * 100)}%` }} />
-          </div>
-          <div className="flex justify-between text-[9px] text-muted mt-0.5">
-            <span>{formatCost(spent)} spent</span>
-            <span>{formatCost(budget - spent)} of ${budget.toFixed(2)} budget</span>
-          </div>
-        </div>
-
-        {/* Cache */}
-        <div className="border border-rule/30 rounded-md p-2.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-ink-2">Cache hit rate</span>
-            <span className="font-mono text-ink">{Math.round(hitRate * 100)}%</span>
-          </div>
-          <div className="h-1.5 w-full bg-paper-2 rounded-full mt-1.5 overflow-hidden">
-            <div
-              className="h-full bg-ok"
-              style={{ width: `${Math.min(100, hitRate * 100)}%` }}
-            />
-          </div>
-          <div className="flex justify-between text-[9px] text-muted mt-0.5">
-            <span>{Number(cache?.external_calls_saved?.total || 0)} external calls saved</span>
-            <span>{Number(cache?.saved_model_calls || 0)} model</span>
-            <span>{Number(cache?.saved_tavily_searches || 0)} search</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="flex items-center justify-between text-[9px] text-muted">
-        <span>Providers: {providers.join(', ') || '—'}</span>
-        <span>Cache mode: {cache?.raw?.cache_mode || '—'}</span>
-      </div>
-    </div>
+        <span>cache mode · {cache?.raw?.cache_mode || 'unknown'}</span>
+      </p>
+    </section>
   );
 }

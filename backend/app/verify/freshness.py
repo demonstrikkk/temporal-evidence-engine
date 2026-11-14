@@ -41,10 +41,11 @@ def half_life(volatility: Volatility | str) -> timedelta:
 def freshness_index(volatility: Volatility | str,
                     last_verified_at: datetime | None,
                     *, now: datetime | None = None) -> int:
-    """0–100, halving every half-life. `None` when never verified.
+    """0–100, halving every half-life. 0 when the claim was never verified.
 
-    Returning `None` rather than 0 matters: "never checked" and "checked so long
-    ago it is worthless" are different states, and the UI must say which.
+    The integer return keeps every internal caller total. The API layer is what
+    turns "never verified" into `None`, because that is the surface a reader
+    sees and "never checked" must not read as "checked and worthless".
     """
     last = as_utc(last_verified_at)
     if last is None:

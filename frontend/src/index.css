@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 /* ============================================================================
-   DATAGOBLIN — design tokens
+   TEMPORAL EVIDENCE ENGINE — design tokens
 
    Colours are stored as bare RGB channel triplets, not hex. Tailwind can only
    apply an opacity modifier (`bg-paper-2/90`) to a colour declared as
@@ -11,30 +11,39 @@
    silently fails to compile. Everywhere raw CSS needs the colour it is written
    as `rgb(var(--x))`.
 
-   A "warm paper + ink" evidence-led palette. Data surfaces stay near-opaque so
-   text contrast never depends on whatever the shader is doing underneath.
+   An archival evidence-room palette: bone paper, ink, one vermilion, one ember.
+   The two accents are not interchangeable. Vermilion is the editorial and
+   verdict accent — it marks a decision. Ember is the evidence accent — it marks
+   the words a value was found in. Mixing them would make a citation look like
+   an error.
+
+   Data surfaces stay near-opaque so text contrast never depends on whatever the
+   procedural field is doing underneath.
    ========================================================================== */
 :root {
-  --ink: 28 25 23;         /* #1c1917 */
-  --ink-2: 68 64 60;       /* #44403c */
-  --paper: 246 243 238;    /* #f6f3ee */
-  --paper-2: 251 249 246;  /* #fbf9f6 */
-  --paper-3: 255 255 255;
-  --warm: 237 231 221;     /* #ede7dd */
-  --muted: 121 113 107;    /* #79716b */
-  --rule: 227 221 211;     /* #e3ddd3 */
-  --rule-2: 211 202 187;   /* #d3cabb */
-  --accent: 154 107 63;    /* #9a6b3f */
-  --accent-ink: 255 255 255;
+  --ink: 33 24 20;         /* #211814 */
+  --ink-2: 74 58 48;       /* #4a3a30 */
+  --paper: 239 230 216;    /* #efe6d6 */
+  --paper-2: 247 240 228;  /* #f7f0e4 */
+  --paper-3: 253 249 241;  /* #fdf9f1 */
+  --warm: 228 214 191;     /* #e4d6bf */
+  --muted: 111 92 74;      /* #6f5c4a — 5.1:1 on paper */
+  --rule: 216 202 180;     /* #d8cab4 */
+  --rule-2: 195 178 152;   /* #c3b298 */
+  --accent: 176 42 28;     /* #b02a1c vermilion — 5.3:1 on paper */
+  --accent-ink: 253 249 241;
+  --ember: 214 100 34;     /* #d66422 — graphics only, 2.9:1 as text */
+  --ember-deep: 148 68 16; /* #944410 — the readable ember for text */
+  --ember-soft: 246 224 204; /* #f6e0cc */
 
   /* semantic — tuned for AA text on --paper and legible on --warm */
-  --ok: 63 125 88;
-  --warn: 154 107 63;
+  --ok: 45 106 74;
+  --warn: 150 80 16;
   --danger: 164 52 43;
-  --info: 47 93 124;
+  --info: 132 74 10;
   --judge: 107 74 134;
 
-  --accent-ring: rgba(154, 107, 63, 0.18);
+  --accent-ring: rgba(176, 42, 28, 0.18);
 
   /* motion */
   --e-swift: cubic-bezier(0.22, 0.61, 0.36, 1);
@@ -65,7 +74,7 @@ body {
   margin: 0;
   background: rgb(var(--paper));
   color: rgb(var(--ink));
-  font-family: 'DM Sans', system-ui, sans-serif;
+  font-family: 'Archivo', system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
@@ -74,9 +83,9 @@ body {
 
 /* --- typography ---------------------------------------------------------- */
 .font-display {
-  font-family: 'Instrument Serif', Newsreader, Georgia, serif;
+  font-family: 'DM Serif Display', 'Newsreader', Georgia, serif;
   font-weight: 400;
-  letter-spacing: -0.015em;
+  letter-spacing: -0.018em;
 }
 .tnum {
   font-variant-numeric: tabular-nums;
@@ -109,11 +118,11 @@ body {
   pointer-events: none;
   background: radial-gradient(
       120% 90% at 8% 0%,
-      rgba(246, 243, 238, 0.35) 0%,
-      rgba(246, 243, 238, 0.86) 46%,
-      rgba(246, 243, 238, 0.97) 100%
+      rgba(239, 230, 216, 0.35) 0%,
+      rgba(239, 230, 216, 0.86) 46%,
+      rgba(239, 230, 216, 0.97) 100%
     ),
-    linear-gradient(to bottom, rgba(246, 243, 238, 0.5), rgba(246, 243, 238, 0.92));
+    linear-gradient(to bottom, rgba(239, 230, 216, 0.5), rgba(239, 230, 216, 0.92));
 }
 .shell-layer {
   position: relative;
@@ -158,12 +167,12 @@ body {
   .btn-primary {
     @apply btn bg-ink text-paper-2 border border-ink
       hover:bg-ink-2 active:scale-[.975]
-      shadow-[0_1px_2px_rgba(28,25,23,.16)];
+      shadow-[0_1px_2px_rgba(33,24,20,.18)];
   }
   .btn-accent {
     @apply btn text-accent-ink border border-accent bg-accent
-      hover:brightness-[1.06] active:scale-[.975]
-      shadow-[0_1px_2px_rgba(28,25,23,.14)];
+      hover:brightness-[1.08] active:scale-[.975]
+      shadow-[0_1px_2px_rgba(33,24,20,.16)];
   }
   .btn-ghost {
     @apply btn border border-transparent text-muted
@@ -338,19 +347,19 @@ body {
    the animation silently does not exist. */
 @keyframes proof-pulse {
   0% {
-    background-color: rgba(154, 107, 63, 0.44);
-    box-shadow: 0 0 0 0 rgba(154, 107, 63, 0.35);
+    background-color: rgba(214, 100, 34, 0.46);
+    box-shadow: 0 0 0 0 rgba(214, 100, 34, 0.38);
   }
   100% {
-    background-color: rgba(154, 107, 63, 0.22);
-    box-shadow: 0 0 0 7px rgba(154, 107, 63, 0);
+    background-color: rgba(214, 100, 34, 0.22);
+    box-shadow: 0 0 0 7px rgba(214, 100, 34, 0);
   }
 }
 
 mark.proof {
-  background: rgba(154, 107, 63, 0.22);
+  background: rgba(214, 100, 34, 0.22);
   color: inherit;
-  box-shadow: 0 1px 0 rgba(154, 107, 63, 0.55);
+  box-shadow: 0 1px 0 rgba(148, 68, 16, 0.5);
   border-radius: 2px;
   padding: 0 1px;
   /* One pass, then still. A permanently glowing highlight would make every
@@ -361,7 +370,7 @@ mark.proof {
 /* The cited span inside a larger page, so a reader can see how much of the
    page the claim actually rests on. */
 mark.proof.context {
-  background: rgba(154, 107, 63, 0.1);
+  background: rgba(214, 100, 34, 0.1);
   box-shadow: none;
 }
 

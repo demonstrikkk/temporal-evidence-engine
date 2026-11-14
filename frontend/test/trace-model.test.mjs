@@ -14,13 +14,17 @@ import {
   countSpans,
   flattenTrace,
   formatDuration,
+  formatOffset,
   formatTokens,
   isModelSpan,
   isProblemSpan,
+  slowestSpan,
   spanCost,
   spanDetail,
   spanLabel,
   spanTone,
+  traceWindow,
+  waterfallRows,
 } from '../src/verify/traceModel.js';
 
 function span(overrides) {
@@ -276,3 +280,109 @@ test('an operation nobody wrote copy for still gets a readable label', () => {
   assert.equal(spanLabel(span({ id: 'b', operation: 'settle_replacement' })), 'settle replacement');
   assert.equal(spanLabel({}), 'operation');
 });
+
+/* --- the waterfall -------------------------------------------------------
+ * Bar geometry is the kind of arithmetic that fails quietly: an axis measured
+ * over the wrong rows, a span clamped to the wrong edge, a zero-duration span
+ * widened until it looks like work. None of it throws, so it is asserted here.
+ */
+
+function timed(id, stage, startedAt, endedAt, extra = {}) {
+  return span({ id, stage, started_at: startedAt, ended_at: endedAt, ...extra });
+}
+
+test('the run window spans the earliest start to the latest end', () => {
+  const win = traceWindow([
+    timed('a', 'extract', '2026-03-01T10:00:02Z', '2026-03-01T10:00:04Z'),
+    timed('b', 'research', '2026-03-01T10:00:00Z', '2026-03-01T10:00:01Z'),
+    timed('c', 'claim', '2026-03-01T10:00:03Z', '2026-03-01T10:00:08Z'),
+  ]);
+  assert.equal(win.start, Date.parse('2026-03-01T10:00:00Z'));
+  assert.equal(win.end, Date.parse('2026-03-01T10:00:08Z'));
+  assert.equal(win.totalMs, 8000);
+});
+
+test('a span with no end falls back to its latency, not to zero', () => {
+  const win = traceWindow([
+    { started_at: '2026-03-01T10:00:00Z', latency_ms: 2500 },
+  ]);
+  assert.equal(win.totalMs, 2500);
+});
+
+test('no usable timestamps means no window, so no bars are invented', () => {
+  assert.equal(traceWindow([]), null);
+  assert.equal(traceWindow([span({ id: 'x' })]), null);
+});
+
+test('offsets and widths are proportions of the run, not of the filtered set', () => {
+  const rows = [
+    timed('a', 'extract', '2026-03-01T10:00:00Z', '2026-03-01T10:00:02Z'),
+    timed('b', 'research', '2026-03-01T10:00:06Z', '2026-03-01T10:00:08Z'),
+  ];
+  const win = traceWindow(rows);
+  const bars = waterfallRows([rows[1]], win);
+  assert.equal(bars[0].startPct, 75, 'the second span starts three quarters in');
+  assert.equal(bars[0].widthPct, 25);
+  assert.equal(bars[0].offsetMs, 6000);
+});
+
+test('a bar never runs past the right edge of the axis', () => {
+  const win = traceWindow([
+    timed('a', 'extract', '2026-03-01T10:00:00Z', '2026-03-01T10:00:01Z'),
+  ]);
+  const [row] = waterfallRows(
+    [timed('late', 'extract', '2026-03-01T10:00:00Z', '2026-03-01T10:00:09Z')],
+    win,
+  );
+  assert.equal(row.startPct, 0);
+  assert.equal(row.widthPct, 100);
+});
+
+test('a zero-length span keeps zero width but is still placed', () => {
+  const win = traceWindow([
+    timed('a', 'extract', '2026-03-01T10:00:00Z', '2026-03-01T10:00:04Z'),
+  ]);
+  const [row] = waterfallRows(
+    [timed('instant', 'settle', '2026-03-01T10:00:02Z', '2026-03-01T10:00:02Z')],
+    win,
+  );
+  assert.equal(row.startPct, 50);
+  assert.equal(row.widthPct, 0);
+});
+
+test('without a window the rows carry no geometry at all', () => {
+  const [row] = waterfallRows([timed('a', 'extract', '2026-03-01T10:00:00Z', '2026-03-01T10:00:04Z')], null);
+  assert.equal(row.startPct, null);
+  assert.equal(row.widthPct, null);
+  assert.equal(row.durationMs, 4000, 'the duration is still known');
+});
+
+test('the slowest step is a step, never the run itself', () => {
+  const rows = [
+    timed('root', 'run', '2026-03-01T10:00:00Z', '2026-03-01T10:00:20Z', { operation: 'run' }),
+    timed('search', 'research', '2026-03-01T10:00:00Z', '2026-03-01T10:00:12Z'),
+    timed('extract', 'extract', '2026-03-01T10:00:12Z', '2026-03-01T10:00:14Z'),
+  ];
+  const win = traceWindow(rows);
+  const slowest = slowestSpan(rows, win);
+  assert.equal(slowest.id, 'search');
+  assert.equal(slowest.durationMs, 12000);
+  assert.equal(slowest.share, 0.6);
+});
+
+test('a context row is never named the slowest step', () => {
+  const rows = [
+    timed('parent', 'claim', '2026-03-01T10:00:00Z', '2026-03-01T10:00:09Z', { context: true }),
+    timed('child', 'research', '2026-03-01T10:00:01Z', '2026-03-01T10:00:02Z'),
+  ];
+  const slowest = slowestSpan(rows, traceWindow(rows));
+  assert.equal(slowest.id, 'child');
+});
+
+test('offsets read as a clock, and a negative offset does not read as the past', () => {
+  assert.equal(formatOffset(0), '+0');
+  assert.equal(formatOffset(-40), '+0');
+  assert.equal(formatOffset(1500), '+1.5 s');
+  assert.equal(formatOffset(null), '+0');
+});
+

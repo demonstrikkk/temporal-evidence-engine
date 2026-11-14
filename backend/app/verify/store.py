@@ -55,6 +55,30 @@ def iso(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat() if value else None
 
 
+def model_key(resolved_model: Any, model: Any) -> str:
+    """The key a model's calls are grouped under.
+
+    The gateway records the requested id (`groq/openai/gpt-oss-20b`) and, on
+    success, the id that actually answered (`openai/gpt-oss-20b`). A failed call
+    resolves nothing, so its row carries only the requested id. Grouping by
+    `resolved_model or model` would therefore split one model into a success row
+    and a failure row, and the failure would never count against the model that
+    failed.
+
+    The requested id is `provider/...` in this gateway's routing convention, so
+    dropping the first segment recovers the same shape the resolved id has.
+    This is a naming convention, not a guess about identity: when there is no
+    slash the requested id is used unchanged.
+    """
+    resolved = str(resolved_model or "").strip()
+    if resolved:
+        return resolved
+    requested = str(model or "").strip()
+    if "/" in requested:
+        requested = requested.split("/", 1)[1]
+    return requested or "unknown"
+
+
 def parse_iso(value: Any) -> datetime | None:
     if not value:
         return None
@@ -135,6 +159,8 @@ class VerifyStore(Protocol):
     def gateway_stats(self, run_id: str | None = None) -> dict: ...
     def list_model_calls(self, limit: int = 25,
                          run_id: str | None = None) -> list[dict]: ...
+    def model_call_stats(self) -> list[dict]: ...
+    def model_verdict_stats(self) -> list[dict]: ...
 
     # multi-layer cache entries
     def get_cache_entry(self, cache_key: str) -> dict | None: ...
@@ -516,6 +542,135 @@ class LocalStore:
                 "status", "created_at")
         return [{k: row.get(k) for k in keys} for row in rows[:limit]]
 
+    def model_call_stats(self) -> list[dict]:
+        """One bucket per model that actually answered, not per requested id.
+
+        A key here is `resolved_model`, falling back to `model` for a failed
+        call that never got a resolution. `priced_calls` is kept beside the
+        total so the caller can tell "free" from "unpriced": a zero cost with
+        `cost_source = none` is not a free call, it is an unknown one.
+        """
+        buckets: dict[str, dict] = {}
+        for row in self._data["calls"]:
+            key = model_key(row.get("resolved_model"), row.get("model"))
+            bucket = buckets.setdefault(key, {
+                "providers": set(), "stages": set(), "calls": 0,
+                "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                "priced_calls": 0, "timed_calls": 0, "latency_ms": 0,
+                "error_calls": 0, "last_call_at": "",
+            })
+            bucket["calls"] += 1
+            bucket["input_tokens"] += int(row.get("input_tokens") or 0)
+            bucket["output_tokens"] += int(row.get("output_tokens") or 0)
+            bucket["cost_usd"] += float(row.get("cost_usd") or 0)
+            if str(row.get("cost_source") or "gateway") != "none":
+                bucket["priced_calls"] += 1
+            latency = int(row.get("latency_ms") or 0)
+            if latency > 0:
+                bucket["latency_ms"] += latency
+                bucket["timed_calls"] += 1
+            if str(row.get("status") or "ok") != "ok":
+                bucket["error_calls"] += 1
+            provider = str(row.get("provider") or "").strip()
+            if provider:
+                bucket["providers"].add(provider)
+            stage = str(row.get("stage") or "").strip()
+            if stage:
+                bucket["stages"].add(stage)
+            seen = str(row.get("created_at") or "")
+            if seen > bucket["last_call_at"]:
+                bucket["last_call_at"] = seen
+        out: list[dict] = []
+        for model, bucket in buckets.items():
+            calls = bucket["calls"]
+            priced = bucket["priced_calls"]
+            timed = bucket["timed_calls"]
+            cost = round(bucket["cost_usd"], 6)
+            out.append({
+                "model": model,
+                "providers": sorted(bucket["providers"]),
+                "calls": calls,
+                "input_tokens": bucket["input_tokens"],
+                "output_tokens": bucket["output_tokens"],
+                "cost_usd": cost,
+                "priced_calls": priced,
+                "avg_cost_usd": round(cost / priced, 6) if priced else None,
+                "timed_calls": timed,
+                "avg_latency_ms": int(round(bucket["latency_ms"] / timed)) if timed else None,
+                "error_calls": bucket["error_calls"],
+                "error_rate": round(bucket["error_calls"] / calls, 4) if calls else None,
+                "stages": sorted(bucket["stages"]),
+                "last_call_at": bucket["last_call_at"] or None,
+            })
+        out.sort(key=lambda row: (-row["calls"], row["model"]))
+        return out
+
+    def model_verdict_stats(self) -> list[dict]:
+        """Verdict mix per answering model, joined through `answers.model`.
+
+        The join is the whole point: a verdict belongs to the answer, and the
+        answer now carries the model that wrote it. An answer with no recorded
+        model is returned under the empty key, which the compare endpoint
+        reports as a pasted answer rather than as a model named "unknown".
+        Inventing attribution would make every rate on the compare page a lie.
+        """
+        by_answer: dict[str, list[dict]] = {}
+        for claim in self._data["claims"]:
+            by_answer.setdefault(str(claim.get("answer_id") or ""), []).append(claim)
+        stamp = iso(now())
+        buckets: dict[str, dict] = {}
+        for answer in self._data["answers"]:
+            # An answer with no recorded model is its own group, not a model
+            # named "unknown": the answer was pasted, so nothing claims to know
+            # who wrote it. The empty key carries that fact to the API.
+            key = str(answer.get("model") or "").strip()
+            bucket = buckets.setdefault(key, {
+                "providers": set(), "answers": 0, "claims": 0,
+                "supported": 0, "changed": 0, "contradicted": 0,
+                "unverifiable": 0, "pending": 0, "time_sensitive": 0,
+                "due": 0, "last_verified_at": "",
+            })
+            bucket["answers"] += 1
+            provider = str(answer.get("provider") or "").strip()
+            if provider:
+                bucket["providers"].add(provider)
+            for claim in by_answer.get(str(answer.get("id") or ""), []):
+                bucket["claims"] += 1
+                status = str(claim.get("status") or "pending")
+                if status in ("supported", "changed", "contradicted", "unverifiable"):
+                    bucket[status] += 1
+                else:
+                    bucket["pending"] += 1
+                if claim.get("time_sensitive"):
+                    bucket["time_sensitive"] += 1
+                due = str(claim.get("next_check_at") or "")
+                if due and stamp and due <= stamp:
+                    bucket["due"] += 1
+                verified = str(claim.get("last_verified_at") or "")
+                if verified > bucket["last_verified_at"]:
+                    bucket["last_verified_at"] = verified
+        out: list[dict] = []
+        for model, bucket in buckets.items():
+            settled = (bucket["supported"] + bucket["changed"]
+                       + bucket["contradicted"] + bucket["unverifiable"])
+            out.append({
+                "model": model,
+                "providers": sorted(bucket["providers"]),
+                "answers": bucket["answers"],
+                "claims": bucket["claims"],
+                "settled": settled,
+                "supported": bucket["supported"],
+                "changed": bucket["changed"],
+                "contradicted": bucket["contradicted"],
+                "unverifiable": bucket["unverifiable"],
+                "pending": bucket["pending"],
+                "time_sensitive": bucket["time_sensitive"],
+                "due": bucket["due"],
+                "last_verified_at": bucket["last_verified_at"] or None,
+            })
+        out.sort(key=lambda row: (-row["claims"], row["model"]))
+        return out
+
     # -- multi-layer cache entries ----------------------------------------
     def get_cache_entry(self, cache_key: str) -> dict | None:
         with self._lock:
@@ -782,12 +937,14 @@ class PgStore:
         return self._write(
             """INSERT INTO answers (id, prompt, answer_text, generated_at,
                    generated_at_source, submitted_at, locale, source_urls,
-                   domain_filter, skip_non_factual)
+                   domain_filter, skip_non_factual, model, provider)
                VALUES (%(id)s, %(prompt)s, %(answer_text)s, %(generated_at)s,
                    %(generated_at_source)s, %(submitted_at)s, %(locale)s,
-                   %(source_urls)s, %(domain_filter)s, %(skip_non_factual)s)
+                   %(source_urls)s, %(domain_filter)s, %(skip_non_factual)s,
+                   %(model)s, %(provider)s)
                RETURNING *""",
-            {**row, "source_urls": _jsonb(row.get("source_urls") or []),
+            {**{"model": "", "provider": ""}, **row,
+             "source_urls": _jsonb(row.get("source_urls") or []),
              "domain_filter": _jsonb(row.get("domain_filter") or [])})
 
     def get_answer(self, answer_id: str) -> dict | None:
@@ -1255,6 +1412,94 @@ class PgStore:
                 FROM model_calls {where}
                 ORDER BY created_at DESC LIMIT %s""",
             (*params, limit))
+
+    def model_call_stats(self) -> list[dict]:
+        rows = self._all(
+            """SELECT COALESCE(NULLIF(
+                          CASE WHEN resolved_model <> '' THEN resolved_model
+                               WHEN strpos(model, '/') > 0
+                                   THEN substr(model, strpos(model, '/') + 1)
+                               ELSE model END, ''), 'unknown') AS model,
+                      COUNT(*) AS calls,
+                      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                      COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                      COUNT(*) FILTER (WHERE cost_source <> 'none') AS priced_calls,
+                      COUNT(*) FILTER (WHERE latency_ms > 0) AS timed_calls,
+                      COALESCE(SUM(latency_ms) FILTER (WHERE latency_ms > 0), 0)
+                          AS latency_ms,
+                      COUNT(*) FILTER (WHERE status NOT IN ('', 'ok'))
+                          AS error_calls,
+                      COALESCE(ARRAY_AGG(DISTINCT NULLIF(provider, ''))
+                          FILTER (WHERE provider <> ''), '{}') AS providers,
+                      COALESCE(ARRAY_AGG(DISTINCT stage)
+                          FILTER (WHERE stage <> ''), '{}') AS stages,
+                      MAX(created_at) AS last_call_at
+               FROM model_calls
+               GROUP BY 1""")
+        out: list[dict] = []
+        for row in rows:
+            calls = int(row.get("calls") or 0)
+            priced = int(row.get("priced_calls") or 0)
+            timed = int(row.get("timed_calls") or 0)
+            errors = int(row.get("error_calls") or 0)
+            cost = float(row.get("cost_usd") or 0)
+            latency = int(row.get("latency_ms") or 0)
+            out.append({
+                "model": row.get("model") or "unknown",
+                "providers": sorted(row.get("providers") or []),
+                "calls": calls,
+                "input_tokens": int(row.get("input_tokens") or 0),
+                "output_tokens": int(row.get("output_tokens") or 0),
+                "cost_usd": round(cost, 6),
+                "priced_calls": priced,
+                "avg_cost_usd": round(cost / priced, 6) if priced else None,
+                "timed_calls": timed,
+                "avg_latency_ms": int(round(latency / timed)) if timed else None,
+                "error_calls": errors,
+                "error_rate": round(errors / calls, 4) if calls else None,
+                "stages": sorted(row.get("stages") or []),
+                "last_call_at": row.get("last_call_at"),
+            })
+        out.sort(key=lambda item: (-item["calls"], str(item["model"])))
+        return out
+
+    def model_verdict_stats(self) -> list[dict]:
+        rows = self._all(
+            """SELECT COALESCE(NULLIF(a.model, ''), '') AS model,
+                      COALESCE(ARRAY_AGG(DISTINCT NULLIF(a.provider, ''))
+                          FILTER (WHERE a.provider <> ''), '{}') AS providers,
+                      COUNT(DISTINCT a.id) AS answers,
+                      COUNT(c.id) AS claims,
+                      COUNT(c.id) FILTER (WHERE c.status = 'supported') AS supported,
+                      COUNT(c.id) FILTER (WHERE c.status = 'changed') AS changed,
+                      COUNT(c.id) FILTER (WHERE c.status = 'contradicted')
+                          AS contradicted,
+                      COUNT(c.id) FILTER (WHERE c.status = 'unverifiable')
+                          AS unverifiable,
+                      COUNT(c.id) FILTER (WHERE c.status = 'pending') AS pending,
+                      COUNT(c.id) FILTER (WHERE c.time_sensitive) AS time_sensitive,
+                      COUNT(c.id) FILTER (WHERE c.next_check_at IS NOT NULL
+                          AND c.next_check_at <= now()) AS due,
+                      MAX(c.last_verified_at) AS last_verified_at
+               FROM answers a
+               LEFT JOIN claims c ON c.answer_id = a.id
+               GROUP BY 1""")
+        out: list[dict] = []
+        for row in rows:
+            counts = {key: int(row.get(key) or 0) for key in (
+                "answers", "claims", "supported", "changed", "contradicted",
+                "unverifiable", "pending", "time_sensitive", "due")}
+            out.append({
+                "model": row.get("model") or "",
+                "providers": sorted(row.get("providers") or []),
+                **counts,
+                "settled": (counts["supported"] + counts["changed"]
+                            + counts["contradicted"] + counts["unverifiable"]),
+                "last_verified_at": row.get("last_verified_at"),
+            })
+        out.sort(key=lambda item: (-item["claims"], str(item["model"])))
+        return out
 
     # -- multi-layer cache entries ----------------------------------------
     def get_cache_entry(self, cache_key: str) -> dict | None:

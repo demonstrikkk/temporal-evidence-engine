@@ -8,29 +8,29 @@
       name="description"
       content="Paste an AI-generated answer and the time it was produced. Get atomic claims, live research, exact quotes from stored sources, and a deterministic verdict for each claim."
     />
-    <meta name="theme-color" content="#f6f3ee" />
+    <meta name="theme-color" content="#efe6d6" />
     <meta name="color-scheme" content="light" />
 
-    <link rel="icon" type="image/svg+xml" href="/tee.svg" />
+    <link rel="icon" type="image/svg+xml" href="/tee-mark.svg" />
     <meta property="og:title" content="Temporal Evidence Engine" />
     <meta
       property="og:description"
       content="A claim is supported, changed, contradicted or unverifiable — with the exact source text and the event date that decided it."
     />
-    <meta property="og:image" content="/tee.svg" />
-    <meta name="twitter:card" content="summary" />
+    <meta property="og:image" content="/og-cover.svg" />
+    <meta name="twitter:card" content="summary_large_image" />
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&family=DM+Mono:wght@400;500&family=Instrument+Serif&display=swap"
+      href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Archivo:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
 
     <style>
-      /* The first frame is paper, not white. The boot mark is plain CSS so it
-         cannot depend on an asset that the bundle has not requested yet. */
-      html { background: #f6f3ee; }
+      /* The first frame is bone paper, not white. The boot mark is plain CSS so
+         it cannot depend on an asset the bundle has not requested yet. */
+      html { background: #efe6d6; }
       #root { min-height: 100%; }
       #boot {
         position: fixed;
@@ -40,21 +40,39 @@
         transition: opacity 260ms ease;
       }
       #boot span {
-        display: grid;
-        place-items: center;
-        width: 56px;
-        height: 56px;
-        border-radius: 14px;
-        border: 1px solid #d3cabb;
-        background: #fbf9f6;
-        color: #9a6b3f;
-        font: 24px/1 'Instrument Serif', Georgia, serif;
+        position: relative;
+        display: block;
+        width: 54px;
+        height: 54px;
+        border-radius: 4px;
+        border: 1px solid #c3b298;
+        background: #fdf9f1;
+      }
+      #boot span::before {
+        content: '';
+        position: absolute;
+        left: 11px;
+        top: 12px;
+        bottom: 12px;
+        width: 2px;
+        background: #b02a1c;
+      }
+      #boot span::after {
+        content: '';
+        position: absolute;
+        right: 11px;
+        top: 22px;
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: #d66422;
+        box-shadow: 0 0 0 4px rgba(214, 100, 34, 0.24);
       }
     </style>
   </head>
   <body>
     <div id="root"></div>
-    <div id="boot" aria-hidden="true"><span>⏱</span></div>
+    <div id="boot" aria-hidden="true"><span></span></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

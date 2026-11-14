@@ -115,6 +115,18 @@ class AnswerIn(BaseModel):
     skip_non_factual: bool = True
     locale: str = "en"
     budget_mode: Literal["balanced", "conserve", "deep", "offline"] = "balanced"
+    # Who wrote the answer, when the caller actually knows. The playground does
+    # (the gateway reports the resolved model) and the paste form offers a field
+    # for it; when it is left blank the value is empty, meaning "not recorded",
+    # never "unknown model". Both fields are recorded facts, never inferred from
+    # the answer or from the model that later scanned it.
+    model: str = Field(default="", max_length=200)
+    provider: str = Field(default="", max_length=120)
+
+    @field_validator("model", "provider", mode="before")
+    @classmethod
+    def _attribution(cls, value: object) -> str:
+        return str(value or "").strip()
 
     @field_validator("generated_at_source", mode="before")
     @classmethod

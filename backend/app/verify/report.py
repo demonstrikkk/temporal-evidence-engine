@@ -272,7 +272,11 @@ def _freshness_lines(claims: list[dict[str, Any]],
         next_check = claim.get("next_check_at")
 
         index = freshness_index(volatility, last_verified, now=now)
-        index_text = f"{index}" if index is not None else "never checked"
+        # `freshness_index` returns 0 for a claim that was never settled, but
+        # "never checked" and "checked until worthless" are different states and
+        # the report must not print a zero for the first one.
+        index_text = ("never checked" if last_verified is None
+                      else f"{index}")
         due = (next_check and parse_iso(next_check) <= now) if next_check else False
         if due:
             due_count += 1

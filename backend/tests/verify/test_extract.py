@@ -71,3 +71,20 @@ def test_a_non_json_shape_is_an_error_not_an_empty_answer():
 def test_an_unknown_claim_type_does_not_invent_a_new_enum():
     claims = postprocess({"claims": [_raw(claim_type="speculative")]}, ANSWER)
     assert claims[0].claim_type.value == "factual"
+
+
+def test_both_extraction_prompts_name_the_stale_fact_categories_by_name():
+    """The brief names pricing, API versions, laws and leadership.
+
+    Recall on exactly those categories is the product's headline requirement, and
+    it is bought with prompt words, not with code. A future trim that drops them
+    would be invisible in every other test: the extractor would still work, it
+    would just stop looking. Both passes are checked because the repair pass is
+    what catches a volatile sentence the first pass missed.
+    """
+    from app.verify import extract
+
+    for system in (extract._SYSTEM, extract._REPAIR_SYSTEM):
+        lowered = system.casefold()
+        for word in ("price", "version", "law", "leader"):
+            assert word in lowered, f"{word!r} is no longer named in the prompt"

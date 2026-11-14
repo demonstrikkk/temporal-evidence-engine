@@ -10,6 +10,7 @@ import { useId, useState } from 'react';
 import {
   RUN_STATE,
   STATUS,
+  freshnessTone,
   statusMeta,
 } from './model.js';
 
@@ -69,9 +70,9 @@ export function Field({ label, hint, children }) {
 export function DateRow({ label, value, tone = '', title }) {
   return (
     <div className="flex items-baseline justify-between gap-3 border-b border-rule/70 py-1.5 last:border-0">
-      <span className="text-[10.5px] uppercase tracking-[0.12em] text-muted">{label}</span>
+      <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-muted">{label}</span>
       <span
-        className={`text-right font-mono text-[11.5px] tabular-nums ${tone || 'text-ink-2'}`}
+        className={`text-right font-mono text-[11px] tabular-nums ${tone || 'text-ink-2'}`}
         title={title}
       >
         {value || '—'}
@@ -82,11 +83,11 @@ export function DateRow({ label, value, tone = '', title }) {
 
 export function SectionHeading({ children, aside, id }) {
   return (
-    <div className="flex items-baseline justify-between gap-3">
-      <h2 id={id} className="eyebrow">
+    <div className="panel-head">
+      <h2 id={id} className="panel-title">
         {children}
       </h2>
-      {aside ? <div className="text-[11px] text-muted">{aside}</div> : null}
+      {aside ? <div className="panel-aside">{aside}</div> : null}
     </div>
   );
 }
@@ -174,6 +175,53 @@ export function SkeletonBlock({ lines = 3 }) {
         <div key={index} className="skeleton h-3" style={{ width: `${100 - index * 12}%` }} />
       ))}
     </div>
+  );
+}
+
+/**
+ * One line of an infrastructure ledger: a mono label, the reading, a figure.
+ *
+ * Quota and gateway diagnostics are key/value lists, not card grids. A ruled
+ * row keeps the label and its value on the same baseline, which is the only
+ * reason a table of numbers is readable at 10px.
+ */
+export function LedgerRow({ label, meta, hint, children }) {
+  return (
+    <div className="infra-row">
+      <span className="infra-label">{label}</span>
+      <span className="min-w-0">
+        {children}
+        {hint ? <span className="infra-hint">{hint}</span> : null}
+      </span>
+      <span className="infra-meta">{meta}</span>
+    </div>
+  );
+}
+
+const FRESH_FILL = {
+  ok: 'bg-ok',
+  warn: 'bg-warn',
+  danger: 'bg-danger',
+  muted: 'bg-rule-2',
+};
+
+/**
+ * The freshness score, as a bar and a number.
+ *
+ * `index === null` renders an empty track and an em dash, never `0`: a claim
+ * that was never verified has no score to show.
+ */
+export function FreshnessMeter({ index, size = 'md' }) {
+  const scored = index !== null && index !== undefined && Number.isFinite(Number(index));
+  const value = scored ? Math.max(0, Math.min(100, Number(index))) : 0;
+  const tone = freshnessTone(index);
+  return (
+    <span className={`fresh ${size === 'sm' ? 'is-sm' : ''}`}>
+      <span className="fresh-bar" aria-hidden="true">
+        <span className={`fresh-fill ${FRESH_FILL[tone]}`} style={{ width: `${value}%` }} />
+      </span>
+      <span className="fresh-value">{scored ? value : '—'}</span>
+    </span>
   );
 }
 

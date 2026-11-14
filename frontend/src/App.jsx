@@ -8,8 +8,11 @@
 import { Component } from 'react';
 import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';
 import { ErrorNote } from './components/ui.jsx';
+import Home from './home/Home.jsx';
 import VerifyShell from './verify/VerifyShell.jsx';
 import NewCheck from './verify/NewCheck.jsx';
+import Playground from './verify/Playground.jsx';
+import Compare from './verify/Compare.jsx';
 import RunList from './verify/RunList.jsx';
 import RunView from './verify/RunView.jsx';
 import Watchlist from './verify/Watchlist.jsx';
@@ -68,7 +71,7 @@ function NotFound() {
       <p className="mt-1.5 max-w-sm text-[12.5px] text-muted">
         That address does not match anything in the verifier.
       </p>
-      <Link to="/" className="btn-primary mt-5">
+      <Link to="/check" className="btn-primary mt-5">
         Start a check
       </Link>
     </div>
@@ -80,8 +83,11 @@ export default function App() {
     <BrowserRouter>
       <Boundary>
         <Routes>
+          <Route index element={<Home />} />
           <Route element={<VerifyShell />}>
-            <Route index element={<NewCheck />} />
+            <Route path="check" element={<NewCheck />} />
+            <Route path="playground" element={<Playground />} />
+    <Route path="compare" element={<Compare />} />
             <Route path="runs" element={<RunList />} />
             <Route path="runs/:runId" element={<RunView />} />
             <Route path="watchlist" element={<Watchlist />} />

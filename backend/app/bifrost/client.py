@@ -33,6 +33,7 @@ import httpx
 from app.cache.coordinator import CacheCoordinator
 from app.cache.keys import model_kv_key
 from app.core.config import settings
+from app.core.errors import provider_fatal, provider_transient
 from app.core.logging import log
 from app.verify.store import VerifyStore, iso, new_id, now, parse_iso
 from app.verify.otel import headers_for_outgoing_call
@@ -593,3 +594,127 @@ class BifrostClient:
         except Exception as exc:  # noqa: BLE001 — never mask the real failure
             log.warning("could not record a failed model call",
                         extra={"data": {"error": str(exc)[:200]}})
+
+
+# --- the playground's gateway call -------------------------------------------
+#
+# The playground deliberately has two sources. "This deployment" is a call made
+# with the gateway's own virtual key, which is the same route a verification
+# takes: provider keys, routing, fallback and logging all stay where they
+# already were, and the browser is never given a credential. "Your endpoint" is
+# the documented exception in `app/playground/client.py`, for a model this
+# deployment has never heard of.
+#
+# This function lives here, and not in the playground, because the one
+# completions URL belongs to this module and `test_no_direct_providers.py`
+# enforces that. It writes nothing: no `model_calls` row, no cache entry, no
+# budget line. The playground has no run to attach a row to, and inventing one
+# would put a call outside a run into the accounting a run is judged by.
+
+
+def _gateway_error_body(response: httpx.Response) -> str:
+    """The gateway's own words about a refusal, cut to a sentence."""
+    try:
+        body = response.json()
+    except ValueError:
+        return " ".join(str(response.text or "").split())[:300]
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("detail") or ""
+            return " ".join(str(message).split())[:300]
+        if isinstance(error, str):
+            return " ".join(error.split())[:300]
+        return " ".join(str(body.get("message") or "").split())[:300]
+    return ""
+
+
+async def gateway_completion(payload: dict[str, Any], *,
+                             timeout: float = 120.0) -> dict[str, Any]:
+    """One raw completion through Bifrost, for the playground.
+
+    Returns the gateway's answer plus the routing facts it reports. Those are
+    the receipt: the provider that actually served the call and the model that
+    actually answered are not always what the caller typed, and a receipt that
+    repeated the request would be a guess wearing a fact's clothes.
+    """
+    base = str(settings.BIFROST_BASE_URL or "").rstrip("/")
+    key = str(settings.BIFROST_VIRTUAL_KEY or "")
+    if not base or not key:
+        raise provider_fatal(
+            "This deployment has no gateway credential, so the playground "
+            "cannot route through it. Point the page at your own endpoint.",
+            {"reason": "no_gateway"},
+        )
+
+    headers = {"Authorization": f"Bearer {key}",
+               "Content-Type": "application/json",
+               "x-bf-vk": key}
+    headers.update(headers_for_outgoing_call())
+
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(f"{base}/v1/chat/completions",
+                                         json=payload, headers=headers)
+    except httpx.TimeoutException as exc:
+        raise provider_transient(
+            f"The gateway did not answer within {int(timeout)} seconds.",
+            {"reason": "timeout"}) from exc
+    except httpx.HTTPError as exc:
+        raise provider_transient(
+            f"Could not reach the gateway: {exc}", {"reason": "transport"}) from exc
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    if response.status_code >= 400:
+        message = _gateway_error_body(response)
+        suffix = f" Gateway said: {message}" if message else ""
+        status = response.status_code
+        if status in (401, 403):
+            reason, make = "auth", provider_fatal
+        elif status == 429:
+            reason, make = "rate_limit", provider_transient
+        elif status >= 500:
+            reason, make = "upstream", provider_transient
+        else:
+            reason, make = "rejected", provider_fatal
+        raise make(
+            f"The gateway refused the call (HTTP {status}).{suffix}",
+            {"status": status, "endpoint": base, "reason": reason})
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise provider_transient(
+            "The gateway returned something that is not JSON.",
+            {"reason": "protocol"}) from exc
+    if not isinstance(body, dict):
+        raise provider_transient(
+            "The gateway returned a non-object JSON body.",
+            {"reason": "protocol"})
+
+    if body.get("error"):
+        error = body["error"]
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        raise provider_transient(
+            f"The gateway returned an error: {str(message)[:300]}",
+            {"reason": "upstream"})
+
+    extra = body.get("extra_fields") or {}
+    routing = extra.get("routing_info") or {}
+    usage = body.get("usage") or {}
+    cost = _first_number(extra.get("cost"), usage.get("cost"),
+                         _header(response.headers, "x-bifrost-cost"))
+
+    return {
+        "body": body,
+        "provider": str(extra.get("provider") or routing.get("provider") or ""),
+        "requested_model": str(extra.get("original_model_requested")
+                               or payload.get("model") or ""),
+        "resolved_model": str(extra.get("resolved_model_used")
+                              or body.get("model") or payload.get("model") or ""),
+        "request_id": str(body.get("id") or ""),
+        "cost_usd": float(cost) if cost is not None else None,
+        "latency_ms": latency_ms,
+    }

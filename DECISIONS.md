@@ -900,3 +900,201 @@ count what it cannot read, moves `total_assertions` and the model budget and
 needs its own decision, per-shape tests, and a re-run of both suites. D-031
 stays unfixed for exactly that reason; the suite now measures it instead of
 describing it.
+
+## D-033 - Freshness is scored at read time, and the four volatile categories are named (2026-11-13)
+
+The problem statement asks for a freshness score per claim and names four
+categories a stale answer hides in: pricing, API versions, laws, leadership. Two
+gaps against that sentence were closed.
+
+**The score was computed but never served.** `freshness_index` existed only in
+the `claim.settled` event payload, and the claims endpoint returned
+`last_verified_at` and `next_check_at` but no score, so no screen could show a
+freshness number. `app/api/verify.py` now derives `freshness_index` and
+`half_life_hours` for every claim in `_claim_view`, at read time, from
+`last_verified_at` and `volatility_class`. Read time, not settlement time: a
+value frozen at settlement would still read 100 a week later, which is the exact
+staleness the product exists to catch. A never-verified claim reports `None`,
+never `0` — "never checked" and "checked until worthless" are different states
+and the UI must say which. `half_life_hours` travels with the claim so the UI
+cannot keep a second copy of the policy table and drift from `HALF_LIFE_HOURS`.
+The number stays a decay of verification age. It is not a probability that the
+claim is true, and no screen says it is.
+
+**The categories were implied, not named.** `extract._SYSTEM` listed prices,
+availability, staffing and rankings as volatile and did not name versions, laws
+or leadership, so recall on three of the four categories rested on the model
+generalising unprompted. Both extraction prompts now name all four, and
+`test_extract.py` fails if a future trim drops the words. `EXTRACT_PROMPT_VERSION`
+is `extract.v2` and `REPAIR_PROMPT_VERSION` is `extract.repair.v2`; the digests
+in `prompts.REGISTERED` were recomputed, which
+`test_prompt_version_changes_when_a_prompt_string_changes` enforces in both
+directions.
+
+This changes no verdict, no settlement rule, no denominator, no `RULE_VERSION`,
+no budget and no schema. `eval/run_eval.py` is hermetic and scripts extraction,
+so the gold set still reports the same 107 claims at 100.0%; the extraction
+prompt is measured by live runs, not by that gate.
+
+## D-034 - The playground asks through Bifrost by default; a user's endpoint is the exception (2026-11-13, amended 2026-11-14)
+
+Invariant 4 says every model call goes through Bifrost so that routing,
+fallback, cost and logging are recorded in one place. A playground where a user
+brings a key for a model this deployment has never heard of cannot honour it: a
+Bifrost call would either fail for an unconfigured model or bill the operator
+for someone else's play. The rule was not quietly bent; it is amended here, with
+the conditions that make the exception safe.
+
+### Amendment, 2026-11-14: the default path asks through the gateway
+
+The original version of this decision left *every* playground call outside
+Bifrost, and the page defaulted to a key-requiring endpoint. A reader who had
+just watched a run succeed through the gateway was then asked for a key the
+deployment already held, and a keyless send answered HTTP 401 — the page
+inviting its own most common failure. That is a design defect, not a fact about
+the wire format.
+
+So the page offers two sources, and the gateway is first:
+
+- **`source: "gateway"`** is the default selection. It calls
+  `app.bifrost.client.gateway_completion`, which posts to the same
+  `/v1/chat/completions` the verifier uses with the deployment's own virtual
+  key. Routing, fallback, provider keys and budgets stay where they already
+  are; the browser is never given a credential, and there is nothing to paste.
+  The receipt carries the gateway's own report — provider, resolved model,
+  request id, cost — rather than echoing the request, because routing may serve
+  a different model than the one asked for.
+- **`source: "endpoint"`** is the bring-your-own-model path, and remains the
+  exception this decision is about. It is opt-in: a request that names no
+  source gets `endpoint` semantics, so the operator's money is never spent by
+  omission, and the page selects the gateway preset explicitly.
+
+`gateway_completion` writes no `model_calls` row, no cache entry and no budget
+line. The playground has no run to attach a row to, and inventing one would put
+a call outside a run into the accounting a run is judged by.
+
+The rest of this decision applies to the endpoint source.
+
+- `app/playground/client.py` is the only code that speaks to a user-supplied
+  endpoint. It uses `httpx` and the OpenAI wire format, and imports no provider
+  SDK, so `test_no_direct_providers.py` still holds and the gateway still owns
+  the only version-qualified completion path.
+- **The playground produces no verdict and writes no row.** It writes no run, no
+  answer, no claim and no `model_calls` row. Scanning is a separate
+  `POST /api/verify/runs` through the ordinary pipeline, which does go through
+  Bifrost. A call outside the gateway therefore cannot reach
+  `verification_status`, which is invariant 1's concern and the reason this
+  exception is tolerable at all.
+- **The key is a function argument, never an attribute and never stored.** The
+  request model sets `repr=False`, so a traceback cannot print it; provider
+  error text is scrubbed through `guard.redact` before it can reach a response;
+  the log line carries model, rounds, tokens and latency, and no key, no base
+  URL auth and no message text.
+- **The destination is validated, not trusted.** `guard.validate_endpoint`
+  requires https for any non-loopback host, refuses the metadata addresses by
+  name, refuses any name resolving onto a private or link-local address, refuses
+  credentials embedded in the URL, and allows loopback only on the ports local
+  model servers use (11434, 1234, 8000, 8080, 12345). A bring-your-own-model tool
+  that cannot reach Ollama has refused the case it was built for; one that can
+  reach anything on localhost is an SSRF. The port list is the compromise, and
+  its residual risk (DNS rebinding between the check and the connection) is
+  written down in the module rather than left implicit.
+- **It costs nothing to read.** Returning usage without a price is deliberate:
+  this client cannot know a tariff it was never told, and an estimated dollar
+  figure beside a real bill is the same category error the trace panel refuses
+  when it keeps billed and estimated spend apart.
+
+`RULE_VERSION` does not move: nothing here changes the decision table.
+
+## D-035 - Failed runs are hidden by a labelled filter, never deleted (2026-11-13)
+
+A demo whose archive opens with four red rows reads as a broken product, but
+hiding that by deleting the rows would make the archive a claim rather than a
+record. So `/runs` hides `status = failed` by default and states the exception:
+
+- the strip beside the list says `show N failed` whenever N > 0, and the toggle
+  restores them;
+- choosing the **Failed** tab shows them without the toggle, because a reader
+  who asked for failures has asked;
+- every other count is computed from the same filtered set that is drawn, so the
+  strip cannot promise rows the list does not contain.
+
+The backend is untouched. A failed run is still a run, still stored, still
+reported by `runCounts()` and still exportable. Hiding is presentation, and the
+control that undoes it sits next to the number it hides.
+
+## D-036 - The proof graph is a spine, and the trace is a waterfall on the run clock (2026-11-13)
+
+Two visualisations were drawn from numbers that did not describe their data.
+
+**The proof graph was an SVG with hard-coded geometry.** Nodes sat at
+`40 + (i % 3) * 150` inside a fixed 520×260 viewBox, so a fourth evidence row
+was clipped, a two-row graph was mostly empty, and in the 390px inspector column
+it always overflowed sideways. The layout is now derived in
+`proofModel.buildProofNodes` and drawn as a grid: the claim on top, one branch
+per stored evidence row, the event date in the gutter, undated rows grouped last
+and labelled. A grid wraps; a fixed viewBox cannot. The pure projection is
+tested (`test/proof-model.test.mjs`), including the rule that a rejected
+`supports` proposal is drawn as an unsettled edge rather than a green one.
+
+**The trace was an indented list**, which says what happened in what order and
+nothing about what was slow. Every span already carries `started_at` and
+`ended_at`, so `TracePanel` now places each span on the run's own clock: an axis
+measured over *all* spans (so filtering never rescales the bars that remain), a
+bar per span, a hairline rather than a widened bar for a zero-length span, and a
+per-span receipt on click — model requested → resolved, provider, tokens, cost
+and its source, cache state, prompt version, tool and arguments, error, decision.
+`traceModel.traceWindow` / `waterfallRows` / `slowestSpan` are pure and tested;
+`slowestSpan` excludes the root because the root is always the longest and
+naming it would tell a reader nothing.
+
+Neither change touches the decision table, the schema or a verdict. They make
+the evidence and the execution legible, which is what the product claims to be.
+
+## D-037 - Model comparison reports measurements, and attribution is stored, not guessed (2026-11-14)
+
+A "compare models" page is an invitation to invent a score. This one reads two
+tables that already exist and refuses to go further.
+
+**Attribution is written when the answer is scanned.** `tev.answers` gained
+`model` and `provider` (`033_ps05_answer_model.sql`), filled from the scan
+request. The playground sends the model that *answered* — `resolved_model` when
+the gateway reports one, because a fallback means the requested id names the
+wrong model for this prose — and the paste form offers an optional field for the
+same reason. An empty value is "not recorded", and the compare page reports
+those answers as a `pasted answers` group rather than inventing a model called
+`unknown`, spreading their claims across the real models, or crediting the
+extractor: the model that read the answer did not write it.
+
+**A call is grouped by the model that ran.** A failed call resolves nothing, so
+its row carries only the requested id (`groq/openai/gpt-oss-20b`). Grouping by
+`resolved_model or model` split one model into a success row and a failure row
+and the failure never counted against the model that failed. `model_key()` in
+`store.py` strips the leading routing segment from the requested id — a naming
+convention, not a guess about identity — so both forms land in one bucket. The
+Postgres aggregation does the same in SQL.
+
+**Nothing measured becomes a zero.** `cost_source = none` is counted in `calls`
+and excluded from `avg_cost_usd`, with `priced_calls` reported beside it; an
+untimed call is excluded from `avg_latency_ms` the same way. The API returns
+`null`, the page renders an em dash, and the sort comparator keeps unmeasured
+rows below measured ones in both directions — including measured rows that
+happen to have no value for the sorted column. Otherwise "cheapest" would be won
+by a model that never ran.
+
+**Registry rows are context.** `zen.free_models()` supplies vendor, transport,
+data posture and the date a route was last seen working, with every
+measurement null. They are catalogue entries, labelled as such, and always sort
+last. The three bands are fixed: models, then the `pasted answers` group, then
+the catalogue. Sorting by any key in either direction never lifts a group or an
+entry above a model.
+
+`supported_rate` is the share of *settled* claims that came back supported.
+Pending is excluded from the denominator so a slow model does not look
+inaccurate, and the share is never presented as a quality score: a model that
+writes safe trivialities scores high on it. `test/compare-model.test.mjs` and
+`tests/verify/test_compare.py` pin the nulls, the rate denominators, the
+sort invariants and the `unknown` bucket.
+
+No change to the decision table, so `RULE_VERSION` does not move.
+

@@ -224,6 +224,11 @@ def create_run(store: VerifyStore, payload: AnswerIn,
         "source_urls": list(payload.source_urls),
         "domain_filter": list(payload.domain_filter),
         "skip_non_factual": payload.skip_non_factual,
+        # Attribution travels with the answer, not with the run: the same answer
+        # may be re-scanned, and the model that wrote it is a property of the
+        # text. Empty is the honest value when the caller did not say.
+        "model": payload.model,
+        "provider": payload.provider,
     })
     store.create_run({
         "id": run_id, "answer_id": answer_id, "status": "queued",
@@ -304,6 +309,13 @@ class Verifier:
             "plans": 0, "queries_shared": 0,
             "pairs_examined": 0, "pairs_skipped": 0,
         }
+        #: Pages this run already tried and could not read, by canonical URL.
+        #: The planner derives several queries per claim, so one paywalled page
+        #: used to be extracted once per query and reported once per attempt —
+        #: three identical failures for one document, and a counter that said
+        #: more sources failed than the run ever asked for. `extracted` is the
+        #: memory of pages that worked; this is its twin for pages that did not.
+        self._unreadable: set[str] = set()
 
     # -- plumbing ---------------------------------------------------------
     def emit(self, event_type: str, payload: dict[str, Any] | None = None
@@ -902,6 +914,11 @@ class Verifier:
                             not in plan.revisions):
                         plan.revisions.append(extracted[canonical].revision_id)
                     continue
+                if canonical in self._unreadable:
+                    # Fetched once already in this run and reported unreadable.
+                    # Asking again would buy the same failure twice and count
+                    # one page as two sources.
+                    continue
                 extract_span = self.trace.begin(
                     "research", "extract", parent=span, claim_id=claim_id,
                     tool_name="tavily_extract",
@@ -910,6 +927,7 @@ class Verifier:
                     extract = self.tavily.extract([hit.url])
                 except ResearchError as exc:
                     self.counters["failed_sources"] += 1
+                    self._unreadable.add(canonical)
                     self.trace.end(extract_span, self.emit("source.failed", {
                         "claim_id": claim_id, "url": hit.url,
                         "stage": "extract", "error": str(exc)[:300]}),
@@ -917,20 +935,36 @@ class Verifier:
                     self.fail("research", f"extraction failed: {exc}",
                               claim_id=claim_id)
                     continue
-                for failed in extract.failed:
-                    self.counters["failed_sources"] += 1
-                    self.emit("source.failed", {"claim_id": claim_id,
-                                                "url": failed.url,
-                                                "stage": "extract",
-                                                "error": failed.error})
+                # One page is one failure row. Tavily routinely reports the
+                # fetch error *and* returns no text for the same URL, so this
+                # used to emit two `source.failed` events for one page and count
+                # it twice in `failed_sources`: the rail showed a single URL
+                # with two different reasons, and the run claimed more failed
+                # sources than it ever asked for. The upstream reason is the
+                # cause, our empty read is the symptom, so the symptom is
+                # recorded only when Tavily reports nothing.
+                upstream = {f.url: f.error for f in extract.failed}
                 content = extract.pages.get(hit.url) or next(
                     iter(extract.pages.values()), "")
-                if not content.strip():
+                if content.strip():
+                    # Text arrived: whatever the extraction metadata says, this
+                    # page did not fail.
+                    upstream.pop(hit.url, None)
+                else:
+                    upstream[hit.url] = (upstream.pop(hit.url, None)
+                                         or "no text returned")
+                for url, error in upstream.items():
                     self.counters["failed_sources"] += 1
-                    self.trace.end(extract_span, self.emit("source.failed", {
-                        "claim_id": claim_id, "url": hit.url,
-                        "stage": "extract", "error": "no text returned"}),
-                        error_type="empty_document")
+                    self._unreadable.add(canonicalize_url(url))
+                    self.trace.end(
+                        extract_span if url == hit.url else None,
+                        self.emit("source.failed", {
+                            "claim_id": claim_id, "url": url,
+                            "stage": "extract", "error": error}),
+                        error_type=("empty_document"
+                                    if error == "no text returned"
+                                    else "extract_failed"))
+                if not content.strip():
                     continue
                 source = save_source(self.store, hit.url, hit.title)
                 revision = save_revision(

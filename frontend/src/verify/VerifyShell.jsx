@@ -86,11 +86,11 @@ export default function VerifyShell() {
       <div className="app-grain" aria-hidden="true" />
       <header className="shell-head sticky top-0 z-20 border-b border-rule bg-paper/88 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-[1500px] items-center gap-5 px-5">
-          <NavLink to="/" className="flex min-w-0 items-center gap-2.5" aria-label="Temporal Evidence Engine — home">
+          <NavLink to="/" className="flex min-w-0 items-center gap-2.5" aria-label="Afterfact - home">
             <img src="/tee-mark.svg" width="28" height="28" alt="" className="h-7 w-7 shrink-0" />
             <span className="min-w-0">
               <span className="block truncate font-display text-[15px] leading-none text-ink">
-                Temporal Evidence Engine
+                Afterfact
               </span>
               <span className="mt-0.5 block truncate font-mono text-[9.5px] uppercase tracking-[0.18em] text-muted">
                 claim-level verification

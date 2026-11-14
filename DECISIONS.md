@@ -1094,7 +1094,21 @@ Pending is excluded from the denominator so a slow model does not look
 inaccurate, and the share is never presented as a quality score: a model that
 writes safe trivialities scores high on it. `test/compare-model.test.mjs` and
 `tests/verify/test_compare.py` pin the nulls, the rate denominators, the
-sort invariants and the `unknown` bucket.
+sort invariants and the `pasted answers` group.
 
 No change to the decision table, so `RULE_VERSION` does not move.
+
+## D-038 - The product is called Afterfact (2026-11-14)
+
+"Temporal Evidence Engine" named the architecture, not the product: it is what
+the thing is made of. Afterfact names what a person does with it — verify a
+statement after the fact, against the record as it stood. The wordmark, page
+title, OG card and dossier carry `Afterfact` with the descriptor
+`claim-level verification`; the home page keeps its own headline.
+
+The display name is branding and moves nothing else. `RULE_VERSION` stays
+`tev-1.2.0` because the decision table did not change, and the repo, Python
+package, `/api` paths and `tev` schema keep their names so existing installs,
+migrations and links do not break for a word.
+
 

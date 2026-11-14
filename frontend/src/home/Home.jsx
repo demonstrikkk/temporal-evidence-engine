@@ -27,11 +27,11 @@ const REASONS = {
 
 function Brand() {
   return (
-    <Link to="/" className="brand" aria-label="Temporal Evidence Engine — home">
+    <Link to="/" className="brand" aria-label="Afterfact — home">
       <img src="/tee-mark.svg" width="30" height="30" alt="" className="brand-mark" />
       <span className="brand-text">
-        <span className="brand-name">Temporal Evidence</span>
-        <span className="brand-sub">Engine</span>
+        <span className="brand-name">Afterfact</span>
+        <span className="brand-sub">claim-level verification</span>
       </span>
     </Link>
   );

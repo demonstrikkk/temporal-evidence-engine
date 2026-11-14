@@ -1,4 +1,8 @@
-# Product contract — Temporal Evidence Engine
+# Product contract - Afterfact
+
+**Display name:** Afterfact · **descriptor:** claim-level verification · **rule set:**
+`tev-1.2.0`. The display name is branding only; it never moves `RULE_VERSION`, which
+versions the decision table.
 
 **One paragraph.** Paste an AI-generated answer and when it was generated. The
 system splits it into atomic claims, researches each one live with Tavily,
